@@ -1,0 +1,13 @@
+{
+  "module_name": "opencv",
+  "namespace": "viam",
+  "language": "python",
+  "resource_type": "component",
+  "resource_subtype": "pose_tracker",
+  "model_name": "chessboard",
+  "enable_cloud_build": true,
+  "initialize_git": false,
+  "generator_version": "0.1.0",
+  "generated_on": "2025-09-29T15:50:04.061341Z",
+  "module_readme_link": "README.md"
+}
