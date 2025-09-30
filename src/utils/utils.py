@@ -5,14 +5,14 @@ import os
 
 
 def _get_binary_path():
-    """Get the path to the orientation converter binary"""
+    """Get the path to the go_utils binary"""
     if getattr(sys, 'frozen', False):
         # Running in PyInstaller bundle
-        binary_path = os.path.join(sys._MEIPASS, 'orientation_converter')
+        binary_path = os.path.join(sys._MEIPASS, 'go_utils')
     else:
         # Running in development
         script_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        binary_path = os.path.join(script_dir, 'orientation_converter', 'orientation_converter')
+        binary_path = os.path.join(script_dir, 'go_utils', 'go_utils')
     
     return binary_path
 
