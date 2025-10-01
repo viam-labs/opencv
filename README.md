@@ -6,7 +6,8 @@ A Viam module that provides OpenCV-based computer vision components for robotics
 
 A pose tracker component that detects and tracks the pose of chessboard calibration patterns in camera images. This model uses OpenCV's chessboard detection algorithms to provide accurate 6-DOF pose estimation of chessboard targets, making it ideal for camera calibration and pose tracking applications.
 
-### Configuration
+### Post Tracker Configuration
+
 The following attribute template can be used to configure this model:
 
 ```json
@@ -17,7 +18,7 @@ The following attribute template can be used to configure this model:
 }
 ```
 
-#### Attributes
+#### Pose Tracker Attributes
 
 The following attributes are available for this model:
 
@@ -27,7 +28,7 @@ The following attributes are available for this model:
 | `pattern_size`   | list   | Required  | Size of the chessboard pattern.                          |
 | `square_size_mm` | int    | Required  | Physical size of a square in the chessboard pattern.     |
 
-#### Example Configuration
+#### Pose Tracker Example Configuration
 
 ```json
 {
@@ -41,7 +42,8 @@ The following attributes are available for this model:
 
 A calibration service that performs hand-eye calibration for robotic arms with mounted cameras. This service automates the process of determining the transformation between the robot's end-effector and camera coordinate frames by moving the arm through predefined poses while tracking AprilTag markers. The resulting calibration enables accurate coordination between robot motion and visual perception.
 
-### Configuration
+### Hand Eye Calibration Configuration
+
 The following attribute template can be used to configure this model:
 
 ```json
@@ -55,7 +57,7 @@ The following attribute template can be used to configure this model:
 }
 ```
 
-#### Attributes
+#### Hand Eye Calibration Attributes
 
 The following attributes are available for this model:
 
@@ -68,7 +70,7 @@ The following attributes are available for this model:
 | `motion`          | string | Optional  | Name of the motion service for coordinated movement.     |
 | `sleep_seconds`   | float  | Optional  | Sleep time between movements (defaults to 1.0 seconds). |
 
-#### Example Configuration
+#### Hand Eye Calibration Example Configuration
 
 ```json
 {

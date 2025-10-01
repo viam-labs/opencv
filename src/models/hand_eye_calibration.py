@@ -16,7 +16,7 @@ from viam.services.generic import *
 from viam.services.motion import Motion
 from viam.utils import struct_to_dict, ValueTypes
 
-from ..utils.utils import call_go_ov2mat, call_go_mat2ov
+from utils.utils import call_go_ov2mat, call_go_mat2ov
 
 # required attributes
 arm_attr = "arm_name"
@@ -188,6 +188,7 @@ class HandEyeCalibration(Generic, EasyResource):
                             R_target2cam_list.append(R_t2c.T)
                             t_target2cam_list.append(t_t2c)
                     else:
+                        # TODO: Implement motion service code here
                         try:
                             success = await self.motion.move(
                                 component_name=self.arm.name,
@@ -195,7 +196,6 @@ class HandEyeCalibration(Generic, EasyResource):
                             )
                         except Exception as e:
                             raise Exception(e)
-
 
                     pose = cv2.calibrateHandEye(
                         R_gripper2base=R_gripper2base_list,

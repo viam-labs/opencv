@@ -169,3 +169,6 @@ orientation_converter/orientation_converter
 # Viam reload files
 .VIAM_RELOAD_ARCHIVE.tar.gz
 reload-*/
+
+# Go binary
+go_utils/go_utils
