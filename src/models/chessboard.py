@@ -18,7 +18,7 @@ from viam.resource.easy_resource import EasyResource
 from viam.resource.types import Model, ModelFamily
 from viam.utils import struct_to_dict, ValueTypes
 
-from utils.utils import call_go_mat2ov
+from ..utils.utils import call_go_mat2ov
 
 
 # required attributes
