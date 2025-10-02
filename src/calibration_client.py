@@ -15,10 +15,10 @@ from viam.media.utils.pil import viam_to_pil_image
 async def connect():
     """Establish a network connection between Codespace host and the robot."""
     opts = RobotClient.Options.with_api_key( 
-        api_key='8onoqogfufm7ftywcxpernv8xq0w6814',
-        api_key_id='7ba18f3e-565a-453f-9ef2-4c213897d4d2',
+        api_key='api-key',
+        api_key_id='api-key-id',
     )
-    address = 'sean-framework-main.yznpnnv7bl.viam.cloud'
+    address = 'address'
     return await RobotClient.at_address(address, opts)
 
 
@@ -169,7 +169,11 @@ async def main():
         
         # Get camera and chessboard components
         cam = Camera.from_robot(machine, "orbbec-1")
-        chessboard = PoseTracker.from_robot(machine, "chessboard")
+
+        props = await cam.get_properties()
+        print(props)
+
+        chessboard = PoseTracker.from_robot(machine, "pose-tracker-1")
         
         # Ask user how many images to collect
         while True:
