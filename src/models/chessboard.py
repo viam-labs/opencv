@@ -188,7 +188,7 @@ class Chessboard(PoseTracker, EasyResource):
         
         return {"pose": pose_in_frame}
 
-    async def _detect_chessboard_corners(self, image: np.ndarray) -> Optional[np.ndarray]:
+    def _detect_chessboard_corners(self, image: np.ndarray) -> Optional[np.ndarray]:
         """Detect and refine chessboard corners in an image.
         
         Args:
