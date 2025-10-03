@@ -221,17 +221,12 @@ class Chessboard(PoseTracker, EasyResource):
     
     def _generate_object_points(self) -> np.ndarray:
         """Generate 3D object points for the chessboard pattern.
-
-        The pattern_size should be [width, height] representing the number of
-        inner corners in the chessboard (columns, rows).
-
+        
         Returns:
             Object points as (N, 3) array where N is number of corners
         """
         objp = np.zeros((self.pattern_size[1] * self.pattern_size[0], 3), np.float32)
-        # Generate grid in correct order to match cv2.findChessboardCorners convention
-        # OpenCV returns corners in column-major order (down columns, then across)
-        objp[:, :2] = np.mgrid[0:self.pattern_size[1], 0:self.pattern_size[0]].T.reshape(-1, 2)
+        objp[:, :2] = np.mgrid[0:self.pattern_size[0], 0:self.pattern_size[1]].T.reshape(-1, 2)
         objp *= self.square_size
         return objp
     
@@ -320,12 +315,18 @@ class Chessboard(PoseTracker, EasyResource):
         
         # Perform camera calibration
         self.logger.info("Running camera calibration...")
+        
+        # Initialize camera matrix and distortion coefficients
+        camera_matrix = np.zeros((3, 3), dtype=np.float32)
+        dist_coeffs = np.zeros(5, dtype=np.float32)
+        
+        # Run calibration
         ret, camera_matrix, dist_coeffs, _, _ = cv2.calibrateCamera(
             object_points,
             image_points,
             image_size,
-            None,
-            None,
+            camera_matrix,
+            dist_coeffs,
             flags=cv2.CALIB_RATIONAL_MODEL
         )
         
@@ -344,11 +345,11 @@ class Chessboard(PoseTracker, EasyResource):
                 "cy": float(camera_matrix[1, 2])
             },
             "distortion_coefficients": {
-                "k1": float(dist_coeffs[0, 0]),
-                "k2": float(dist_coeffs[0, 1]),
-                "p1": float(dist_coeffs[0, 2]),
-                "p2": float(dist_coeffs[0, 3]),
-                "k3": float(dist_coeffs[0, 4])
+                "k1": float(dist_coeffs[0]),
+                "k2": float(dist_coeffs[1]),
+                "p1": float(dist_coeffs[2]),
+                "p2": float(dist_coeffs[3]),
+                "k3": float(dist_coeffs[4])
             }
         }
         
@@ -403,4 +404,3 @@ class Chessboard(PoseTracker, EasyResource):
     ) -> Sequence[Geometry]:
         self.logger.error("`get_geometries` is not implemented")
         raise NotImplementedError()
-
