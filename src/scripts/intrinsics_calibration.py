@@ -1,9 +1,10 @@
 import asyncio
 import base64
 import io
+import os
 
+from dotenv import load_dotenv
 from PIL import Image
-import numpy as np
 
 from viam.components.camera import Camera
 from viam.components.pose_tracker import PoseTracker
@@ -13,12 +14,12 @@ from viam.media.utils.pil import viam_to_pil_image
 
 
 async def connect():
-    """Establish a network connection between Codespace host and the robot."""
+    load_dotenv()
     opts = RobotClient.Options.with_api_key( 
-        api_key='api-key',
-        api_key_id='api-key-id',
+        api_key=os.getenv('VIAM_MACHINE_API_KEY'),
+        api_key_id=os.getenv('VIAM_MACHINE_API_KEY_ID'),
     )
-    address = 'address'
+    address = os.getenv('VIAM_MACHINE_ADDRESS')
     return await RobotClient.at_address(address, opts)
 
 
