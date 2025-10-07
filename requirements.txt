@@ -12,5 +12,6 @@ protobuf==5.29.5
 pymongo==4.15.1
 typing_extensions==4.15.0
 viam-sdk==0.56.0
+python-dotenv==1.1.1
 
 typing-extensions
