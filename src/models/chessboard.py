@@ -178,25 +178,29 @@ class Chessboard(PoseTracker, EasyResource):
         # Transpose needed due to frame convention mismatch:
         # OpenCV solvePnP returns object -> camera transform, but Viam expects camera -> object transform.
         ox, oy, oz, theta = call_go_mat2ov(R.T)
-        self.logger.debug(f"Translated roation matrix to orientation vector with values ox={ox}, oy={oy}, oz={oz}, theta={theta}")
+        self.logger.debug(f"Translated rotation matrix to orientation vector with values ox={ox}, oy={oy}, oz={oz}, theta={theta}")
         
-        # Convert tvec to column vector (3x1)
-        t = tvec.reshape(3, 1)
-
-        pose_in_frame = PoseInFrame(
-            reference_frame=self.camera.name,
-            pose=Pose(
-                x=t[0][0],
-                y=t[1][0],
-                z=t[2][0],
-                o_x=ox,
-                o_y=oy,
-                o_z=oz,
-                theta=theta
+        corner_poses = {}
+        
+        for i, obj_point in enumerate(objp):
+            point_3d = R @ obj_point.reshape(3, 1) + tvec
+            
+            corner_name = f"corner_{i}"
+            corner_poses[corner_name] = PoseInFrame(
+                reference_frame=self.camera.name,
+                pose=Pose(
+                    x=point_3d[0][0],
+                    y=point_3d[1][0],
+                    z=point_3d[2][0],
+                    o_x=ox,
+                    o_y=oy,
+                    o_z=oz,
+                    theta=theta
+                )
             )
-        )
         
-        return {"pose": pose_in_frame}
+        self.logger.debug(f"generated {len(corner_poses)} corner poses")
+        return corner_poses
 
     async def do_command(
         self,
