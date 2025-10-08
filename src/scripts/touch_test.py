@@ -17,10 +17,10 @@ from typing import Dict, Optional
 
 # Consts
 ARM_NAME = "ur5e"
-POSE_TRACKER_NAME = "april-tag-tracker"
+POSE_TRACKER_NAME = "chessboard-pose-tracker"
 MOTION_SERVICE_NAME = "motion-service"
 
-APRILTAG_BODY_NAMES = ['1', '6', '11', '16', '21']
+BODY_NAMES = []
 
 TOUCH_PROBE_LENGTH_MM = 113
 PRETOUCH_OFFSET_MM = 10  # additional offset beyond touch probe length
@@ -66,7 +66,7 @@ async def transform_and_adjust_poses(machine: RobotClient, poses: Dict[str, Pose
 
 async def move_to_poses(motion_service: MotionClient, arm: Arm, poses: Dict[str, PoseInFrame]) -> None:
     for pose_name, pose_pretouch in poses.items():
-        print(f"\n--- Moving to AprilTag: {pose_name} ---")
+        print(f"\n--- Moving to body: {pose_name} ---")
         
         # Move to pretouch pose
         await motion_service.move(
@@ -81,7 +81,7 @@ async def move_to_poses(motion_service: MotionClient, arm: Arm, poses: Dict[str,
         # Current pose for incremental movement
         current_pose = copy.deepcopy(pose_pretouch)
         
-        # Get the orientation vector for this AprilTag
+        # Get the orientation vector for this body
         o_x = pose_pretouch.pose.o_x
         o_y = pose_pretouch.pose.o_y
         o_z = pose_pretouch.pose.o_z
@@ -148,7 +148,7 @@ async def main(scanning_pose: Optional[list[float]] = None):
         print(f"Initial arm pose captured: {initial_arm_pose}")
         
         if scanning_pose:
-            print(f"Moving to initial AprilTag scanning pose: scanning_pose={scanning_pose}")
+            print(f"Moving to initial scanning pose: scanning_pose={scanning_pose}")
             scan_pose = Pose(
                 x=scanning_pose[0],
                 y=scanning_pose[1],
@@ -168,12 +168,14 @@ async def main(scanning_pose: Optional[list[float]] = None):
             )
             print("Arrived at scanning position")
         else:
-            print("No scanning position provided, assuming AprilTags are already visible")
+            print("No scanning position provided, assuming bodies re already visible")
         
         input("Press Enter to continue...")
         
         pt = PoseTracker.from_robot(machine, POSE_TRACKER_NAME)
-        poses = await pt.get_poses(body_names=APRILTAG_BODY_NAMES)
+        poses = await pt.get_poses(body_names=BODY_NAMES)
+        print("Got poses:")
+        print(poses)
 
         poses = await transform_and_adjust_poses(machine, poses, length_of_touch_tip=TOUCH_PROBE_LENGTH_MM)
 
@@ -194,13 +196,13 @@ async def main(scanning_pose: Optional[list[float]] = None):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Touch test script for AprilTag detection')
+    parser = argparse.ArgumentParser(description='Touch test script')
     parser.add_argument(
         '--scanning-pose',
         type=float,
         nargs=7,
         metavar=('X', 'Y', 'Z', 'O_X', 'O_Y', 'O_Z', 'THETA'),
-        help='Scanning pose in world frame: x y z o_x o_y o_z theta (7 values). If not provided, assumes AprilTags are already visible from the current pose.'
+        help='Scanning pose in world frame: x y z o_x o_y o_z theta (7 values). If not provided, assumes bodies are already visible from the current pose.'
     )
     
     args = parser.parse_args()
