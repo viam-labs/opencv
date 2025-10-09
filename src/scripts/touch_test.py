@@ -1,7 +1,6 @@
 import argparse
 import asyncio
 import copy
-import math
 import os
 
 from dotenv import load_dotenv
@@ -20,10 +19,10 @@ ARM_NAME = "ur5e"
 POSE_TRACKER_NAME = "chessboard-pose-tracker"
 MOTION_SERVICE_NAME = "motion-service"
 
-BODY_NAMES = []
+BODY_NAMES = ['corner_53', 'corner_62', 'corner_75']
 
 TOUCH_PROBE_LENGTH_MM = 113
-PRETOUCH_OFFSET_MM = 10  # additional offset beyond touch probe length
+PRETOUCH_OFFSET_MM = 30  # additional offset beyond touch probe length
 
 VELOCITY_NORMAL = 48
 VELOCITY_SLOW = 25
@@ -31,6 +30,9 @@ VELOCITY_SLOW = 25
 WORLD_FRAME = "world"
 COLLISION_FRAME_PROBE = "touch_probe"
 COLLISION_FRAME_PEDESTAL = "pedestal-ur5e"
+COLLISION_FRAME_APRILTAGS = "apriltags-obstacle"
+COLLISION_FRAME_CHESSBOARD = "chessboard-obstacle"
+ALLOWED_PROBE_COLLISION_FRAMES = [COLLISION_FRAME_PEDESTAL, COLLISION_FRAME_APRILTAGS, COLLISION_FRAME_CHESSBOARD]
 
 
 async def connect():
@@ -43,45 +45,62 @@ async def connect():
     return await RobotClient.at_address(address, opts)
 
 
-async def transform_and_adjust_poses(machine: RobotClient, poses: Dict[str, PoseInFrame], length_of_touch_tip: float = 0) -> Dict[str, PoseInFrame]:
-    """Transform poses to world frame and apply offset along orientation vector"""
-    for pose_name, pose_in_camera_frame in poses.items():
+async def get_pretouch_poses(machine: RobotClient, pt: PoseTracker, length_of_touch_tip: float = 0) -> Dict[str, PoseInFrame]:
+    poses_in_camera_frame = await pt.get_poses(body_names=BODY_NAMES)
+    print("Got poses from pose tracker in camera frame:")
+    print(poses_in_camera_frame)
+
+    for pose_name, pose_in_camera_frame in poses_in_camera_frame.items():
         pose_in_world_frame_pretouch = await machine.transform_pose(pose_in_camera_frame, WORLD_FRAME)
         
-        # Get ov of the tag (pre-normalized)
         o_x = pose_in_world_frame_pretouch.pose.o_x
         o_y = pose_in_world_frame_pretouch.pose.o_y
         o_z = pose_in_world_frame_pretouch.pose.o_z
         
-        # Calculate offset distance (negative to move away from tag surface)
         offset_distance = -(length_of_touch_tip + PRETOUCH_OFFSET_MM)
         
         pose_in_world_frame_pretouch.pose.x += o_x * offset_distance
         pose_in_world_frame_pretouch.pose.y += o_y * offset_distance
         pose_in_world_frame_pretouch.pose.z += o_z * offset_distance
 
-        poses[pose_name] = pose_in_world_frame_pretouch
-    return poses
+        poses_in_camera_frame[pose_name] = pose_in_world_frame_pretouch
+    return poses_in_camera_frame
 
 
-async def move_to_poses(motion_service: MotionClient, arm: Arm, poses: Dict[str, PoseInFrame]) -> None:
+async def move_to_scanning_pose(motion_service: MotionClient, arm: Arm, scanning_pose: list[float]) -> None:
+    print(f"Moving to initial scanning pose: scanning_pose={scanning_pose}")
+    scan_pose = Pose(
+        x=scanning_pose[0],
+        y=scanning_pose[1],
+        z=scanning_pose[2],
+        o_x=scanning_pose[3],
+        o_y=scanning_pose[4],
+        o_z=scanning_pose[5],
+        theta=scanning_pose[6]
+    )
+    scan_pose_in_frame = PoseInFrame(
+        reference_frame=WORLD_FRAME,
+        pose=scan_pose
+    )
+    await motion_service.move(
+        component_name=arm.name,
+        destination=scan_pose_in_frame
+    )
+    print("Arrived at scanning position")
+
+
+async def start_touching(motion_service: MotionClient, arm: Arm, poses: Dict[str, PoseInFrame]) -> None:
     for pose_name, pose_pretouch in poses.items():
-        print(f"\n--- Moving to body: {pose_name} ---")
-        
-        # Move to pretouch pose
+        print(f"Moving to pretouch position: {pose_name}")
         await motion_service.move(
             component_name=arm.name,
-            destination=pose_pretouch,
+            destination=pose_pretouch
         )
-        print(f"Arrived at pretouch pose for {pose_name}")
         
-        # Set slower velocity for incremental movements
         await arm.do_command({"set_vel": VELOCITY_SLOW})
         
-        # Current pose for incremental movement
         current_pose = copy.deepcopy(pose_pretouch)
         
-        # Get the orientation vector for this body
         o_x = pose_pretouch.pose.o_x
         o_y = pose_pretouch.pose.o_y
         o_z = pose_pretouch.pose.o_z
@@ -95,7 +114,6 @@ async def move_to_poses(motion_service: MotionClient, arm: Arm, poses: Dict[str,
             
             try:
                 distance = float(response)
-                # Move forward by specified distance along the orientation vector
                 current_pose.pose.x += o_x * distance
                 current_pose.pose.y += o_y * distance
                 current_pose.pose.z += o_z * distance
@@ -103,12 +121,12 @@ async def move_to_poses(motion_service: MotionClient, arm: Arm, poses: Dict[str,
                 print(f"  New position: x={current_pose.pose.x:.2f}, y={current_pose.pose.y:.2f}, z={current_pose.pose.z:.2f}")
                 
                 collision_spec = CollisionSpecification()
-                collision_spec.allows.append(
+                collision_spec.allows.extend([
                     CollisionSpecification.AllowedFrameCollisions(
                         frame1=COLLISION_FRAME_PROBE,
-                        frame2=COLLISION_FRAME_PEDESTAL
-                    )
-                )
+                        frame2=frame
+                    ) for frame in ALLOWED_PROBE_COLLISION_FRAMES
+                ])
                 constraints = Constraints(collision_specification=[collision_spec])
                 
                 await motion_service.move(
@@ -117,7 +135,7 @@ async def move_to_poses(motion_service: MotionClient, arm: Arm, poses: Dict[str,
                     constraints=constraints
                 )
             except ValueError:
-                print("Invalid response, please enter a number (e.g., 1, 0.5, 2.5).")
+                print("Invalid response, please enter a number (e.g., 1, 10, 0.5, 2.5).")
                 print(f"Finished with {pose_name}, moving to next pose")
                 break
             except Exception as e:
@@ -125,8 +143,12 @@ async def move_to_poses(motion_service: MotionClient, arm: Arm, poses: Dict[str,
                 print(f"Finished with {pose_name}, moving to next pose")
                 break
         
-        # Restore normal velocity
         await arm.do_command({"set_vel": VELOCITY_NORMAL})
+        await motion_service.move(
+            component_name=arm.name,
+            destination=pose_pretouch,
+        )
+        await asyncio.sleep(1)
 
 async def main(scanning_pose: Optional[list[float]] = None):
     machine: Optional[RobotClient] = None
@@ -137,50 +159,33 @@ async def main(scanning_pose: Optional[list[float]] = None):
     try:
         machine = await connect()
         arm = Arm.from_robot(machine, ARM_NAME)
-        # Set initial speed
         await arm.do_command({"set_vel": VELOCITY_NORMAL})
 
+        # Print initial arm pose for utility and sanity check
         motion_service = MotionClient.from_robot(machine, MOTION_SERVICE_NAME)
         initial_arm_pose = await motion_service.get_pose(
             component_name=arm.name,
             destination_frame=WORLD_FRAME
         )
-        print(f"Initial arm pose captured: {initial_arm_pose}")
+        print(f"Initial arm pose: {initial_arm_pose}")
         
+        # Move to scanning pose if provided
         if scanning_pose:
-            print(f"Moving to initial scanning pose: scanning_pose={scanning_pose}")
-            scan_pose = Pose(
-                x=scanning_pose[0],
-                y=scanning_pose[1],
-                z=scanning_pose[2],
-                o_x=scanning_pose[3],
-                o_y=scanning_pose[4],
-                o_z=scanning_pose[5],
-                theta=scanning_pose[6]
-            )
-            scan_pose_in_frame = PoseInFrame(
-                reference_frame=WORLD_FRAME,
-                pose=scan_pose
-            )
-            await motion_service.move(
-                component_name=arm.name,
-                destination=scan_pose_in_frame
-            )
-            print("Arrived at scanning position")
+            await move_to_scanning_pose(motion_service, arm, scanning_pose)
         else:
             print("No scanning position provided, assuming bodies re already visible")
         
         input("Press Enter to continue...")
         
+        # Get poses from pose tracker in camera frame and convert to world frame
         pt = PoseTracker.from_robot(machine, POSE_TRACKER_NAME)
-        poses = await pt.get_poses(body_names=BODY_NAMES)
-        print("Got poses:")
+        poses = await get_pretouch_poses(machine, pt, length_of_touch_tip=TOUCH_PROBE_LENGTH_MM)
+        print("Converted poses to world frame and applied offset:")
         print(poses)
 
-        poses = await transform_and_adjust_poses(machine, poses, length_of_touch_tip=TOUCH_PROBE_LENGTH_MM)
-
+        # Start touches
         input("Press Enter to start touches...")
-        await move_to_poses(motion_service, arm, poses)
+        await start_touching(motion_service, arm, poses)
     except Exception as e:
         print("Caught exception in script main: ")
         raise e

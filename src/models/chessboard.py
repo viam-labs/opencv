@@ -176,6 +176,7 @@ class Chessboard(PoseTracker, EasyResource):
 
         # Transpose needed due to frame convention mismatch:
         # OpenCV solvePnP returns object -> camera transform, but Viam expects camera -> object transform.
+        # All corners share the same orientation (they're on the same rigid planar board)
         ox, oy, oz, theta = call_go_mat2ov(R.T)
         self.logger.debug(f"Translated rotation matrix to orientation vector with values ox={ox}, oy={oy}, oz={oz}, theta={theta}")
         
@@ -199,6 +200,15 @@ class Chessboard(PoseTracker, EasyResource):
             )
         
         self.logger.debug(f"generated {len(corner_poses)} corner poses")
+        
+        if body_names:
+            filtered_poses = {}
+            for name in body_names:
+                if name not in corner_poses:
+                    raise Exception(f"requested body name '{name}' not found in detected corners")
+                filtered_poses[name] = corner_poses[name]
+            return filtered_poses
+        
         return corner_poses
 
     async def do_command(
