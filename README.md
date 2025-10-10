@@ -63,16 +63,16 @@ The following attribute template can be used to configure this model:
 
 The following attributes are available for this model:
 
-| Name              | Type     | Inclusion  | Description                                             |
-|-------------------|----------|------------|---------------------------------------------------------|
-| `arm_name`        | `string` | `Required` | Name of the arm component used for calibration.         |
-| `calibration_type`| `string` | `Required` | Name of the type of calibration to perform.             |
-| `camera_name`     | `string` | `Required` | Name of the camera component used for calibration.      |
-| `joint_positions` | `list`   | `Required` | List of joint positions for calibration poses.          |
-| `method`          | `string` | `Required` | Method to use for calibration.                          |
-| `pose_tracker`    | `string` | `Required` | Name of the pose tracker component to detect markers.   |
-| `motion`          | `string` | `Optional` | Name of the motion service for coordinated movement.    |
-| `sleep_seconds`   | `float`  | `Optional` | Sleep time between movements (defaults to 1.0 seconds). |
+| Name              | Type     | Inclusion  | Description                                                                        |
+|-------------------|----------|------------|------------------------------------------------------------------------------------|
+| `arm_name`        | `string` | `Required` | Name of the arm component used for calibration.                                    |
+| `calibration_type`| `string` | `Required` | Name of the type of calibration to perform.                                        |
+| `camera_name`     | `string` | `Required` | Name of the camera component used for calibration.                                 |
+| `joint_positions` | `list`   | `Required` | List of joint positions for calibration poses.                                     |
+| `method`          | `string` | `Required` | Method to use for calibration.                                                     |
+| `pose_tracker`    | `string` | `Required` | Name of the pose tracker component to detect markers.                              |
+| `motion`          | `string` | `Optional` | Name of the motion service for coordinated movement.                               |
+| `sleep_seconds`   | `float`  | `Optional` | Sleep time between movements to allow for arm to settle (defaults to 2.0 seconds). |
 
 Available calibrations are:
 
@@ -92,7 +92,7 @@ Available methods are:
 ```json
 {
   "arm_name": "my_arm",
-  "calibration": "eye-in-hand",
+  "calibration_type": "eye-in-hand",
   "camera_name": "cam",
   "joint_positions": [[0, 0, 0, 0, 0, 0], [0.1, 0.2, 0.3, 0, 0, 0]],
   "method": "CALIB_HAND_EYE_TSAI",

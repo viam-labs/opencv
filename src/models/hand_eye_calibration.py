@@ -28,14 +28,18 @@ METHODS = [
 ]
 
 # required attributes
-arm_attr = "arm_name"
-calib_attr = "calibration_type"
-cam_attr = "camera_name"
-joint_positions_attr = "joint_positions"
-method_attr = "method"
-motion_attr = "motion"
-pose_tracker_attr = "pose_tracker"
-sleep_attr = "sleep_seconds"
+ARM_ATTR = "arm_name"
+CALIB_ATTR = "calibration_type"
+CAM_ATTR = "camera_name"
+JOINT_POSITIONS_ATTR = "joint_positions"
+METHOD_ATTR = "method"
+MOTION_ATTR = "motion"
+POSE_TRACKER_ATTR = "pose_tracker"
+SLEEP_ATTR = "sleep_seconds"
+
+# Default config attribute values
+DEFAULT_SLEEP_SECONDS = 2.0
+DEFAULT_METHOD = "CALIB_HAND_EYE_TSAI"
 
 
 class HandEyeCalibration(Generic, EasyResource):
@@ -78,28 +82,28 @@ class HandEyeCalibration(Generic, EasyResource):
         """
         attrs = struct_to_dict(config.attributes)
 
-        cam = attrs.get(cam_attr)
+        cam = attrs.get(CAM_ATTR)
         if cam is None:
-            raise Exception(f"Missing required {cam_attr} attribute.")
+            raise Exception(f"Missing required {CAM_ATTR} attribute.")
         
-        arm = attrs.get(arm_attr)
+        arm = attrs.get(ARM_ATTR)
         if arm is None:
-            raise Exception(f"Missing required {arm_attr} attribute.")
+            raise Exception(f"Missing required {ARM_ATTR} attribute.")
         
-        if attrs.get(joint_positions_attr) is None:
-            raise Exception(f"Missing required {joint_positions_attr} attribute.")
+        if attrs.get(JOINT_POSITIONS_ATTR) is None:
+            raise Exception(f"Missing required {JOINT_POSITIONS_ATTR} attribute.")
         
-        pose_tracker = attrs.get(pose_tracker_attr)
+        pose_tracker = attrs.get(POSE_TRACKER_ATTR)
         if pose_tracker is None:
-            raise Exception(f"Missing required {pose_tracker_attr} attribute.")
+            raise Exception(f"Missing required {POSE_TRACKER_ATTR} attribute.")
         
-        calib = attrs.get(calib_attr)
+        calib = attrs.get(CALIB_ATTR)
         if calib is None:
-            raise Exception(f"Missing required {calib_attr} attribute.")
+            raise Exception(f"Missing required {CALIB_ATTR} attribute.")
         if calib not in CALIBS:
             raise Exception(f"{calib} is not an available calibration.")
         
-        method = attrs.get(method_attr)
+        method = attrs.get(METHOD_ATTR)
         if method not in METHODS:
             raise Exception(f"{method} is not an available method for calibration.")
 
@@ -116,22 +120,22 @@ class HandEyeCalibration(Generic, EasyResource):
         """
         attrs = struct_to_dict(config.attributes)
 
-        camera: str = attrs.get(cam_attr)
+        camera: str = attrs.get(CAM_ATTR)
         self.camera: Camera = dependencies.get(Camera.get_resource_name(camera))
         
-        arm: Arm = attrs.get(arm_attr)
+        arm: Arm = attrs.get(ARM_ATTR)
         self.arm: Arm = dependencies.get(Arm.get_resource_name(arm))
 
-        pose_tracker: PoseTracker = attrs.get(pose_tracker_attr)
+        pose_tracker: PoseTracker = attrs.get(POSE_TRACKER_ATTR)
         self.pose_tracker: PoseTracker = dependencies.get(PoseTracker.get_resource_name(pose_tracker))
 
-        motion: Motion = attrs.get(motion_attr)
+        motion: Motion = attrs.get(MOTION_ATTR)
         self.motion: Motion = dependencies.get(Motion.get_resource_name(motion))
 
-        self.calib = attrs.get(calib_attr)
-        self.joint_positions = attrs.get(joint_positions_attr, [])
-        self.method = attrs.get(method_attr, "CALIB_HAND_EYE_TSAI")
-        self.sleep_seconds = attrs.get(sleep_attr, 1.0)
+        self.calib = attrs.get(CALIB_ATTR)
+        self.joint_positions = attrs.get(JOINT_POSITIONS_ATTR, [])
+        self.method = attrs.get(METHOD_ATTR, DEFAULT_METHOD)
+        self.sleep_seconds = attrs.get(SLEEP_ATTR, DEFAULT_SLEEP_SECONDS)
 
         return super().reconfigure(config, dependencies)
     
