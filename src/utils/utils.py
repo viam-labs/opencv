@@ -94,33 +94,3 @@ def call_go_mat2ov(R: np.ndarray) -> tuple:
     except Exception as e:
         print(f"Failed to call Go mat2ov converter: {e}")
         return None
-    
-def call_joints2pose(joints: list) -> tuple:
-    """
-    TODO: Insert docstring
-    """
-    try:
-        binary_path = _get_binary_path()
-
-        joints_args = [str(val) for val in joints]
-
-        result = subprocess.run([
-            binary_path, 'joints2pose'
-        ] + joints_args, capture_output=True, text=True)
-
-        if result.returncode != 0:
-            print(f"Go binary error: {result.stderr}")
-            return None
-        
-        # Parse the 7 values returned by Go binary (x, y, z, ox, oy, oz, theta)
-        values = [float(x) for x in result.stdout.strip().split()]
-        if len(values) != 7:
-            print(f"Expected 7 values from Go binary, got {len(values)}")
-            return None
-            
-        # Return orientation vector components
-        return values[0], values[1], values[2], values[3]
-
-    except Exception as e:
-        print(f"Failed to conver joint positions to pose")
-        return None

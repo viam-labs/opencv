@@ -127,23 +127,6 @@ func main() {
 			matrixElements[6], matrixElements[7], matrixElements[8], // Row 3
 		)
 
-	case "joints2pose":
-		if len(os.Args) != 6 {
-			fmt.Fprintf(os.Stderr, "Usage: %s joints2pose joints[0] joints[1] joints[2] joints[3] joints[4] joints[5]\n", os.Args[0])
-			os.Exit(1)
-		}
-
-		// Parse joint values
-		var jointElements [6]float64
-		for i := 0; i < 6; i++ {
-			val, err := strconv.ParseFloat(os.Args[i+2], 64)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error parsing matrix element %d: %v\n", i+1, err)
-				os.Exit(1)
-			}
-			jointElements[i] = val
-		}
-
 	default:
 		// For backward compatibility, if no command is specified but we have 4 args,
 		// assume it's the old ov2mat format
