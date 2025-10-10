@@ -22,11 +22,11 @@ The following attribute template can be used to configure this model:
 
 The following attributes are available for this model:
 
-| Name             | Type   | Inclusion | Description                                              |
-|------------------|--------|-----------|----------------------------------------------------------|
-| `camera_name`    | string | Required  | Name of the camera used for checking pose of chessboard. |
-| `pattern_size`   | list   | Required  | Size of the chessboard pattern.                          |
-| `square_size_mm` | int    | Required  | Physical size of a square in the chessboard pattern.     |
+| Name             | Type   | Inclusion | Description                                             |
+|------------------|--------|-----------|---------------------------------------------------------|
+| `camera_name`    | string | Required  | Name of the camera used for checking pose of chessboard.|
+| `pattern_size`   | list   | Required  | Dimensions of the chessboard pattern (rows x columns of inner corner squares).|
+| `square_size_mm` | int    | Required  | Physical size of a square in the chessboard pattern.    |
 
 #### Pose Tracker Example Configuration
 
@@ -49,7 +49,7 @@ The following attribute template can be used to configure this model:
 ```json
 {
 "arm_name": <string>,
-"calibration": <string>,
+"calibration_type": <string>,
 "camera_name": <string>,
 "joint_positions": <list>,
 "method": <string>,
@@ -63,16 +63,16 @@ The following attribute template can be used to configure this model:
 
 The following attributes are available for this model:
 
-| Name              | Type   | Inclusion | Description                                             |
-|-------------------|--------|-----------|---------------------------------------------------------|
-| `arm_name`        | string | Required  | Name of the arm component used for calibration.         |
-| `calibration`     | string | Required  | Name of the type of calibration to perform.             |
-| `camera_name`     | string | Required  | Name of the camera component used for calibration.      |
-| `joint_positions` | list   | Required  | List of joint positions for calibration poses.          |
-| `method`          | string | Required  | Method to use for calibration.                          |
-| `pose_tracker`    | string | Required  | Name of the pose tracker component to detect markers.   |
-| `motion`          | string | Optional  | Name of the motion service for coordinated movement.    |
-| `sleep_seconds`   | float  | Optional  | Sleep time between movements (defaults to 1.0 seconds). |
+| Name              | Type     | Inclusion  | Description                                             |
+|-------------------|----------|------------|---------------------------------------------------------|
+| `arm_name`        | `string` | `Required` | Name of the arm component used for calibration.         |
+| `calibration_type`| `string` | `Required` | Name of the type of calibration to perform.             |
+| `camera_name`     | `string` | `Required` | Name of the camera component used for calibration.      |
+| `joint_positions` | `list`   | `Required` | List of joint positions for calibration poses.          |
+| `method`          | `string` | `Required` | Method to use for calibration.                          |
+| `pose_tracker`    | `string` | `Required` | Name of the pose tracker component to detect markers.   |
+| `motion`          | `string` | `Optional` | Name of the motion service for coordinated movement.    |
+| `sleep_seconds`   | `float`  | `Optional` | Sleep time between movements (defaults to 1.0 seconds). |
 
 Available calibrations are:
 

@@ -29,7 +29,7 @@ METHODS = [
 
 # required attributes
 arm_attr = "arm_name"
-calib_attr = "calibration"
+calib_attr = "calibration_type"
 cam_attr = "camera_name"
 joint_positions_attr = "joint_positions"
 method_attr = "method"
@@ -42,7 +42,7 @@ class HandEyeCalibration(Generic, EasyResource):
     # To enable debug-level logging, either run viam-server with the --debug option,
     # or configure your resource/machine to display debug logs.
     MODEL: ClassVar[Model] = Model(
-        ModelFamily("bradgrigsby", "calibrate"), "hand-eye-calibration"
+        ModelFamily("viam", "opencv"), "hand_eye_calibration"
     )
 
     @classmethod
@@ -147,23 +147,25 @@ class HandEyeCalibration(Generic, EasyResource):
         )
         t_g2b = np.array([arm_pose.x, arm_pose.y, arm_pose.z], dtype=np.float64)
 
-        # Get pose of the tag
-        tag_poses: Dict[str, PoseInFrame] = await self.pose_tracker.get_poses(body_names=[])
-        if tag_poses is None or len(tag_poses) == 0:
-            self.logger.warning("could not find any tags in camera frame. Check to make sure there is a tag in view.")
-            raise Exception("could not find any tags in camera frame. Check to make sure there is a tag in view.")
-        if len(tag_poses.items()) > 1:
-            self.logger.warning("more than 1 tag detected in camera frame. Please remove any other tags in view.")
-            raise Exception("more than 1 tag detected in camera frame. Please remove any other tags in view.")
+        # Get pose from the tracker (AprilTag, chessboard corner, etc.)
+        tracked_poses: Dict[str, PoseInFrame] = await self.pose_tracker.get_poses(body_names=[])
+        if tracked_poses is None or len(tracked_poses) == 0:
+            no_bodies_error_msg = "could not find any tracked bodies in camera frame. Check to make sure a calibration target is in view."
+            self.logger.warning(no_bodies_error_msg)
+            raise Exception(no_bodies_error_msg)
+        if len(tracked_poses.items()) > 1:
+            multiple_bodies_error_msg = "more than 1 body detected in camera frame. Ensure only one calibration target is visible or filter out other bodies."
+            self.logger.warning(multiple_bodies_error_msg)
+            raise Exception(multiple_bodies_error_msg)
         
-        tag_pose: Pose = list(tag_poses.values())[0].pose
+        tracked_pose: Pose = list(tracked_poses.values())[0].pose
         R_t2c = call_go_ov2mat(
-            tag_pose.o_x,
-            tag_pose.o_y,
-            tag_pose.o_z,
-            tag_pose.theta
+            tracked_pose.o_x,
+            tracked_pose.o_y,
+            tracked_pose.o_z,
+            tracked_pose.theta
         )
-        t_t2c = np.array([tag_pose.x, tag_pose.y, tag_pose.z], dtype=np.float64)
+        t_t2c = np.array([tracked_pose.x, tracked_pose.y, tracked_pose.z], dtype=np.float64)
 
         return R_g2b, t_g2b, R_t2c, t_t2c
 
@@ -230,7 +232,7 @@ class HandEyeCalibration(Generic, EasyResource):
 
                     # Check if we have enough measurements
                     if len(R_gripper2base_list) < 3:
-                        raise Exception(f"not enough valid measurements collected. Got {len(R_gripper2base_list)}, need at least 3. Make sure the pose tracker can see exactly one tag in each calibration position.")
+                        raise Exception(f"not enough valid measurements collected. Got {len(R_gripper2base_list)}, need at least 3. Make sure the pose tracker can see exactly one target in each calibration position.")
 
                     self.logger.info(f"collected {len(R_gripper2base_list)} measurements, running calibration...")
 
@@ -282,12 +284,12 @@ class HandEyeCalibration(Generic, EasyResource):
                 case "move_arm": 
                     raise NotImplementedError("This is not yet implemented")
                 case "check_tags":
-                    tag_poses: Dict[str, PoseInFrame] = await self.pose_tracker.get_poses(body_names=[])
-                    if tag_poses is None or len(tag_poses) == 0:
-                        resp["check_tags"] = "No tags found in image"
+                    tracked_poses: Dict[str, PoseInFrame] = await self.pose_tracker.get_poses(body_names=[])
+                    if tracked_poses is None or len(tracked_poses) == 0:
+                        resp["check_tags"] = "No tracked bodies found in image"
                         break
 
-                    resp["check_tags"] = f"Number of tags seen: {len(tag_poses)}"
+                    resp["check_tags"] = f"Number of tracked bodies seen: {len(tracked_poses)}"
                 case "save_calibration_position":
                     index = int(value)
 
@@ -323,12 +325,12 @@ class HandEyeCalibration(Generic, EasyResource):
 
                     # TODO: Implement using motion service 
 
-                    tag_poses: dict = await self.pose_tracker.get_poses()
-                    if tag_poses is None:
-                        resp["move_arm_to_position"] = "No tags found in image"
+                    tracked_poses: dict = await self.pose_tracker.get_poses()
+                    if tracked_poses is None:
+                        resp["move_arm_to_position"] = "No tracked bodies found in image"
                         break
 
-                    resp["move_arm_to_position"] = len(tag_poses)
+                    resp["move_arm_to_position"] = len(tracked_poses)
                 case "delete_calibration_position":
                     index = int(value)
                     if index >= len(self.joint_positions):
