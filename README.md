@@ -101,16 +101,50 @@ Available methods are:
   "sleep_seconds": 2.0
 }
 ```
-### Camera Calibration
 
-This model provides camera calibration functionality through the `do_command` interface. You can use it to determine the intrinsic parameters of a camera by providing multiple images of a chessboard pattern.
+## Model viam:opencv:camera-calibration
 
-#### Calibrate Camera Command
+A generic service that provides camera calibration functionality through the `do_command` interface. This service uses chessboard patterns to determine camera intrinsic parameters (focal lengths, principal point, and distortion coefficients) from multiple images. Unlike the chessboard pose tracker, this service is dedicated solely to calibration and does not track poses.
 
-Use the `calibrate_camera` command to compute camera intrinsics:
+### Camera Calibration Configuration
+
+The following attribute template can be used to configure this model:
+
+```json
+{
+  "pattern_size": <list>,
+  "square_size_mm": <int>
+}
+```
+
+#### Camera Calibration Attributes
+
+The following attributes are available for this model:
+
+| Name             | Type   | Inclusion | Description                                             |
+|------------------|--------|-----------|---------------------------------------------------------|
+| `pattern_size`   | list   | Required  | Dimensions of the chessboard pattern (rows x columns of inner corner squares).|
+| `square_size_mm` | int    | Required  | Physical size of a square in the chessboard pattern in millimeters.|
+
+#### Camera Calibration Example Configuration
+
+```json
+{
+  "pattern_size": [9, 6],
+  "square_size_mm": 21
+}
+```
+
+### Calibrate Camera Command
+
+Use the `calibrate_camera` command via `do_command` to compute camera intrinsics:
 
 ```python
 import base64
+from viam.services.generic import Generic
+
+# Get the camera calibration service
+camera_cal = Generic.from_robot(robot, "camera-calibration-1")
 
 # Capture and encode images at your own pace
 images = []
@@ -118,13 +152,13 @@ for i in range(10):
     # Capture image from your camera
     # User can move the chessboard between captures with proper feedback
     img_data = capture_image()  # Your image capture logic
-    
+
     # Encode to base64
     base64_img = base64.b64encode(img_data).decode('utf-8')
     images.append(base64_img)
 
 # Run calibration
-result = await chessboard.do_command({
+result = await camera_cal.do_command({
     "calibrate_camera": {
         "images": images  # List of base64 encoded image strings
     }

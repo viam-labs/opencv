@@ -7,10 +7,10 @@ from dotenv import load_dotenv
 from PIL import Image
 
 from viam.components.camera import Camera
-from viam.components.pose_tracker import PoseTracker
 from viam.robot.client import RobotClient
 from viam.media.video import CameraMimeType
 from viam.media.utils.pil import viam_to_pil_image
+from viam.services.generic import Generic
 
 
 async def connect():
@@ -117,18 +117,18 @@ async def collect_calibration_images(cam: Camera, num_images: int = 10) -> list[
     return base64_images
 
 
-async def run_calibration(chessboard: PoseTracker, base64_images: list[str]):
+async def run_calibration(camera_cal: Generic, base64_images: list[str]):
     """Run camera calibration using collected images.
-    
+
     Args:
-        chessboard: Chessboard pose tracker component
+        camera_cal: Camera calibration generic service
         base64_images: List of base64 encoded images
     """
     print(f"\n{'='*60}")
     print("Running Camera Calibration...")
     print(f"{'='*60}\n")
-    
-    result = await chessboard.do_command({
+
+    result = await camera_cal.do_command({
         "calibrate_camera": {
             "images": base64_images
         }
@@ -203,8 +203,9 @@ async def main():
         
         print(f"\n{'='*60}\n")
 
-        chessboard = PoseTracker.from_robot(machine, "pose-tracker-1")
-        
+        # Get camera calibration service
+        camera_cal = Generic.from_robot(machine, "camera-calibration-1")
+
         # Ask user how many images to collect
         while True:
             try:
@@ -222,9 +223,9 @@ async def main():
         
         # Collect calibration images with user validation
         base64_images = await collect_calibration_images(cam, num_images)
-        
+
         # Run calibration
-        result = await run_calibration(chessboard, base64_images)
+        result = await run_calibration(camera_cal, base64_images)
         
     except Exception as e:
         print(f"Error: {e}")
