@@ -186,7 +186,6 @@ class HandEyeCalibration(Generic, EasyResource):
         for key, value in command.items():
             match key:
                 case "run_calibration":
-                    self.logger.info("Running calibration (everything should be transposed properly now) !!!")
                     # Initialize data collection lists
                     R_gripper2base_list = []
                     t_gripper2base_list = []
