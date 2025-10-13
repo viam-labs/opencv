@@ -1,0 +1,20 @@
+# Include production requirements first
+-r requirements.txt
+
+# Development and testing dependencies
+pytest>=7.0.0
+pytest-asyncio>=0.21.0      # For async test support  
+pytest-mock>=3.10.0         # For mocking in tests
+pytest-cov>=4.0.0           # For coverage reports
+pytest-xdist>=3.0.0         # For parallel test execution
+
+# Code quality tools
+black>=23.0.0               # Code formatter
+isort>=5.12.0               # Import sorter  
+flake8>=6.0.0               # Linter
+mypy>=1.0.0                 # Type checker
+
+# Additional testing utilities  
+factory-boy>=3.2.0          # For creating test data
+responses>=0.23.0           # For mocking HTTP responses
+freezegun>=1.2.0            # For mocking datetime
