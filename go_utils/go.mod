@@ -1,4 +1,4 @@
-module orientation_converter
+module go_utils
 
 go 1.24.6
 

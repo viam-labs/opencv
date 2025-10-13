@@ -8,8 +8,14 @@
     {
       "api": "rdk:component:pose_tracker",
       "model": "viam:opencv:chessboard",
-      "short_description": "Provide a short (100 characters or less) description of this model here",
+      "short_description": "OpenCV-based pose tracker component for chessboard patterns",
       "markdown_link": "README.md#model-viamopencvchessboard"
+    },
+    {
+      "api": "rdk:service:generic",
+      "model": "viam:opencv:hand_eye_calibration",
+      "short_description": "OpenCV-based hand-eye calibration service",
+      "markdown_link": "README.md#model-viamopencvhandeyecalibration"
     }
   ],
   "applications": null,
