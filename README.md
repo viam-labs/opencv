@@ -139,7 +139,7 @@ The following attributes are available for this model:
 
 Use the `calibrate_camera` command via `do_command` to compute camera intrinsics:
 
-See `src/scripts/camera_calibration.py` for a Python script example.
+See `src/scripts/camera_calibration_script.py` for the Python script to do so..
 
 **Parameters:**
 - `images` (required): List of base64 encoded image strings containing chessboard patterns
