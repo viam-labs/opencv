@@ -200,7 +200,7 @@ class CameraCalibration(Generic, EasyResource):
         dist_coeffs = np.zeros(5, dtype=np.float32)
 
         # Run calibration
-        ret, camera_matrix, dist_coeffs, _, _ = cv2.calibrateCamera(
+        ret, camera_matrix, dist_coeffs, rvecs, tvecs = cv2.calibrateCamera(
             object_points,
             image_points,
             image_size,
@@ -209,12 +209,23 @@ class CameraCalibration(Generic, EasyResource):
             flags=cv2.CALIB_RATIONAL_MODEL
         )
 
-        self.logger.info(f"Calibration complete with RMS error: {ret}")
+        # Calculate re-projection error
+        mean_error = 0
+        for i in range(len(object_points)):
+            imgpoints2, _ = cv2.projectPoints(object_points[i], rvecs[i], tvecs[i], camera_matrix, dist_coeffs)
+            error = cv2.norm(image_points[i], imgpoints2, cv2.NORM_L2) / len(imgpoints2)
+            mean_error += error
+
+        reprojection_error = mean_error / len(object_points)
+
+        self.logger.info(f"Calibration complete with RMS error: {ret:.6f}")
+        self.logger.info(f"Mean re-projection error: {reprojection_error:.6f}")
 
         # Format results
         result = {
             "success": True,
             "rms_error": float(ret),
+            "reprojection_error": float(reprojection_error),
             "num_images": successful_detections,
             "image_size": {"width": image_size[0], "height": image_size[1]},
             "camera_matrix": {

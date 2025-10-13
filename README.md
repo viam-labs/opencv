@@ -175,6 +175,7 @@ The command returns a dictionary with the following structure:
 {
   "success": true,
   "rms_error": 0.234,
+  "reprojection_error": 0.156,
   "num_images": 10,
   "image_size": {
     "width": 1920,
@@ -203,7 +204,8 @@ The command returns a dictionary with the following structure:
 4. Once all images are processed, it uses OpenCV's `calibrateCamera` function to compute:
    - **Camera matrix (intrinsics)**: Focal lengths (fx, fy) and principal point (cx, cy)
    - **Distortion coefficients**: Radial (k1, k2, k3) and tangential (p1, p2) distortion parameters
-   - **RMS error**: Root mean square reprojection error (lower is better)
+   - **RMS error**: Root mean square reprojection error from calibration (lower is better)
+   - **Re-projection error**: Mean error when projecting 3D points back to 2D using calibrated parameters (lower is better, closer to zero indicates more accurate calibration)
    - **Number of images**: Number of images successfully used for calibration
 
 **Tips for best results:**

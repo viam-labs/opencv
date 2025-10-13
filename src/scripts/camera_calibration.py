@@ -1,7 +1,28 @@
+"""
+Camera Calibration Script
+
+This script performs camera calibration using chessboard patterns.
+
+Usage:
+    python camera_calibration.py --camera-name <camera_name> --service-name <service_name> [options]
+
+Required Arguments:
+    --camera-name     Name of the camera component in your robot configuration
+    --service-name    Name of the camera calibration service in your robot configuration
+
+Optional Arguments:
+    --num-images      Number of images to collect (default: 10, minimum: 3)
+
+Example:
+    python camera_calibration.py --camera-name orbbec-1 --service-name camera-calibration-1 --num-images 15
+"""
+
+import argparse
 import asyncio
 import base64
 import io
 import os
+import sys
 
 from dotenv import load_dotenv
 from PIL import Image
@@ -128,50 +149,63 @@ async def run_calibration(camera_cal: Generic, base64_images: list[str]):
     print("Running Camera Calibration...")
     print(f"{'='*60}\n")
 
-    result = await camera_cal.do_command({
+    response = await camera_cal.do_command({
         "calibrate_camera": {
             "images": base64_images
         }
     })
     
-    if result.get("success"):
+    if response.get("success"):
         print("Calibration successful!\n")
-        print(f"RMS Error: {result['rms_error']:.4f}")
-        print(f"Images Used: {result['num_images']}")
-        print(f"Image Size: {result['image_size']['width']}x{result['image_size']['height']}")
+        print(f"RMS Error: {response['rms_error']:.6f}")
+        print(f"Re-projection Error: {response['reprojection_error']:.6f}")
+        print(f"Images Used: {response['num_images']}")
+        print(f"Image Size: {response['image_size']['width']}x{response['image_size']['height']}")
         print("\nCamera Matrix (Intrinsics):")
-        cm = result['camera_matrix']
+        cm = response['camera_matrix']
         print(f"  fx: {cm['fx']:.2f}")
         print(f"  fy: {cm['fy']:.2f}")
         print(f"  cx: {cm['cx']:.2f}")
         print(f"  cy: {cm['cy']:.2f}")
         print("\nDistortion Coefficients:")
-        dc = result['distortion_coefficients']
+        dc = response['distortion_coefficients']
         print(f"  k1: {dc['k1']:.6f}")
         print(f"  k2: {dc['k2']:.6f}")
         print(f"  p1: {dc['p1']:.6f}")
         print(f"  p2: {dc['p2']:.6f}")
         print(f"  k3: {dc['k3']:.6f}")
     else:
-        print(f"Calibration failed: {result.get('error', 'Unknown error')}")
+        print(f"Calibration failed: {response.get('error', 'Unknown error. Error not present in response')}")
     
     print(f"\n{'='*60}\n")
-    return result
+    return response
 
 
 async def main():
     """Main function to orchestrate the calibration process."""
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description='Camera calibration using chessboard patterns')
+    parser.add_argument('--camera-name', type=str, required=True, help='Name of the camera component')
+    parser.add_argument('--service-name', type=str, required=True, help='Name of the camera calibration service')
+    parser.add_argument('--num-images', type=int, default=10, help='Number of images to collect (default: 10, minimum: 3)')
+    args = parser.parse_args()
+
+    # Validate num_images
+    if args.num_images < 3:
+        print("Error: num_images must be at least 3")
+        sys.exit(1)
+
     machine = None
     try:
         # Connect to robot
         print("Connecting to robot...")
         machine = await connect()
         print("Connected!\n")
-        
-        # Get camera and chessboard components
-        cam = Camera.from_robot(machine, "orbbec-1")
 
-        resp = await cam.do_command({"get_camera_params": ""})
+        # Get camera component
+        cam = Camera.from_robot(machine, args.camera_name)
+
+        resp = await cam.do_command({"get_camera_params": ""})  
         
         # Display camera parameters prettily
         print(f"\n{'='*60}")
@@ -204,25 +238,10 @@ async def main():
         print(f"\n{'='*60}\n")
 
         # Get camera calibration service
-        camera_cal = Generic.from_robot(machine, "camera-calibration-1")
+        camera_cal = Generic.from_robot(machine, args.service_name)
 
-        # Ask user how many images to collect
-        while True:
-            try:
-                num_images_str = input("How many images to collect for calibration? (default: 10): ").strip()
-                if num_images_str == "":
-                    num_images = 10
-                else:
-                    num_images = int(num_images_str)
-                    if num_images < 3:
-                        print("Please enter at least 3 images")
-                        continue
-                break
-            except ValueError:
-                print("Please enter a valid number")
-        
         # Collect calibration images with user validation
-        base64_images = await collect_calibration_images(cam, num_images)
+        base64_images = await collect_calibration_images(cam, args.num_images)
 
         # Run calibration
         result = await run_calibration(camera_cal, base64_images)
