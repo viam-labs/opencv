@@ -16,7 +16,7 @@ from typing import Dict, Optional
 
 # Default values for optional args
 DEFAULT_TOUCH_PROBE_LENGTH_MM = 113
-DEFAULT_PRETOUCH_OFFSET_MM = 30  # additional offset beyond touch probe length
+DEFAULT_PRETOUCH_OFFSET_MM = 500  # additional offset beyond touch probe length
 DEFAULT_VELOCITY_NORMAL = 25
 DEFAULT_VELOCITY_SLOW = 10
 DEFAULT_WORLD_FRAME = "world"
@@ -109,7 +109,11 @@ async def start_touching(
     velocity_normal: float,
     velocity_slow: float
 ) -> None:
-    for pose_name, pose_pretouch in poses.items():
+    # Sort poses lexicographically by name
+    sorted_poses = sorted(poses.items(), key=lambda item: item[0])
+    print(f"Sorted poses: {sorted_poses}")
+    
+    for pose_name, pose_pretouch in sorted_poses:
         print(f"Moving to pretouch position: {pose_name}")
         await motion_service.move(
             component_name=arm.name,

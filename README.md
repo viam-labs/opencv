@@ -200,6 +200,8 @@ The command returns a dictionary with the following structure:
 
 The `touch_test.py` script is a utility for measuring hand-eye calibration accuracy by physically touching tracked targets (such as chessboard corners) with a calibrated touch probe. By comparing the pose reported by the camera system against the arm's physical position reached by the touch probe, you can quantify the error in the derived hand-eye transformation.
 
+To use it you must create a `.env` file in the same directory as the script, and set `VIAM_MACHINE_ADDRESS`, `VIAM_MACHINE_API_KEY_ID` and `VIAM_MACHINE_API_KEY`.
+
 **Location:** `src/scripts/touch_test.py`
 
 **Example usage:**
@@ -209,7 +211,7 @@ python3 src/scripts/touch_test.py \
   --pose-tracker-name pose-tracker-opencv \
   --motion-service-name motion \
   --body-names corner_0 corner_1 corner_2 corner_3 corner_4 corner_5 corner_6 corner_7 corner_8 \
-  --probe-collision-frame touch_probe \
+  --probe-collision-frame touch-probe \
   --allowed-collision-frames pedestal-ur5e apriltags-obstacle chessboard-obstacle \
   --scanning-pose 100 200 300 0 0 1 0
 ```
