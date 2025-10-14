@@ -125,10 +125,12 @@ async def start_touching(
         o_z = pose_pretouch.pose.o_z
         
         # Incremental forward movement loop (along orientation vector)
+        distance_mm_moved = 0
         while True:
             response = input("Keep going? By how many mm (number or press Enter to finish)?: ")
             if not response.strip():
-                print(f"Finished with {pose_name}, moving to next pose")
+                print(f"Finished touching {pose_name}. Moved {distance_mm_moved}mm along orientation vector before stopping.")
+                print("Moving to next pose.")
                 break
             
             try:
@@ -155,13 +157,11 @@ async def start_touching(
                     destination=current_pose,
                     constraints=constraints
                 )
-            except ValueError:
-                print("Invalid response, please enter a number (e.g., 1, 10, 0.5, 2.5).")
-                print(f"Finished with {pose_name}, moving to next pose")
-                break
+                distance_mm_moved += distance
             except Exception as e:
                 print(f"Error: {e}")
-                print(f"Finished with {pose_name}, moving to next pose")
+                print(f"Error touching {pose_name}. Moved {distance_mm_moved}mm along orientation vector before stopping.")
+                print("Moving to next pose")
                 break
 
         await arm.do_command({"set_vel": velocity_normal})
