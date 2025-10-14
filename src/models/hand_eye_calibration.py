@@ -112,8 +112,6 @@ class HandEyeCalibration(Generic, EasyResource):
         if body_name is not None:
             if not isinstance(body_name, str):
                 raise Exception(f"'{BODY_NAME_ATTR}' must be a string, got {type(body_name)}")
-        else:
-            raise Exception(f"Missing required {BODY_NAME_ATTR} attribute.")
 
         return [str(arm), str(cam), str(pose_tracker)], []
 
@@ -144,7 +142,7 @@ class HandEyeCalibration(Generic, EasyResource):
         self.joint_positions = attrs.get(JOINT_POSITIONS_ATTR, [])
         self.method = attrs.get(METHOD_ATTR, DEFAULT_METHOD)
         self.sleep_seconds = attrs.get(SLEEP_ATTR, DEFAULT_SLEEP_SECONDS)
-        self.body_names = [attrs.get(BODY_NAME_ATTR)]
+        self.body_names = [attrs.get(BODY_NAME_ATTR)] if attrs.get(BODY_NAME_ATTR) is not None else []
 
         return super().reconfigure(config, dependencies)
     
@@ -164,11 +162,18 @@ class HandEyeCalibration(Generic, EasyResource):
         # Get pose from the tracker (AprilTag, chessboard corner, etc.)
         tracked_poses: Dict[str, PoseInFrame] = await self.pose_tracker.get_poses(body_names=self.body_names)
         if tracked_poses is None or len(tracked_poses) == 0:
-            no_bodies_error_msg = f"could not find any tracked bodies in camera frame{f' (looking for: {self.body_names})' if self.body_names else ''}. Check to make sure a calibration target is in view."
+            no_bodies_error_msg = "could not find any tracked bodies in camera frame"
+            if self.body_names:
+                no_bodies_error_msg += f" (looking for: {self.body_names})"
+            no_bodies_error_msg += ". Check to make sure a calibration target is in view."
             self.logger.warning(no_bodies_error_msg)
             raise Exception(no_bodies_error_msg)
         if len(tracked_poses.items()) > 1:
-            multiple_bodies_error_msg = f"more than 1 body detected in camera frame. Ensure only one calibration target is visible or specify 'body_name' in config to filter to a specific tracked body."
+            multiple_bodies_error_msg = (
+                f"more than 1 body detected was returned from the pose tracker: {tracked_poses.keys()}."
+                " Ensure only one calibration target is visible or set the 'body_name' config attribute"
+                " to one of the aforementioned body names to filter for a specific tracked body."
+            )
             self.logger.warning(multiple_bodies_error_msg)
             raise Exception(multiple_bodies_error_msg)
         # Get rotation matrix: camera -> target

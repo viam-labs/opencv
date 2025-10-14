@@ -67,14 +67,14 @@ The following attributes are available for this model:
 | Name              | Type     | Inclusion  | Description                                                                        |
 |-------------------|----------|------------|------------------------------------------------------------------------------------|
 | `arm_name`        | `string` | `Required` | Name of the arm component used for calibration.                                    |
-| `body_name`       | `string` | `Required` | Name of the specific tracked body to use (e.g., AprilTag ID like "tag36h11:0" or chessboard corner like "corner_0"). Calibration expects exactly one pose. You can call `get_poses` on a pose tracker resource with no body names specified to discover what body names it's providing. **Important**: When using chessboard corners, ensure the chessboard maintains consistent orientation across all calibration poses to ensure the same corner is tracked. |
 | `calibration_type`| `string` | `Required` | Name of the type of calibration to perform.                                        |
 | `camera_name`     | `string` | `Required` | Name of the camera component used for calibration.                                 |
 | `joint_positions` | `list`   | `Required` | List of joint positions for calibration poses.                                     |
 | `method`          | `string` | `Required` | Method to use for calibration.                                                     |
-| `pose_tracker`    | `string` | `Required` | Name of the pose tracker component to detect markers.                              |
+| `pose_tracker`    | `string` | `Required` | Name of the pose tracker component to detect tracked bodies.                              |
 | `motion`          | `string` | `Optional` | Name of the motion service for coordinated movement.                               |
 | `sleep_seconds`   | `float`  | `Optional` | Sleep time between movements to allow for arm to settle (defaults to 2.0 seconds). |
+| `body_name`       | `string` | `Optional` | Name of the specific tracked body to use (e.g., AprilTag ID like "tag36h11:0" or chessboard corner like "corner_0"). Calibration expects exactly one pose, so if the pose tracker's `get_poses` returns more than one pose, this attribute will be necessary to specify. **Important**: When using chessboard corners, ensure the chessboard maintains consistent orientation across all calibration poses to ensure the same corner is tracked. |
 
 Available calibrations are:
 
