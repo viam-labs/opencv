@@ -37,6 +37,7 @@ METHOD_ATTR = "method"
 MOTION_ATTR = "motion"
 POSE_TRACKER_ATTR = "pose_tracker"
 SLEEP_ATTR = "sleep_seconds"
+VIAM_UTILS = "viam_utils"
 
 # Default config attribute values
 DEFAULT_SLEEP_SECONDS = 2.0
@@ -112,8 +113,15 @@ class HandEyeCalibration(Generic, EasyResource):
         if body_name is not None:
             if not isinstance(body_name, str):
                 raise Exception(f"'{BODY_NAME_ATTR}' must be a string, got {type(body_name)}")
+            
+        # Ensure viam-utils is a resource so that we can convert between joint positions and poses
+        motion = attrs.get(MOTION_ATTR)
+        if motion is not None:
+            viam_utils = attrs.get(VIAM_UTILS)
+            if viam_utils is None:
+                raise Exception(f"{VIAM_UTILS} must be configured with motion planning.")
 
-        return [str(arm), str(cam), str(pose_tracker)], []
+        return [str(arm), str(cam), str(pose_tracker)], [str(viam_utils)]
 
     def reconfigure(
         self, config: ComponentConfig, dependencies: Mapping[ResourceName, ResourceBase]
@@ -126,17 +134,20 @@ class HandEyeCalibration(Generic, EasyResource):
         """
         attrs = struct_to_dict(config.attributes)
 
-        camera: str = attrs.get(CAM_ATTR)
+        camera = attrs.get(CAM_ATTR)
         self.camera: Camera = dependencies.get(Camera.get_resource_name(camera))
         
-        arm: Arm = attrs.get(ARM_ATTR)
+        arm= attrs.get(ARM_ATTR)
         self.arm: Arm = dependencies.get(Arm.get_resource_name(arm))
 
-        pose_tracker: PoseTracker = attrs.get(POSE_TRACKER_ATTR)
+        pose_tracker = attrs.get(POSE_TRACKER_ATTR)
         self.pose_tracker: PoseTracker = dependencies.get(PoseTracker.get_resource_name(pose_tracker))
 
-        motion: Motion = attrs.get(MOTION_ATTR)
+        motion = attrs.get(MOTION_ATTR)
         self.motion: Motion = dependencies.get(Motion.get_resource_name(motion))
+        if self.motion is not None:
+            viam_utilsx = attrs.get(VIAM_UTILS)
+            self.viam_utils: Generic = dependencies.get(Generic.get_resource_name(viam_utils))
 
         self.calib = attrs.get(CALIB_ATTR)
         self.joint_positions = attrs.get(JOINT_POSITIONS_ATTR, [])
@@ -188,6 +199,73 @@ class HandEyeCalibration(Generic, EasyResource):
 
         return R_base2gripper, t_base2gripper, R_cam2target, t_cam2target
 
+    async def _move_arm_to_position(self, joints, position_index):
+        """Move arm to specified joint positions using either direct joint control or motion planning."""
+        self.logger.debug(f"Moving to pose {position_index+1}/{len(self.joint_positions)}")
+        
+        if self.motion is None:
+            # Direct joint position control
+            joints_deg = [np.degrees(joint) for joint in joints]
+            jp = JointPositions(values=joints_deg)
+            await self.arm.move_to_joint_positions(jp)
+            while await self.arm.is_moving():
+                await asyncio.sleep(0.05)
+            self.logger.debug(f"Moved arm to position: {jp}")
+        else:
+            # Motion planning approach
+            raw_pose = await self.viam_utils.do_command({"transform": joints})
+            pose = Pose(
+                x=raw_pose["x"], y=raw_pose["y"], z=raw_pose["z"],
+                o_x=raw_pose["o_x"], o_y=raw_pose["o_y"], 
+                o_z=raw_pose["o_z"], theta=raw_pose["theta"]
+            )
+            pif = PoseInFrame(reference_frame="world", pose=pose)
+            
+            success = await self.motion.move(
+                component_name=self.arm.name,
+                destination=pif,
+            )
+            if not success:
+                raise Exception(f"Could not move to pose {position_index+1}/{len(self.joint_positions)}")
+            self.logger.debug(f"Moved arm to position using motion planning")
+
+    async def _collect_calibration_data(self):
+        """Collect calibration data for all joint positions."""
+        R_gripper2base_list = []
+        t_gripper2base_list = []
+        R_target2cam_list = []
+        t_target2cam_list = []
+
+        for i, joints in enumerate(self.joint_positions):
+            try:
+                await self._move_arm_to_position(joints, i)
+                await asyncio.sleep(self.sleep_seconds)
+                
+                R_base2gripper, t_base2gripper, R_cam2target, t_cam2target = await self.get_calibration_values()
+                
+                # TODO: Implement eye-to-hand. This should just be changing the
+                # order/in-frame values
+                
+                # OpenCV calibrateHandEye expects transposed rotations but original translation vectors
+                # Only invert rotation matrices, keep translation vectors as-is
+                R_gripper2base = R_base2gripper.T
+                t_gripper2base = t_base2gripper
+                R_target2cam = R_cam2target.T
+                t_target2cam = t_cam2target
+                
+                R_gripper2base_list.append(R_gripper2base)
+                t_gripper2base_list.append(t_gripper2base)
+                R_target2cam_list.append(R_target2cam)
+                t_target2cam_list.append(t_target2cam)
+                
+                self.logger.info(f"successfully collected calibration data for pose {i+1}/{len(self.joint_positions)}")
+                
+            except Exception as e:
+                self.logger.warning(f"Could not find calibration values for pose {i+1}/{len(self.joint_positions)}: {e}")
+                continue
+        
+        return R_gripper2base_list, t_gripper2base_list, R_target2cam_list, t_target2cam_list
+
     async def do_command(
         self,
         command: Mapping[str, ValueTypes],
@@ -199,63 +277,7 @@ class HandEyeCalibration(Generic, EasyResource):
         for key, value in command.items():
             match key:
                 case "run_calibration":
-                    # Initialize data collection lists
-                    R_gripper2base_list = []
-                    t_gripper2base_list = []
-                    R_target2cam_list = []
-                    t_target2cam_list = []
-
-                    # TODO: Use motion planning if available
-                    if self.motion is None:
-                        for i, joints in enumerate(self.joint_positions):
-                            R_base2gripper = None
-                            t_base2gripper = None
-                            R_cam2target = None
-                            t_cam2target = None
-
-                            self.logger.debug(f"Moving to pose {i+1}/{len(self.joint_positions)}")
-
-                            # Python SDK requires degrees for joint positions
-                            joints_deg = [np.degrees(joint) for joint in joints]
-                            jp = JointPositions(values=joints_deg)
-                            await self.arm.move_to_joint_positions(jp)
-                            while await self.arm.is_moving():
-                                await asyncio.sleep(0.05)
-                            self.logger.debug(f"Moved arm to position: {jp}")
-
-                            # Sleep for the configured amount of time to allow the arm and camera to settle
-                            await asyncio.sleep(self.sleep_seconds)
-
-                            R_base2gripper, t_base2gripper, R_cam2target, t_cam2target = await self.get_calibration_values()
-                            if R_base2gripper is None or t_base2gripper is None or R_cam2target is None or t_cam2target is None:
-                                self.logger.warning(f"Could not find calibration values for pose {i+1}/{len(self.joint_positions)}")
-                                continue
-
-                            self.logger.info(f"successfully collected calibration data for pose {i+1}/{len(self.joint_positions)}")
-
-                            # TODO: Implement eye-to-hand. This should just be changing the
-                            # order/in-frame values
-
-                            # OpenCV calibrateHandEye expects transposed rotations but original translation vectors
-                            # Only invert rotation matrices, keep translation vectors as-is
-                            R_gripper2base = R_base2gripper.T
-                            t_gripper2base = t_base2gripper
-                            R_target2cam = R_cam2target.T
-                            t_target2cam = t_cam2target
-                            
-                            R_gripper2base_list.append(R_gripper2base)
-                            t_gripper2base_list.append(t_gripper2base)
-                            R_target2cam_list.append(R_target2cam)
-                            t_target2cam_list.append(t_target2cam)
-                    else:
-                        # TODO: Implement motion service code here
-                        try:
-                            success = await self.motion.move(
-                                component_name=self.arm.name,
-                                destination=None,
-                            )
-                        except Exception as e:
-                            raise Exception(e)
+                    R_gripper2base_list, t_gripper2base_list, R_target2cam_list, t_target2cam_list = await self._collect_calibration_data()
 
                     # Check if we have enough measurements
                     if len(R_gripper2base_list) < 3:
@@ -350,10 +372,10 @@ class HandEyeCalibration(Generic, EasyResource):
 
                     if self.motion is None:
                         jp = JointPositions(joint_pos)
-                        arm_joint_pos = self.arm.move_to_joint_positions(jp)
+                        await self.arm.move_to_joint_positions(jp)
 
                         # Sleep to allow time for the camera and arm to settle
-                        asyncio.sleep(self.sleep_seconds)
+                        await asyncio.sleep(self.sleep_seconds)
 
                     # TODO: Implement using motion service 
 
