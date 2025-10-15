@@ -116,12 +116,15 @@ class HandEyeCalibration(Generic, EasyResource):
             
         # Ensure viam-utils is a resource so that we can convert between joint positions and poses
         motion = attrs.get(MOTION_ATTR)
+        optional_deps = []
         if motion is not None:
             viam_utils = attrs.get(VIAM_UTILS)
             if viam_utils is None:
                 raise Exception(f"{VIAM_UTILS} must be configured with motion planning.")
+            optional_deps.append(str(viam_utils))
+            optional_deps.append(str(motion))
 
-        return [str(arm), str(cam), str(pose_tracker)], [str(viam_utils)]
+        return [str(arm), str(cam), str(pose_tracker)], optional_deps
 
     def reconfigure(
         self, config: ComponentConfig, dependencies: Mapping[ResourceName, ResourceBase]
@@ -136,18 +139,19 @@ class HandEyeCalibration(Generic, EasyResource):
 
         camera = attrs.get(CAM_ATTR)
         self.camera: Camera = dependencies.get(Camera.get_resource_name(camera))
-        
-        arm= attrs.get(ARM_ATTR)
+
+        arm = attrs.get(ARM_ATTR)
         self.arm: Arm = dependencies.get(Arm.get_resource_name(arm))
 
         pose_tracker = attrs.get(POSE_TRACKER_ATTR)
         self.pose_tracker: PoseTracker = dependencies.get(PoseTracker.get_resource_name(pose_tracker))
 
         motion = attrs.get(MOTION_ATTR)
-        self.motion: Motion = dependencies.get(Motion.get_resource_name(motion))
+        self.motion: Optional[Motion] = dependencies.get(Motion.get_resource_name(motion)) if motion else None
+        self.viam_utils: Optional[Generic] = None
         if self.motion is not None:
             viam_utils = attrs.get(VIAM_UTILS)
-            self.viam_utils: Generic = dependencies.get(Generic.get_resource_name(viam_utils))
+            self.viam_utils = dependencies.get(Generic.get_resource_name(viam_utils))
 
         self.calib = attrs.get(CALIB_ATTR)
         self.joint_positions = attrs.get(JOINT_POSITIONS_ATTR, [])
