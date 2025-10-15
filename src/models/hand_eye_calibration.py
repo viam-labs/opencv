@@ -146,7 +146,7 @@ class HandEyeCalibration(Generic, EasyResource):
         motion = attrs.get(MOTION_ATTR)
         self.motion: Motion = dependencies.get(Motion.get_resource_name(motion))
         if self.motion is not None:
-            viam_utilsx = attrs.get(VIAM_UTILS)
+            viam_utils = attrs.get(VIAM_UTILS)
             self.viam_utils: Generic = dependencies.get(Generic.get_resource_name(viam_utils))
 
         self.calib = attrs.get(CALIB_ATTR)
