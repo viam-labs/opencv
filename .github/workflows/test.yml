@@ -16,7 +16,7 @@ jobs:
       run: pip install -r requirements-dev.txt
 
     - name: Build go binary
-      run: cd go && go build -o go_utils main.go && cd ..
+      run: cd go_utils && go build -o go_utils main.go && cd ..
 
 
     - name: Run lint
