@@ -1,11 +1,11 @@
 import asyncio
 import numpy as np
-from typing import ClassVar, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, ClassVar, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from viam.components.arm import Arm
 from viam.components.pose_tracker import PoseTracker
 from viam.proto.app.robot import ComponentConfig
-from viam.proto.common import Pose, ResourceName
+from viam.proto.common import Pose, PoseInFrame, ResourceName
 from viam.resource.base import ResourceBase
 from viam.resource.easy_resource import EasyResource
 from viam.resource.types import Model, ModelFamily
@@ -26,10 +26,7 @@ CAMERA_NAME_ATTR = "camera_name"
 POSE_TRACKER_ATTR = "pose_tracker"
 MOTION_SERVICE_ATTR = "motion_service"
 POSES_ATTR = "poses"
-WORLD_FRAME_ATTR = "world_frame"
-
-# Default config attribute values
-DEFAULT_WORLD_FRAME = "world"
+BODY_NAME_ATTR = "body_name"
 
 
 class PoseTest(Generic, EasyResource):
@@ -82,15 +79,16 @@ class PoseTest(Generic, EasyResource):
         if not isinstance(poses, list):
             raise Exception(f"{POSES_ATTR} must be a list.")
 
-        if len(poses) < 2:
-            raise Exception(f"{POSES_ATTR} must contain at least 2 poses (anchor + 1 test pose).")
-
         # Validate each pose has required fields
         for i, pose_dict in enumerate(poses):
             required_fields = ["x", "y", "z", "o_x", "o_y", "o_z", "theta"]
             for field in required_fields:
                 if field not in pose_dict:
                     raise Exception(f"Pose {i} in {POSES_ATTR} missing required field '{field}'.")
+
+        body_name = attrs.get(BODY_NAME_ATTR)
+        if body_name is None:
+            raise Exception(f"Missing required {BODY_NAME_ATTR} attribute.")
 
         return [str(arm_name), str(camera_name), str(pose_tracker), str(motion_service)], []
 
@@ -103,6 +101,7 @@ class PoseTest(Generic, EasyResource):
             config: The new configuration
             dependencies: Any dependencies (both required and optional)
         """
+        self.logger.debug(f"Reconfiguring pose test resource with deps: {dependencies}")
         attrs = struct_to_dict(config.attributes)
 
         arm_name: str = attrs.get(ARM_NAME_ATTR)
@@ -119,8 +118,12 @@ class PoseTest(Generic, EasyResource):
 
         motion_service_name: str = attrs.get(MOTION_SERVICE_ATTR)
         self.motion: Motion = dependencies.get(Motion.get_resource_name(motion_service_name))
+        if self.motion is None:
+            raise Exception(f"Motion service not found: {motion_service_name}")
 
-        self.world_frame: str = attrs.get(WORLD_FRAME_ATTR, DEFAULT_WORLD_FRAME)
+        # Get body name for pose tracker
+        self.body_name: str = attrs.get(BODY_NAME_ATTR)
+
 
         # Parse poses from config
         poses_list = attrs.get(POSES_ATTR, [])
@@ -199,32 +202,21 @@ class PoseTest(Generic, EasyResource):
         """
         pose_in_frame = await self.motion.get_pose(
             component_name=self.arm_name,
-            destination_frame=self.world_frame
+            destination_frame="world"
         )
         return pose_in_frame.pose
 
-    async def _get_camera_pose(self) -> Optional[Pose]:
-        """Get the current pose of the camera in the world frame.
-
-        This uses the frame system which should have the hand-eye calibration
-        configured as a transform between the arm and camera.
+    async def _get_current_parent_pose(self) -> Pose:
+        """Get the current pose of the arm end effector (parent) in world frame.
 
         Returns:
-            Pose: Camera pose in world frame, or None if not available
+            Pose: Current pose in world frame
         """
-        try:
-            # The camera frame should be accessible through the frame system
-            # We get the camera's pose in the world frame
-            # Note: This assumes the camera is properly configured in the frame system
-            # with the hand-eye calibration transform
-            pose_in_frame = await self.motion.get_pose(
-                component_name=self.camera_name,
-                destination_frame=self.world_frame
-            )
-            return pose_in_frame.pose
-        except Exception as e:
-            self.logger.warning(f"Could not get camera pose: {e}")
-            return None
+        pose_in_frame = await self.motion.get_pose(
+            component_name=self.arm_name,
+            destination_frame="world"
+        )
+        return pose_in_frame.pose
 
     def _calculate_translational_error(self, T_estimated: np.ndarray, T_actual: np.ndarray) -> Dict[str, float]:
         """Calculate translational error between two transformation matrices.
@@ -295,7 +287,7 @@ class PoseTest(Generic, EasyResource):
 
         return theta_deg
 
-    async def _run_pose_test_algorithm(self) -> Dict[str, any]:
+    async def _run_pose_test(self) -> Dict[str, Any]:
         """Execute the pose test algorithm.
 
         Returns:
@@ -310,84 +302,97 @@ class PoseTest(Generic, EasyResource):
         self.logger.info("Moving to anchor pose (pose_0)")
         await self.motion.move(
             component_name=self.arm_name,
-            destination=self.poses[0]
+            destination=PoseInFrame(reference_frame="world", pose=self.poses[0])
         )
-
         # Wait for arm to settle
         await asyncio.sleep(1.0)
 
-        # Get A_0 and B_0
-        A_0_pose = await self._get_current_arm_pose()
-        B_0_pose = await self._get_camera_pose()
-
-        if B_0_pose is None:
-            raise Exception("Could not get camera pose. Check frame system configuration and hand-eye calibration.")
-
-        self.logger.info(f"Anchor pose A_0: {A_0_pose}")
-        self.logger.info(f"Anchor camera pose B_0: {B_0_pose}")
-
-        # Convert to matrices immediately
+        #########################################################################################################
+        # Get A_0 (end effector in world) first
+        #########################################################################################################
+        A_0_pose = await self._get_current_parent_pose()
+        # Convert to matrix
         T_A_0 = self._pose_to_matrix(A_0_pose)
-        T_B_0 = self._pose_to_matrix(B_0_pose)
 
-        # Get hand-eye transform X from frame system
-        # X should be the transform from camera to arm (gripper)
-        # X = A_0 * inv(B_0)
-        T_X = T_A_0 @ np.linalg.inv(T_B_0)
+        #########################################################################################################
+        # Compute hand-eye transform X robustly from world poses at anchor
+        # X should be camera_in_end_effector. We derive: X = inv(A_0) * camera_world_0
+        #########################################################################################################
+        # Compute X once by querying camera pose in arm frame (gripper parent)
+        pose_in_frame = await self.motion.get_pose(
+            component_name=self.camera_name,
+            destination_frame=self.arm_name
+        )
+        X_pose = pose_in_frame.pose
+        T_X = self._pose_to_matrix(X_pose)
 
-        self.logger.info(f"Hand-eye transform X: {self._matrix_to_pose(T_X)}")
+        # minimal; do not use frame system further beyond initial X derivation
 
+        #########################################################################################################
+        # Get target observation from pose tracker at anchor pose
+        # The pose tracker observes a fixed target and returns its pose in some reference frame
+        #########################################################################################################
+        tracked_poses_0 = await self.pose_tracker.get_poses(body_names=[self.body_name])
+        if not tracked_poses_0:
+            raise Exception(f"Could not get any poses from pose tracker at anchor pose")
+        if self.body_name not in tracked_poses_0:
+            raise Exception(f"Could not find tracked body '{self.body_name}' in pose tracker observations at anchor pose")
+
+        # Extract PoseInFrame and its reference frame at anchor
+        target_pif_0 = tracked_poses_0[self.body_name]
+        ref_frame_0 = getattr(target_pif_0, "reference_frame", None) or getattr(target_pif_0, "reference_frame_name", None)
+        target_in_ref_0 = target_pif_0.pose
+        # ref frame required to be camera for algorithm
+        if ref_frame_0 != self.camera_name:
+            raise Exception("pose tracker must report target in camera frame")
+        T_target_in_ref_0 = self._pose_to_matrix(target_in_ref_0)
+
+        # Compute target world anchor purely from arm and X: T_target^W0 = (A0 * X) * T_target^C0
+        T_camera_0_in_world = T_A_0 @ T_X
+        T_target_in_world = T_camera_0_in_world @ self._pose_to_matrix(target_pif_0.pose)
+
+        #########################################################################################################
         # Test each subsequent pose
+        #########################################################################################################
         pose_errors = []
-
         for i in range(1, len(self.poses)):
-            self.logger.info(f"Testing pose {i}/{len(self.poses)-1}")
-
             # Move to pose_i
             await self.motion.move(
                 component_name=self.arm_name,
-                destination=self.poses[i]
+                destination=PoseInFrame(reference_frame="world", pose=self.poses[i])
             )
 
             # Wait for arm to settle
             await asyncio.sleep(1.0)
 
-            # Get A_i and B_i
-            A_i_pose = await self._get_current_arm_pose()
-            B_i_pose = await self._get_camera_pose()
+            # Get A_i
+            A_i_pose = await self._get_current_parent_pose()
+            # Convert to matrix
+            T_A_i = self._pose_to_matrix(A_i_pose)
 
-            if B_i_pose is None:
-                self.logger.warning(f"Could not get camera pose for pose {i}, skipping")
+            # Get target observation from pose tracker at pose i
+            tracked_poses_i = await self.pose_tracker.get_poses(body_names=[self.body_name])
+            if not tracked_poses_i or self.body_name not in tracked_poses_i:
+                self.logger.warning(f"Could not find tracked body '{self.body_name}' at pose {i}, skipping")
                 continue
 
-            self.logger.debug(f"Pose {i} - A_i: {A_i_pose}")
-            self.logger.debug(f"Pose {i} - B_i: {B_i_pose}")
+            # Extract PoseInFrame and its reference frame at pose i
+            target_pif_i = tracked_poses_i[self.body_name]
+            ref_frame_i = getattr(target_pif_i, "reference_frame", None) or getattr(target_pif_i, "reference_frame_name", None)
+            target_in_ref_i = target_pif_i.pose
+            if ref_frame_i != self.camera_name:
+                raise Exception("pose tracker must report target in camera frame")
+            T_target_in_ref_i = self._pose_to_matrix(target_in_ref_i)
 
-            # Convert to matrices
-            T_A_i = self._pose_to_matrix(A_i_pose)
-            T_B_i = self._pose_to_matrix(B_i_pose)
+            # Delta-based predictions per literature (Equation 47)
+            # Actual delta_A: motion from anchor to pose i in parent frame
+            T_delta_A_actual = np.linalg.inv(T_A_0) @ T_A_i
 
-            # Calculate delta_B = inv(B_i) * B_0
-            T_delta_B = np.linalg.inv(T_B_i) @ T_B_0
-
-            self.logger.debug(f"Pose {i} - delta_B: {self._matrix_to_pose(T_delta_B)}")
-
-            # Calculate delta_A_estimated = X * delta_B * inv(X)
-            T_delta_A_estimated = T_X @ T_delta_B @ np.linalg.inv(T_X)
-
-            self.logger.debug(f"Pose {i} - delta_A_estimated: {self._matrix_to_pose(T_delta_A_estimated)}")
-
-            # Calculate delta_A_actual = inv(A_i) * A_0
-            T_delta_A_actual = np.linalg.inv(T_A_i) @ T_A_0
-
-            self.logger.debug(f"Pose {i} - delta_A_actual: {self._matrix_to_pose(T_delta_A_actual)}")
-
-            # Calculate errors using matrices
-            translational_error = self._calculate_translational_error(T_delta_A_estimated, T_delta_A_actual)
-            rotational_error = self._calculate_rotational_error(T_delta_A_estimated, T_delta_A_actual)
-
-            self.logger.info(f"Pose {i} - Translational error: {translational_error['magnitude']:.2f} mm")
-            self.logger.info(f"Pose {i} - Rotational error: {rotational_error:.2f} degrees")
+            # Use tracker deltas: delta_B = inv(B0) * Bi in camera frame
+            T_delta_B = np.linalg.inv(T_target_in_ref_0) @ T_target_in_ref_i
+            T_delta_A_pred = T_X @ T_delta_B @ np.linalg.inv(T_X)
+            translational_error = self._calculate_translational_error(T_delta_A_pred, T_delta_A_actual)
+            rotational_error = self._calculate_rotational_error(T_delta_A_pred, T_delta_A_actual)
 
             pose_errors.append({
                 "pose_index": i,
@@ -428,7 +433,7 @@ class PoseTest(Generic, EasyResource):
         Supported commands:
         - {"get_current_pose": {}}: Get current arm pose in world frame
         - {"validate_setup": {}}: Validate configuration and dependencies
-        - {"run_pose_test": {}}: Execute the pose test algorithm
+        - {"run_pose_test": {}}: Move the arm and execute the pose test algorithm 
         """
         if "get_current_pose" in command:
             try:
@@ -503,7 +508,7 @@ class PoseTest(Generic, EasyResource):
 
         if "run_pose_test" in command:
             try:
-                result = await self._run_pose_test_algorithm()
+                result = await self._run_pose_test()
                 return result
             except Exception as e:
                 self.logger.error(f"Pose test failed: {e}")
