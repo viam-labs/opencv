@@ -31,13 +31,12 @@ METHODS = [
 ARM_ATTR = "arm_name"
 BODY_NAME_ATTR = "body_name"
 CALIB_ATTR = "calibration_type"
-CAM_ATTR = "camera_name"
 JOINT_POSITIONS_ATTR = "joint_positions"
+POSES_ATTR = "poses"
 METHOD_ATTR = "method"
 MOTION_ATTR = "motion"
 POSE_TRACKER_ATTR = "pose_tracker"
 SLEEP_ATTR = "sleep_seconds"
-VIAM_UTILS = "viam_utils"
 
 # Default config attribute values
 DEFAULT_SLEEP_SECONDS = 2.0
@@ -84,27 +83,26 @@ class HandEyeCalibration(Generic, EasyResource):
         """
         attrs = struct_to_dict(config.attributes)
 
-        cam = attrs.get(CAM_ATTR)
-        if cam is None:
-            raise Exception(f"Missing required {CAM_ATTR} attribute.")
-        
         arm = attrs.get(ARM_ATTR)
         if arm is None:
             raise Exception(f"Missing required {ARM_ATTR} attribute.")
-        
-        if attrs.get(JOINT_POSITIONS_ATTR) is None:
-            raise Exception(f"Missing required {JOINT_POSITIONS_ATTR} attribute.")
-        
+
+        # Either joint_positions or poses must be provided
+        joint_positions = attrs.get(JOINT_POSITIONS_ATTR)
+        poses = attrs.get(POSES_ATTR)
+        if joint_positions is None and poses is None:
+            raise Exception(f"Must provide either {JOINT_POSITIONS_ATTR} or {POSES_ATTR} attribute.")
+
         pose_tracker = attrs.get(POSE_TRACKER_ATTR)
         if pose_tracker is None:
             raise Exception(f"Missing required {POSE_TRACKER_ATTR} attribute.")
-        
+
         calib = attrs.get(CALIB_ATTR)
         if calib is None:
             raise Exception(f"Missing required {CALIB_ATTR} attribute.")
         if calib not in CALIBS:
             raise Exception(f"{calib} is not an available calibration.")
-        
+
         method = attrs.get(METHOD_ATTR)
         if method not in METHODS:
             raise Exception(f"{method} is not an available method for calibration.")
@@ -113,20 +111,16 @@ class HandEyeCalibration(Generic, EasyResource):
         if body_name is not None:
             if not isinstance(body_name, str):
                 raise Exception(f"'{BODY_NAME_ATTR}' must be a string, got {type(body_name)}")
-            
-        # Ensure viam-utils is a resource so that we can convert between joint positions and poses
+
+        # Motion service is required when using poses
         motion = attrs.get(MOTION_ATTR)
         optional_deps = []
+        if poses is not None and motion is None:
+            raise Exception(f"Motion service is required when using {POSES_ATTR}. Set the {MOTION_ATTR} attribute to the name of the motion service.")
         if motion is not None:
-            viam_utils = attrs.get(VIAM_UTILS)
-            if viam_utils is None:
-                raise Exception(f"{VIAM_UTILS} must be configured with motion planning.")
             optional_deps.append(str(motion))
-            optional_deps.append(str(viam_utils))
-        else:
-            raise Exception(f"Missing {MOTION_ATTR} attribute!!!: {motion}")
 
-        return [str(arm), str(cam), str(pose_tracker)], optional_deps
+        return [str(arm), str(pose_tracker)], optional_deps
 
     def reconfigure(
         self, config: ComponentConfig, dependencies: Mapping[ResourceName, ResourceBase]
@@ -139,9 +133,6 @@ class HandEyeCalibration(Generic, EasyResource):
         """
         attrs = struct_to_dict(config.attributes)
 
-        camera = attrs.get(CAM_ATTR)
-        self.camera: Camera = dependencies.get(Camera.get_resource_name(camera))
-
         arm = attrs.get(ARM_ATTR)
         self.arm: Arm = dependencies.get(Arm.get_resource_name(arm))
 
@@ -150,18 +141,29 @@ class HandEyeCalibration(Generic, EasyResource):
 
         motion = attrs.get(MOTION_ATTR)
         self.motion: Optional[Motion] = dependencies.get(Motion.get_resource_name(motion)) if motion else None
-        self.viam_utils: Optional[Generic] = None
-        self.logger.debug(f"Dependencies: {dependencies}")
         if self.motion is not None:
             self.logger.debug(f"Motion service configured: {self.motion.name}")
-            viam_utils = attrs.get(VIAM_UTILS)
-            self.viam_utils = dependencies.get(Generic.get_resource_name(viam_utils))
-            self.logger.debug(f"Viam utils service configured: {self.viam_utils.name}")
         else:
             self.logger.debug("No motion service configured, using direct joint position control")
 
-        self.calib = attrs.get(CALIB_ATTR)
+
+        # Parse joint positions or poses from config
         self.joint_positions = attrs.get(JOINT_POSITIONS_ATTR, [])
+
+        poses_config = attrs.get(POSES_ATTR, [])
+        self.poses = []
+        for pose_dict in poses_config:
+            pose = Pose(
+                x=pose_dict.get("x", 0),
+                y=pose_dict.get("y", 0),
+                z=pose_dict.get("z", 0),
+                o_x=pose_dict.get("o_x", 0),
+                o_y=pose_dict.get("o_y", 0),
+                o_z=pose_dict.get("o_z", 1),
+                theta=pose_dict.get("theta", 0)
+            )
+            self.poses.append(pose)
+
         self.method = attrs.get(METHOD_ATTR, DEFAULT_METHOD)
         self.sleep_seconds = attrs.get(SLEEP_ATTR, DEFAULT_SLEEP_SECONDS)
         self.body_names = [attrs.get(BODY_NAME_ATTR)] if attrs.get(BODY_NAME_ATTR) is not None else []
@@ -210,70 +212,75 @@ class HandEyeCalibration(Generic, EasyResource):
 
         return R_base2gripper, t_base2gripper, R_cam2target, t_cam2target
 
-    async def _move_arm_to_position(self, joints, position_index):
-        """Move arm to specified joint positions using either direct joint control or motion planning."""
-        self.logger.debug(f"Moving to pose {position_index+1}/{len(self.joint_positions)}")
-        
+    async def _move_arm_to_position(self, position_data, position_index, total_positions):
+        """Move arm to specified position using either direct joint control or motion planning.
+
+        Args:
+            position_data: Either a list of joint positions (radians) or a Pose object
+            position_index: Index of the current position
+            total_positions: Total number of positions
+        """
+        self.logger.debug(f"Moving to position {position_index+1}/{total_positions}")
+
         if self.motion is None:
             # Direct joint position control
-            joints_deg = [np.degrees(joint) for joint in joints]
+            joints_deg = [np.degrees(joint) for joint in position_data]
             jp = JointPositions(values=joints_deg)
             await self.arm.move_to_joint_positions(jp)
             while await self.arm.is_moving():
                 await asyncio.sleep(0.05)
-            self.logger.debug(f"Moved arm to position: {jp}")
+            self.logger.debug(f"Moved arm to joint position: {jp}")
         else:
-            # Motion planning approach
-            raw_pose = await self.viam_utils.do_command({"transform": joints})
-            pose = Pose(
-                x=raw_pose["x"], y=raw_pose["y"], z=raw_pose["z"],
-                o_x=raw_pose["o_x"], o_y=raw_pose["o_y"], 
-                o_z=raw_pose["o_z"], theta=raw_pose["theta"]
-            )
-            pif = PoseInFrame(reference_frame="world", pose=pose)
-            
+            # Motion planning approach with pose
+            pif = PoseInFrame(reference_frame="world", pose=position_data)
+
             success = await self.motion.move(
                 component_name=self.arm.name,
                 destination=pif,
             )
             if not success:
-                raise Exception(f"Could not move to pose {position_index+1}/{len(self.joint_positions)}")
-            self.logger.debug(f"Moved arm to position using motion planning")
+                raise Exception(f"Could not move to pose {position_index+1}/{total_positions}")
+            self.logger.debug(f"Moved arm to pose using motion planning")
 
     async def _collect_calibration_data(self):
-        """Collect calibration data for all joint positions."""
+        """Collect calibration data for all joint positions or poses."""
         R_gripper2base_list = []
         t_gripper2base_list = []
         R_target2cam_list = []
         t_target2cam_list = []
 
-        for i, joints in enumerate(self.joint_positions):
+        # Use poses if available (motion planning mode), otherwise use joint positions
+        positions = self.poses if self.poses else self.joint_positions
+        total_positions = len(positions)
+
+        for i, position in enumerate(positions):
             try:
-                await self._move_arm_to_position(joints, i)
+                await self._move_arm_to_position(position, i, total_positions)
                 await asyncio.sleep(self.sleep_seconds)
-                
+
                 R_base2gripper, t_base2gripper, R_cam2target, t_cam2target = await self.get_calibration_values()
-                
+
                 # TODO: Implement eye-to-hand. This should just be changing the
                 # order/in-frame values
-                
+
                 # OpenCV calibrateHandEye expects transposed rotations but original translation vectors
                 # Only invert rotation matrices, keep translation vectors as-is
                 R_gripper2base = R_base2gripper.T
                 t_gripper2base = t_base2gripper
                 R_target2cam = R_cam2target.T
                 t_target2cam = t_cam2target
-                
+
                 R_gripper2base_list.append(R_gripper2base)
                 t_gripper2base_list.append(t_gripper2base)
                 R_target2cam_list.append(R_target2cam)
                 t_target2cam_list.append(t_target2cam)
-                
-                self.logger.info(f"successfully collected calibration data for pose {i+1}/{len(self.joint_positions)}")
-                
+
+                self.logger.info(f"successfully collected calibration data for position {i+1}/{total_positions}")
+
             except Exception as e:
-                self.logger.warning(f"Could not find calibration values for pose {i+1}/{len(self.joint_positions)}: {e}")
-                continue
+                error_msg = f"Could not find calibration values for position {i+1}/{total_positions}: {e}"
+                self.logger.error(error_msg)
+                raise Exception(error_msg)
         
         return R_gripper2base_list, t_gripper2base_list, R_target2cam_list, t_target2cam_list
 
@@ -355,7 +362,27 @@ class HandEyeCalibration(Generic, EasyResource):
                         break
 
                     resp["check_tags"] = f"Number of tracked bodies seen: {len(tracked_poses)}"
+                case "get_current_arm_pose":
+                    arm_pose = await self.arm.get_end_position()
+                    if arm_pose is None:
+                        resp["get_current_arm_pose"] = "Could not get end position of arm"
+                        break
+
+                    resp["get_current_arm_pose"] = {
+                        "x": arm_pose.x,
+                        "y": arm_pose.y,
+                        "z": arm_pose.z,
+                        "o_x": arm_pose.o_x,
+                        "o_y": arm_pose.o_y,
+                        "o_z": arm_pose.o_z,
+                        "theta": arm_pose.theta
+                    }
                 case "save_calibration_position":
+                    # Only available in joint position mode (when motion is not configured)
+                    if self.motion is not None:
+                        resp["save_calibration_position"] = "This command is only available when using joint positions (no motion service configured). Use 'get_current_arm_pose' instead."
+                        break
+
                     index = int(value)
 
                     arm_joint_pos = await self.arm.get_joint_positions()
@@ -364,31 +391,34 @@ class HandEyeCalibration(Generic, EasyResource):
                         break
 
                     if index < 0:
-                        self.joint_positions.append(arm_joint_pos)
+                        self.joint_positions.append(arm_joint_pos.values)
                         resp["save_calibration_position"] = f"joint position {len(self.joint_positions) - 1} added to config"
                     elif index >= len(self.joint_positions):
                         resp["save_calibration_position"] = f"index {value} is out of range, only {len(self.joint_positions)} are set."
                     else:
-                        self.joint_positions[index] = arm_joint_pos
+                        self.joint_positions[index] = arm_joint_pos.values
                         resp["save_calibration_position"] = f"joint position {index} updated in config"
-
-                    # TODO: Update config with updated joint positions array
                 case "move_arm_to_position":
+                    # Use poses if available (motion planning mode), otherwise use joint positions
+                    if self.motion is not None and self.poses:
+                        positions = self.poses
+                        position_type = "pose"
+                    else:
+                        positions = self.joint_positions
+                        position_type = "joint position"
+
                     index = int(value)
 
-                    if index >= len(self.joint_positions):
-                        resp["move_arm_to_position"] = f"position {index} invalid since there are only {len(self.joint_positions)} positions"
+                    if index >= len(positions):
+                        resp["move_arm_to_position"] = f"{position_type} {index} invalid since there are only {len(positions)} {position_type}s"
+                        break
 
-                    joint_pos = self.joint_positions[index]
+                    position = positions[index]
 
-                    if self.motion is None:
-                        jp = JointPositions(joint_pos)
-                        await self.arm.move_to_joint_positions(jp)
+                    await self._move_arm_to_position(position, index, len(positions))
 
-                        # Sleep to allow time for the camera and arm to settle
-                        await asyncio.sleep(self.sleep_seconds)
-
-                    # TODO: Implement using motion service 
+                    # Sleep to allow time for the camera and arm to settle
+                    await asyncio.sleep(self.sleep_seconds)
 
                     tracked_poses: Optional[Dict[str, PoseInFrame]] = await self.pose_tracker.get_poses(body_names=self.body_names)
                     if tracked_poses is None or len(tracked_poses) == 0:
@@ -396,18 +426,6 @@ class HandEyeCalibration(Generic, EasyResource):
                         break
 
                     resp["move_arm_to_position"] = len(tracked_poses)
-                case "delete_calibration_position":
-                    index = int(value)
-                    if index >= len(self.joint_positions):
-                        resp["delete_calibration_position"] = f"index {index} is out of range of list with length {len(self.joint_positions)}"
-
-                    del self.joint_positions[index]
-
-                    resp["delete_calibration_position"] = f"position {index} deleted"
-                case "clear_calibration_positions":
-                    self.joint_positions = []
-
-                    resp["clear_calibration_positions"] = "all calibration positions removed"
                 case "auto_calibrate":
                     raise NotImplementedError("This is not yet implemented")
                 case _:
