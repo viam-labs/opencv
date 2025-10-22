@@ -361,18 +361,18 @@ async def main(
             T_hand_eye = None
         
         # Get initial poses
-        A_0_pose = await _get_current_arm_pose(motion_service, arm.name)
-        T_A_0 = _pose_to_matrix(A_0_pose)
-        B_0_pose = await _get_current_camera_pose(pt, body_names[0])
-        T_B_0 = _pose_to_matrix(B_0_pose)
+        A_0_pose_world_frame = await _get_current_arm_pose(motion_service, arm.name)
+        T_A_0_world_frame = _pose_to_matrix(A_0_pose_world_frame)
+        B_0_pose_camera_frame = await _get_current_camera_pose(pt, body_names[0])
+        T_B_0_camera_frame = _pose_to_matrix(B_0_pose_camera_frame)
 
         if T_hand_eye is None:
             print("❌ Could not extract hand-eye transformation from camera configuration")
             return
         
         print(f"\n=== HAND-EYE TRANSFORMATION VERIFICATION TEST ===")
-        print(f"Reference robot pose: x={A_0_pose.x:.2f}, y={A_0_pose.y:.2f}, z={A_0_pose.z:.2f}, theta={A_0_pose.theta:.2f}°")
-        print(f"Reference camera pose: x={B_0_pose.x:.2f}, y={B_0_pose.y:.2f}, z={B_0_pose.z:.2f}, theta={B_0_pose.theta:.2f}°")
+        print(f"Reference robot pose: x={A_0_pose_world_frame.x:.2f}, y={A_0_pose_world_frame.y:.2f}, z={A_0_pose_world_frame.z:.2f}, theta={A_0_pose_world_frame.theta:.2f}°")
+        print(f"Reference camera pose: x={B_0_pose_camera_frame.x:.2f}, y={B_0_pose_camera_frame.y:.2f}, z={B_0_pose_camera_frame.z:.2f}, theta={B_0_pose_camera_frame.theta:.2f}°")
         
         # Test the hand-eye transformation with 4 rotations
         for i in range(4):
@@ -380,8 +380,8 @@ async def main(
             print(f"\n=== ROTATION {i+1}/4: {rotation_angle}° ===")
             
             # Calculate target pose (rotate around Z-axis)
-            target_pose = copy.deepcopy(A_0_pose)
-            target_pose.theta = A_0_pose.theta + rotation_angle
+            target_pose = copy.deepcopy(A_0_pose_world_frame)
+            target_pose.theta = A_0_pose_world_frame.theta + rotation_angle
             
             print(f"Moving to target pose: theta={target_pose.theta:.2f}°")
             
@@ -391,52 +391,52 @@ async def main(
             await asyncio.sleep(2.0)
             
             # Get current poses
-            A_i_pose = await _get_current_arm_pose(motion_service, arm.name)
-            T_A_i = _pose_to_matrix(A_i_pose)
-            B_i_pose = await _get_current_camera_pose(pt, body_names[0])
-            T_B_i = _pose_to_matrix(B_i_pose)
+            A_i_pose_world_frame = await _get_current_arm_pose(motion_service, arm.name)
+            T_A_i_world_frame = _pose_to_matrix(A_i_pose_world_frame)
+            B_i_pose_camera_frame = await _get_current_camera_pose(pt, body_names[0])
+            T_B_i_camera_frame = _pose_to_matrix(B_i_pose_camera_frame)
             
             # Calculate motion matrices (relative to reference)
-            T_delta_A = np.linalg.inv(T_A_0) @ T_A_i
-            T_delta_B = np.linalg.inv(T_B_0) @ T_B_i
+            T_delta_A_world_frame = np.linalg.inv(T_A_0_world_frame) @ T_A_i_world_frame
+            T_delta_B_camera_frame = T_B_i_camera_frame @ np.linalg.inv(T_B_0_camera_frame)
             
             # Calculate rotation angles
-            R_delta_A = T_delta_A[:3, :3]
-            rvec_delta_A, _ = cv2.Rodrigues(R_delta_A)
-            angle_delta_A = np.linalg.norm(rvec_delta_A) * 180 / np.pi
+            R_delta_A_world_frame = T_delta_A_world_frame[:3, :3]
+            rvec_delta_A_world_frame, _ = cv2.Rodrigues(R_delta_A_world_frame)
+            angle_delta_A_world_frame = np.linalg.norm(rvec_delta_A_world_frame) * 180 / np.pi
             
-            R_delta_B = T_delta_B[:3, :3]
-            rvec_delta_B, _ = cv2.Rodrigues(R_delta_B)
-            angle_delta_B = np.linalg.norm(rvec_delta_B) * 180 / np.pi
+            R_delta_B_camera_frame = T_delta_B_camera_frame[:3, :3]
+            rvec_delta_B_camera_frame, _ = cv2.Rodrigues(R_delta_B_camera_frame)
+            angle_delta_B_camera_frame = np.linalg.norm(rvec_delta_B_camera_frame) * 180 / np.pi
             
-            print(f"Robot rotation: {angle_delta_A:.3f}° (target: {rotation_angle}°)")
-            print(f"Camera rotation: {angle_delta_B:.3f}°")
-            print(f"Translation: A=[{T_delta_A[0,3]:.3f}, {T_delta_A[1,3]:.3f}, {T_delta_A[2,3]:.3f}]")
-            print(f"Translation: B=[{T_delta_B[0,3]:.3f}, {T_delta_B[1,3]:.3f}, {T_delta_B[2,3]:.3f}]")
+            print(f"Robot rotation: {angle_delta_A_world_frame:.3f}° (target: {rotation_angle}°)")
+            print(f"Camera rotation: {angle_delta_B_camera_frame:.3f}°")
+            print(f"Translation: A=[{T_delta_A_world_frame[0,3]:.3f}, {T_delta_A_world_frame[1,3]:.3f}, {T_delta_A_world_frame[2,3]:.3f}]")
+            print(f"Translation: B=[{T_delta_B_camera_frame[0,3]:.3f}, {T_delta_B_camera_frame[1,3]:.3f}, {T_delta_B_camera_frame[2,3]:.3f}]")
             
             # Apply hand-eye transformation to predict robot motion from camera motion
             # A_predicted = T_hand_eye @ B_motion @ T_hand_eye^-1
-            T_A_predicted = T_hand_eye @ T_delta_B @ np.linalg.inv(T_hand_eye)
+            T_A_predicted_world_frame = T_hand_eye @ T_delta_B_camera_frame @ np.linalg.inv(T_hand_eye)
             
             # Calculate predicted rotation angle
-            R_predicted = T_A_predicted[:3, :3]
-            rvec_predicted, _ = cv2.Rodrigues(R_predicted)
-            angle_predicted = np.linalg.norm(rvec_predicted) * 180 / np.pi
+            R_predicted_world_frame = T_A_predicted_world_frame[:3, :3]
+            rvec_predicted_world_frame, _ = cv2.Rodrigues(R_predicted_world_frame)
+            angle_predicted_world_frame = np.linalg.norm(rvec_predicted_world_frame) * 180 / np.pi
             
             # Calculate errors
-            rotation_error = abs(angle_predicted - angle_delta_A)
-            translation_error = np.linalg.norm(T_A_predicted[:3, 3] - T_delta_A[:3, 3])
+            rotation_error = abs(angle_predicted_world_frame - angle_delta_A_world_frame)
+            translation_error = np.linalg.norm(T_A_predicted_world_frame[:3, 3] - T_delta_A_world_frame[:3, 3])
 
             #Calulate error according to paper
-            rotation_error_paper = R_predicted.T @ R_delta_A
-            translation_error_paper = T_A_predicted[:3, 3] - T_delta_A[:3, 3]
-            rotation_error_paper_vec, _ = cv2.Rodrigues(rotation_error_paper.T)
-            rotation_error_paper_angle = np.linalg.norm(rotation_error_paper_vec) * 180 / np.pi
-            print(f"Rotation error according to paper: {rotation_error_paper_angle:.3f}°")
+            rotation_error_paper = R_predicted_world_frame.T @ R_delta_A_world_frame
+            translation_error_paper = T_A_predicted_world_frame[:3, 3] - T_delta_A_world_frame[:3, 3]
             translation_error_paper_norm = np.linalg.norm(translation_error_paper)
+            rotation_error_paper_vec_angle, _ = cv2.Rodrigues(rotation_error_paper.T)
+            rotation_error_paper_angle = np.linalg.norm(rotation_error_paper_vec_angle) * 180 / np.pi
+            print(f"Rotation error according to paper: {rotation_error_paper_angle:.3f}°")
             print(f"Translation error according to paper: {translation_error_paper_norm:.3f} mm")
             
-            print(f"Predicted robot rotation: {angle_predicted:.3f}°")
+            print(f"Predicted robot rotation: {angle_predicted_world_frame:.3f}°")
             print(f"Rotation error: {rotation_error:.3f}°")
             print(f"Translation error: {translation_error:.3f} mm")
             
@@ -445,7 +445,7 @@ async def main(
         
         # Return to reference pose
         print(f"\n=== RETURNING TO REFERENCE POSE ===")
-        A_0_pose_in_frame = PoseInFrame(reference_frame=DEFAULT_WORLD_FRAME, pose=A_0_pose)
+        A_0_pose_in_frame = PoseInFrame(reference_frame=DEFAULT_WORLD_FRAME, pose=A_0_pose_world_frame)
         await motion_service.move(component_name=arm.name, destination=A_0_pose_in_frame)
         await asyncio.sleep(2.0)
         
