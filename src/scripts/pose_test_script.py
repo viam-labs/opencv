@@ -376,7 +376,7 @@ async def main(
         
         # Test the hand-eye transformation with 4 rotations
         for i in range(4):
-            rotation_angle = (i + 1) * 5  # 5°, 10°, 15°, 20°
+            rotation_angle = (i + 1) * 90  # 5°, 10°, 15°, 20°
             print(f"\n=== ROTATION {i+1}/4: {rotation_angle}° ===")
             
             # Calculate target pose (rotate around Z-axis)
@@ -426,6 +426,15 @@ async def main(
             # Calculate errors
             rotation_error = abs(angle_predicted - angle_delta_A)
             translation_error = np.linalg.norm(T_A_predicted[:3, 3] - T_delta_A[:3, 3])
+
+            #Calulate error according to paper
+            rotation_error_paper = R_predicted.T @ R_delta_A
+            translation_error_paper = T_A_predicted[:3, 3] - T_delta_A[:3, 3]
+            rotation_error_paper_vec, _ = cv2.Rodrigues(rotation_error_paper.T)
+            rotation_error_paper_angle = np.linalg.norm(rotation_error_paper_vec) * 180 / np.pi
+            print(f"Rotation error according to paper: {rotation_error_paper_angle:.3f}°")
+            translation_error_paper_norm = np.linalg.norm(translation_error_paper)
+            print(f"Translation error according to paper: {translation_error_paper_norm:.3f} mm")
             
             print(f"Predicted robot rotation: {angle_predicted:.3f}°")
             print(f"Rotation error: {rotation_error:.3f}°")
