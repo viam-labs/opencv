@@ -13,6 +13,8 @@ from viam.app.app_client import AppClient
 from viam.components.arm import Arm
 from viam.components.pose_tracker import PoseTracker
 from viam.services.motion import MotionClient, Constraints
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
 from viam.proto.service.motion import CollisionSpecification
 from viam.proto.common import PoseInFrame, Pose
 from viam.media.utils.pil import viam_to_pil_image
@@ -95,12 +97,9 @@ async def connect():
         raise Exception("Failed to create AppClient")
     return app_client, robot
 
-async def _get_current_arm_pose(motion: MotionClient, arm_name: str) -> Pose:
-    pose_in_frame = await motion.get_pose(
-        component_name=arm_name,
-        destination_frame="world"
-    )
-    return pose_in_frame.pose
+async def _get_current_arm_pose(motion: MotionClient, arm_name: str, arm: Arm) -> Pose:
+    pose_in_frame = await arm.get_end_position()
+    return pose_in_frame
 
 def frame_config_to_transformation_matrix(frame_config):
     """
@@ -198,10 +197,15 @@ def rvec_tvec_to_matrix(rvec, tvec):
     
     return T
 
-def get_camera_pose_from_chessboard(image, camera_matrix, dist_coeffs, chessboard_size, square_size=30.0):
+def get_chessboard_pose_in_camera_frame(image, camera_matrix, dist_coeffs, chessboard_size, square_size=30.0):
     """
-    Get camera pose relative to chessboard using PnP
+    Get chessboard pose in camera frame using PnP.
+    
+    Note: cv2.solvePnP returns the transformation from chessboard coordinates to camera coordinates.
+    This is T_chessboard_to_camera, NOT T_camera_to_chessboard.
+    
     Returns: (success, rotation_vector, translation_vector, corners)
+        - rvec, tvec represent the chessboard's pose in the camera's coordinate system
     """
     # Convert to grayscale if needed
     if len(image.shape) == 3:
@@ -224,13 +228,227 @@ def get_camera_pose_from_chessboard(image, camera_matrix, dist_coeffs, chessboar
         
         # Solve PnP to get camera pose
         success, rvec, tvec = cv2.solvePnP(objp, corners, camera_matrix, dist_coeffs)
-        
-        if success:
-            return True, rvec, tvec, corners
-        else:
+
+        if not success:
+            print("Failed to solve PnP")
             return False, None, None, None
+
+        rvec, tvec = cv2.solvePnPRefineVVS(objp, corners, camera_matrix, dist_coeffs, rvec, tvec)
+        return True, rvec, tvec, corners
     else:
         return False, None, None, None
+
+def visualize_transformation_difference(T_actual, T_predicted, rotation_num, save_dir="."):
+    """
+    Visualize the difference between actual and predicted transformations.
+    Creates a multi-panel figure with 3D view and 2D projections.
+    
+    Args:
+        T_actual: 4x4 actual transformation matrix
+        T_predicted: 4x4 predicted transformation matrix
+        rotation_num: rotation number for labeling
+        save_dir: directory to save the plot
+    """
+    fig = plt.figure(figsize=(16, 10))
+    
+    # Create 3D subplot
+    ax3d = fig.add_subplot(2, 3, (1, 4), projection='3d')
+    ax = ax3d  # Keep compatibility with existing code
+    
+    # Helper function to draw a coordinate frame
+    def draw_frame(T, label, colors, linestyle='-'):
+        # Origin
+        origin = T[:3, 3]
+        
+        # Axes (X, Y, Z)
+        scale = 50  # mm
+        for i, (color, axis_label) in enumerate(zip(colors, ['X', 'Y', 'Z'])):
+            axis = T[:3, i] * scale
+            ax.quiver(origin[0], origin[1], origin[2],
+                     axis[0], axis[1], axis[2],
+                     color=color, arrow_length_ratio=0.25, linewidth=2.5, linestyle=linestyle, alpha=0.8)
+        
+        # Label the frame
+        ax.text(origin[0], origin[1], origin[2], label, fontsize=10, weight='bold')
+    
+    # Draw identity frame (starting position)
+    T_identity = np.eye(4)
+    draw_frame(T_identity, 'Origin', ['#888888', '#888888', '#888888'])
+    
+    # Draw actual transformation result
+    draw_frame(T_actual, 'Actual', ['#FF0000', '#FF4444', '#FF8888'])
+    
+    # Draw predicted transformation result
+    draw_frame(T_predicted, 'Predicted', ['#0000FF', '#4444FF', '#8888FF'], linestyle='--')
+    
+    # Add dummy artists for legend (coordinate frames)
+    from matplotlib.lines import Line2D
+    legend_frame_actual = Line2D([0], [0], color='red', linewidth=2, label='Actual frame (XYZ)', alpha=0.8)
+    legend_frame_predicted = Line2D([0], [0], color='blue', linestyle='--', linewidth=2, label='Predicted frame (XYZ)', alpha=0.8)
+    
+    # Draw translation vectors
+    origin = np.zeros(3)
+    t_actual = T_actual[:3, 3]
+    t_predicted = T_predicted[:3, 3]
+    
+    # Actual translation vector
+    ax.plot([origin[0], t_actual[0]], 
+            [origin[1], t_actual[1]], 
+            [origin[2], t_actual[2]], 
+            'r-', linewidth=2, label='Actual translation', alpha=0.6)
+    
+    # Predicted translation vector
+    ax.plot([origin[0], t_predicted[0]], 
+            [origin[1], t_predicted[1]], 
+            [origin[2], t_predicted[2]], 
+            'b--', linewidth=2, label='Predicted translation', alpha=0.6)
+    
+    # Extract and draw rotation axes
+    R_actual = T_actual[:3, :3]
+    R_predicted = T_predicted[:3, :3]
+    
+    rvec_actual, _ = cv2.Rodrigues(R_actual)
+    rvec_predicted, _ = cv2.Rodrigues(R_predicted)
+    
+    angle_actual = np.linalg.norm(rvec_actual) * 180 / np.pi
+    angle_predicted = np.linalg.norm(rvec_predicted) * 180 / np.pi
+    
+    if angle_actual > 0.1:
+        axis_actual = rvec_actual.flatten() / np.linalg.norm(rvec_actual) * 30  # Scale for visibility
+        ax.quiver(0, 0, 0, axis_actual[0], axis_actual[1], axis_actual[2],
+                 color='orange', arrow_length_ratio=0.2, linewidth=4, label=f'Actual axis ({angle_actual:.1f}°)', alpha=0.9)
+    else:
+        axis_actual = None
+    
+    if angle_predicted > 0.1:
+        axis_predicted = rvec_predicted.flatten() / np.linalg.norm(rvec_predicted) * 30
+        ax.quiver(0, 0, 0, axis_predicted[0], axis_predicted[1], axis_predicted[2],
+                 color='cyan', arrow_length_ratio=0.2, linewidth=4, label=f'Predicted axis ({angle_predicted:.1f}°)', alpha=0.9)
+    else:
+        axis_predicted = None
+    
+    # Set labels and title for 3D plot
+    ax.set_xlabel('X (mm)', fontsize=10)
+    ax.set_ylabel('Y (mm)', fontsize=10)
+    ax.set_zlabel('Z (mm)', fontsize=10)
+    ax.set_title('3D View', fontsize=11, weight='bold')
+    
+    # Set equal aspect ratio
+    max_range = max(np.abs(t_actual).max(), np.abs(t_predicted).max(), 50)
+    ax.set_xlim([-max_range, max_range])
+    ax.set_ylim([-max_range, max_range])
+    ax.set_zlim([-max_range, max_range])
+    
+    # Add legend with all elements
+    handles, labels = ax.get_legend_handles_labels()
+    handles.extend([legend_frame_actual, legend_frame_predicted])
+    ax.legend(handles=handles, loc='upper right', fontsize=8)
+    
+    # Add grid
+    ax.grid(True, alpha=0.3)
+    
+    # Add 2D projection views showing rotation axes
+    # Get normalized rotation axes for 2D plots
+    rvec_actual_norm = rvec_actual.flatten() / np.linalg.norm(rvec_actual) if angle_actual > 0.1 else np.array([0, 0, 0])
+    rvec_pred_norm = rvec_predicted.flatten() / np.linalg.norm(rvec_predicted) if angle_predicted > 0.1 else np.array([0, 0, 0])
+    
+    # XY projection
+    ax_xy = fig.add_subplot(2, 3, 2)
+    ax_xy.arrow(0, 0, rvec_actual_norm[0], rvec_actual_norm[1], head_width=0.1, head_length=0.1, 
+                fc='orange', ec='orange', linewidth=3, alpha=0.9, label=f'Actual ({angle_actual:.1f}°)')
+    ax_xy.arrow(0, 0, rvec_pred_norm[0], rvec_pred_norm[1], head_width=0.1, head_length=0.1, 
+                fc='cyan', ec='cyan', linewidth=3, alpha=0.9, label=f'Predicted ({angle_predicted:.1f}°)')
+    ax_xy.set_xlim([-1.2, 1.2])
+    ax_xy.set_ylim([-1.2, 1.2])
+    ax_xy.set_xlabel('X', fontsize=10, weight='bold')
+    ax_xy.set_ylabel('Y', fontsize=10, weight='bold')
+    ax_xy.set_title('XY Projection (Top View)', fontsize=11, weight='bold')
+    ax_xy.grid(True, alpha=0.3)
+    ax_xy.set_aspect('equal')
+    ax_xy.legend(fontsize=8)
+    ax_xy.axhline(0, color='k', linewidth=0.5, alpha=0.3)
+    ax_xy.axvline(0, color='k', linewidth=0.5, alpha=0.3)
+    
+    # XZ projection
+    ax_xz = fig.add_subplot(2, 3, 3)
+    ax_xz.arrow(0, 0, rvec_actual_norm[0], rvec_actual_norm[2], head_width=0.1, head_length=0.1, 
+                fc='orange', ec='orange', linewidth=3, alpha=0.9, label=f'Actual ({angle_actual:.1f}°)')
+    ax_xz.arrow(0, 0, rvec_pred_norm[0], rvec_pred_norm[2], head_width=0.1, head_length=0.1, 
+                fc='cyan', ec='cyan', linewidth=3, alpha=0.9, label=f'Predicted ({angle_predicted:.1f}°)')
+    ax_xz.set_xlim([-1.2, 1.2])
+    ax_xz.set_ylim([-1.2, 1.2])
+    ax_xz.set_xlabel('X', fontsize=10, weight='bold')
+    ax_xz.set_ylabel('Z', fontsize=10, weight='bold')
+    ax_xz.set_title('XZ Projection (Front View)', fontsize=11, weight='bold')
+    ax_xz.grid(True, alpha=0.3)
+    ax_xz.set_aspect('equal')
+    ax_xz.legend(fontsize=8)
+    ax_xz.axhline(0, color='k', linewidth=0.5, alpha=0.3)
+    ax_xz.axvline(0, color='k', linewidth=0.5, alpha=0.3)
+    
+    # YZ projection
+    ax_yz = fig.add_subplot(2, 3, 5)
+    ax_yz.arrow(0, 0, rvec_actual_norm[1], rvec_actual_norm[2], head_width=0.1, head_length=0.1, 
+                fc='orange', ec='orange', linewidth=3, alpha=0.9, label=f'Actual ({angle_actual:.1f}°)')
+    ax_yz.arrow(0, 0, rvec_pred_norm[1], rvec_pred_norm[2], head_width=0.1, head_length=0.1, 
+                fc='cyan', ec='cyan', linewidth=3, alpha=0.9, label=f'Predicted ({angle_predicted:.1f}°)')
+    ax_yz.set_xlim([-1.2, 1.2])
+    ax_yz.set_ylim([-1.2, 1.2])
+    ax_yz.set_xlabel('Y', fontsize=10, weight='bold')
+    ax_yz.set_ylabel('Z', fontsize=10, weight='bold')
+    ax_yz.set_title('YZ Projection (Side View)', fontsize=11, weight='bold')
+    ax_yz.grid(True, alpha=0.3)
+    ax_yz.set_aspect('equal')
+    ax_yz.legend(fontsize=8)
+    ax_yz.axhline(0, color='k', linewidth=0.5, alpha=0.3)
+    ax_yz.axvline(0, color='k', linewidth=0.5, alpha=0.3)
+    
+    # Add error summary text
+    ax_text = fig.add_subplot(2, 3, 6)
+    ax_text.axis('off')
+    
+    # Compute rotation error
+    R_error = R_predicted.T @ R_actual
+    trace = np.trace(R_error)
+    rotation_error = np.arccos(np.clip((trace - 1) / 2, -1, 1)) * 180 / np.pi
+    translation_error = np.linalg.norm(t_predicted - t_actual)
+    
+    # Compute angle between axes
+    if angle_actual > 0.1 and angle_predicted > 0.1:
+        axis_angle = np.arccos(np.clip(np.dot(rvec_actual_norm, rvec_pred_norm), -1, 1)) * 180 / np.pi
+        axis_angle_text = f"{axis_angle:.1f}°"
+    else:
+        axis_angle_text = "N/A"
+    
+    summary_text = f"""ROTATION {rotation_num} SUMMARY
+    
+Rotation Angles:
+  Actual:    {angle_actual:.2f}°
+  Predicted: {angle_predicted:.2f}°
+  
+Rotation Axes:
+  Actual:    [{rvec_actual_norm[0]:6.3f}, {rvec_actual_norm[1]:6.3f}, {rvec_actual_norm[2]:6.3f}]
+  Predicted: [{rvec_pred_norm[0]:6.3f}, {rvec_pred_norm[1]:6.3f}, {rvec_pred_norm[2]:6.3f}]
+  Angle between axes: {axis_angle_text}
+  
+ERRORS (AX=XB verification):
+  Rotation error:    {rotation_error:.2f}°
+  Translation error: {translation_error:.2f} mm
+    """
+    ax_text.text(0.1, 0.5, summary_text, fontsize=10, verticalalignment='center',
+                 fontfamily='monospace', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
+    
+    # Overall title
+    fig.suptitle(f'Rotation {rotation_num}: Actual vs Predicted Transformation', 
+                 fontsize=14, weight='bold', y=0.98)
+    
+    # Save figure
+    filepath = os.path.join(save_dir, f"transform_viz_rotation_{rotation_num}.png")
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.savefig(filepath, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f"  Saved visualization: {filepath}")
 
 def compute_hand_eye_verification_errors(T_hand_eye, T_delta_A_world_frame, T_delta_B_camera_frame):
     """
@@ -257,7 +475,32 @@ def compute_hand_eye_verification_errors(T_hand_eye, T_delta_A_world_frame, T_de
     """
     # Paper's method (Equation 47): Predict robot motion from camera motion
     # Â_i0 = X B_i0 X^(-1) (similarity transform)
-    T_A_predicted = T_hand_eye @ T_delta_B_camera_frame @ np.linalg.inv(T_hand_eye)
+    T_eye_hand = np.linalg.inv(T_hand_eye)
+    
+    # Decompose the similarity transform to see where axis deviation occurs
+    # Step 1: Start with camera-observed motion (B)
+    R_B = T_delta_B_camera_frame[:3, :3]
+    rvec_B, _ = cv2.Rodrigues(R_B)
+    angle_B = np.linalg.norm(rvec_B) * 180 / np.pi
+    
+    # Step 2: Apply T_hand_eye (gripper→camera) on the right
+    T_intermediate = T_delta_B_camera_frame @ T_hand_eye
+    R_intermediate = T_intermediate[:3, :3]
+    rvec_intermediate, _ = cv2.Rodrigues(R_intermediate)
+    angle_intermediate = np.linalg.norm(rvec_intermediate) * 180 / np.pi
+    
+    # Step 3: Apply T_eye_hand (camera→gripper) on the left to get final prediction
+    T_A_predicted = T_eye_hand @ T_delta_B_camera_frame @ T_hand_eye
+    
+    # Debug: Show axis transformation at each step
+    if angle_B > 0.1:
+        axis_B = rvec_B.flatten() / np.linalg.norm(rvec_B)
+        print(f"\n  DECOMPOSITION - Rotation axis at each step:")
+        print(f"  1. Camera observed (B):           [{axis_B[0]:7.3f}, {axis_B[1]:7.3f}, {axis_B[2]:7.3f}] ({angle_B:.2f}°)")
+        
+        if angle_intermediate > 0.1:
+            axis_intermediate = rvec_intermediate.flatten() / np.linalg.norm(rvec_intermediate)
+            print(f"  2. After B @ T_hand_eye:          [{axis_intermediate[0]:7.3f}, {axis_intermediate[1]:7.3f}, {axis_intermediate[2]:7.3f}] ({angle_intermediate:.2f}°)")
     
     # Extract rotation matrices and translations
     R_A_actual = T_delta_A_world_frame[:3, :3]
@@ -270,6 +513,19 @@ def compute_hand_eye_verification_errors(T_hand_eye, T_delta_A_world_frame, T_de
     rvec_pred, _ = cv2.Rodrigues(R_A_predicted)
     angle_actual = np.linalg.norm(rvec_actual) * 180 / np.pi
     angle_pred = np.linalg.norm(rvec_pred) * 180 / np.pi
+    
+    # Continue decomposition debug output
+    if angle_B > 0.1:
+        axis_pred = rvec_pred.flatten() / np.linalg.norm(rvec_pred) if angle_pred > 0.1 else np.array([0, 0, 0])
+        axis_actual = rvec_actual.flatten() / np.linalg.norm(rvec_actual) if angle_actual > 0.1 else np.array([0, 0, 0])
+        print(f"  3. After T_eye_hand @ ... (final): [{axis_pred[0]:7.3f}, {axis_pred[1]:7.3f}, {axis_pred[2]:7.3f}] ({angle_pred:.2f}°)")
+        print(f"  4. Actual robot motion (A):        [{axis_actual[0]:7.3f}, {axis_actual[1]:7.3f}, {axis_actual[2]:7.3f}] ({angle_actual:.2f}°)")
+        
+        # Compute angle between final axes
+        if angle_pred > 0.1 and angle_actual > 0.1:
+            dot_product = np.dot(axis_pred, axis_actual)
+            angle_between = np.arccos(np.clip(dot_product, -1, 1)) * 180 / np.pi
+            print(f"  → Angle between predicted and actual axes: {angle_between:.1f}°")
     
     # Calculate errors according to paper (Equation 48)
     # R_error = (R̂_A_i0)^T R_A_i0
@@ -287,6 +543,7 @@ def compute_hand_eye_verification_errors(T_hand_eye, T_delta_A_world_frame, T_de
         'R_A_predicted': R_A_predicted,
         't_A_actual': t_A_actual,
         't_A_predicted': t_A_predicted,
+        'T_A_predicted': T_A_predicted,  # Full 4x4 predicted transformation
         'angle_actual': angle_actual,
         'angle_predicted': angle_pred,
         'rotation_error': rotation_error,
@@ -422,13 +679,13 @@ async def main(
             T_hand_eye = None
         
         # Get initial poses
-        A_0_pose_world_frame = await _get_current_arm_pose(motion_service, arm.name)
+        A_0_pose_world_frame = await _get_current_arm_pose(motion_service, arm.name, arm)
         T_A_0_world_frame = _pose_to_matrix(A_0_pose_world_frame)
 
         camera_matrix, dist_coeffs = await get_camera_intrinsics(camera)
         image = await get_camera_image(camera)
 
-        success, rvec, tvec, corners = get_camera_pose_from_chessboard(image, camera_matrix, dist_coeffs, chessboard_size=(11, 8), square_size=30.0)
+        success, rvec, tvec, corners = get_chessboard_pose_in_camera_frame(image, camera_matrix, dist_coeffs, chessboard_size=(11, 8), square_size=30.0)
         if not success:
             print("Failed to detect chessboard in reference image")
             return
@@ -492,7 +749,7 @@ async def main(
             await asyncio.sleep(2.0)
             
             image = await get_camera_image(camera)
-            success, rvec, tvec, corners = get_camera_pose_from_chessboard(image, camera_matrix, dist_coeffs, chessboard_size=(11, 8), square_size=30.0)
+            success, rvec, tvec, corners = get_chessboard_pose_in_camera_frame(image, camera_matrix, dist_coeffs, chessboard_size=(11, 8), square_size=30.0)
             if not success:
                 print(f"Failed to detect chessboard in rotation {i+1}")
                 continue
@@ -506,7 +763,7 @@ async def main(
             print(f"Saved debug image: debug_rotation_{i+1}.jpg")
             
             # Get current poses
-            A_i_pose_world_frame = await _get_current_arm_pose(motion_service, arm.name)
+            A_i_pose_world_frame = await _get_current_arm_pose(motion_service, arm.name, arm)
             T_A_i_world_frame = _pose_to_matrix(A_i_pose_world_frame)
 
             # Convert chessboard pose (don't transpose - solvePnP is OpenCV convention)
@@ -557,6 +814,14 @@ async def main(
                 T_hand_eye, 
                 T_delta_A_world_frame, 
                 T_delta_B_camera_frame
+            )
+            
+            # Visualize the transformation difference
+            visualize_transformation_difference(
+                T_delta_A_world_frame,
+                errors['T_A_predicted'],
+                i + 1,
+                data_dir
             )
             
             # Debug: Print rotation matrices

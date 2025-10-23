@@ -18,10 +18,11 @@ sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 
 # Import functions from pose_test_script
 from scripts.pose_test_script import (
-    _pose_to_matrix, 
-    rvec_tvec_to_matrix, 
-    get_camera_pose_from_chessboard,
-    compute_hand_eye_verification_errors
+    _pose_to_matrix,
+    rvec_tvec_to_matrix,
+    get_chessboard_pose_in_camera_frame,
+    compute_hand_eye_verification_errors,
+    visualize_transformation_difference
 )
 
 def pose_dict_to_matrix(pose_dict):
@@ -72,7 +73,7 @@ def run_verification(data_dir):
     # Detect chessboard in reference image
     print(f"\nProcessing reference image...")
     ref_image = cv2.imread(os.path.join(data_dir, "image_reference.jpg"))
-    success, rvec_0, tvec_0, corners_0 = get_camera_pose_from_chessboard(
+    success, rvec_0, tvec_0, corners_0 = get_chessboard_pose_in_camera_frame(
         ref_image, camera_matrix, dist_coeffs, 
         chessboard_size=chessboard_size, 
         square_size=square_size
@@ -97,7 +98,7 @@ def run_verification(data_dir):
         
         # Detect chessboard
         image = cv2.imread(img_path)
-        success, rvec_i, tvec_i, corners_i = get_camera_pose_from_chessboard(
+        success, rvec_i, tvec_i, corners_i = get_chessboard_pose_in_camera_frame(
             image, camera_matrix, dist_coeffs,
             chessboard_size=chessboard_size,
             square_size=square_size
@@ -129,6 +130,14 @@ def run_verification(data_dir):
                 T_hand_eye,
                 T_delta_A_world_frame,
                 T_delta_B_camera_frame
+            )
+            
+            # Visualize the transformation difference
+            visualize_transformation_difference(
+                T_delta_A_world_frame,
+                errors['T_A_predicted'],
+                idx + 1,
+                data_dir
             )
             
             # Print results
