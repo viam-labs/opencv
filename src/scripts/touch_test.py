@@ -333,7 +333,6 @@ async def main(
             poses,
             probe_collision_frame,
             allowed_collision_frames,
-            velocity_normal,
             velocity_slow,
             force_threshold,
             force_check_step_mm,
