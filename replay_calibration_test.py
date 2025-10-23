@@ -120,24 +120,19 @@ def run_verification(data_dir):
             rot_data = rotation_data[idx]
             T_A_i_world_frame = pose_dict_to_matrix(rot_data["A_i_pose"])
             
-            # Compute actual robot motion
+            # Compute actual robot motion (in WORLD frame)
             T_delta_A_world_frame = np.linalg.inv(T_A_i_world_frame) @ T_A_0_world_frame
             
-            # Transform to gripper frame for fair comparison
-            R_A_0 = T_A_0_world_frame[:3, :3]
-            T_delta_A_gripper_frame = np.eye(4)
-            T_delta_A_gripper_frame[:3, :3] = R_A_0.T @ T_delta_A_world_frame[:3, :3] @ R_A_0
-            T_delta_A_gripper_frame[:3, 3] = R_A_0.T @ T_delta_A_world_frame[:3, 3]
-            
             # Compute errors using modular function
+            # The similarity transform X B X^(-1) naturally handles the frame transformation
             errors = compute_hand_eye_verification_errors(
                 T_hand_eye,
-                T_delta_A_gripper_frame,
+                T_delta_A_world_frame,
                 T_delta_B_camera_frame
             )
             
             # Print results
-            print(f"  Predicted vs Actual robot motion (in gripper frame):")
+            print(f"  Predicted vs Actual robot motion:")
             if errors['axis_actual'] is not None:
                 axis = errors['axis_actual']
                 print(f"    Actual: {errors['angle_actual']:.2f}° around axis [{axis[0]:.3f}, {axis[1]:.3f}, {axis[2]:.3f}]")
