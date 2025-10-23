@@ -232,13 +232,13 @@ def get_camera_pose_from_chessboard(image, camera_matrix, dist_coeffs, chessboar
     else:
         return False, None, None, None
 
-def compute_hand_eye_verification_errors(T_hand_eye, T_delta_A_gripper_frame, T_delta_B_camera_frame):
+def compute_hand_eye_verification_errors(T_hand_eye, T_delta_A_world_frame, T_delta_B_camera_frame):
     """
     Compute hand-eye calibration verification errors using the paper's method.
     
     Args:
         T_hand_eye: 4x4 hand-eye transformation matrix (camera to gripper)
-        T_delta_A_gripper_frame: 4x4 actual robot motion in gripper frame
+        T_delta_A_world_frame: 4x4 actual robot motion in world frame
         T_delta_B_camera_frame: 4x4 camera motion (chessboard motion in camera frame)
     
     Returns:
@@ -260,9 +260,9 @@ def compute_hand_eye_verification_errors(T_hand_eye, T_delta_A_gripper_frame, T_
     T_A_predicted = T_hand_eye @ T_delta_B_camera_frame @ np.linalg.inv(T_hand_eye)
     
     # Extract rotation matrices and translations
-    R_A_actual = T_delta_A_gripper_frame[:3, :3]
+    R_A_actual = T_delta_A_world_frame[:3, :3]
     R_A_predicted = T_A_predicted[:3, :3]
-    t_A_actual = T_delta_A_gripper_frame[:3, 3]
+    t_A_actual = T_delta_A_world_frame[:3, 3]
     t_A_predicted = T_A_predicted[:3, 3]
     
     # Convert to axis-angle
@@ -399,48 +399,6 @@ async def main(
                                             for i in range(3):
                                                 print(f"  [{R[i,0]:8.4f} {R[i,1]:8.4f} {R[i,2]:8.4f}]")
                                             print(f"Translation Vector: [{t[0]:8.4f}, {t[1]:8.4f}, {t[2]:8.4f}]")
-                                            
-                                            # Config stores T_gripper2cam, but we need T_cam2gripper for verification
-                                            # Invert the transformation: T^(-1) = [R^T, -R^T*t; 0, 1]
-                                            R_cam2gripper = R.T
-                                            t_cam2gripper = -R.T @ t
-                                            T_hand_eye = np.eye(4)
-                                            T_hand_eye[:3, :3] = R_cam2gripper
-                                            T_hand_eye[:3, 3] = t_cam2gripper
-                                            
-                                            # Analyze what transformation T_hand_eye represents
-                                            print(f"\n=== ANALYZING HAND-EYE TRANSFORM ===")
-                                            rvec_he, _ = cv2.Rodrigues(R_cam2gripper)
-                                            angle_he = np.linalg.norm(rvec_he) * 180 / np.pi
-                                            if angle_he > 0.01:
-                                                axis_he = rvec_he.flatten() / np.linalg.norm(rvec_he)
-                                                print(f"Hand-eye rotation: {angle_he:.2f}° around axis [{axis_he[0]:.3f}, {axis_he[1]:.3f}, {axis_he[2]:.3f}]")
-                                            
-                                            # Test: Apply similarity transform to a pure Z-axis 90° rotation
-                                            R_test_z = np.array([
-                                                [0, -1, 0],
-                                                [1,  0, 0],
-                                                [0,  0, 1]
-                                            ], dtype=np.float64)  # 90° around Z
-                                            
-                                            R_test_transformed = R_cam2gripper @ R_test_z @ R_cam2gripper.T
-                                            rvec_test, _ = cv2.Rodrigues(R_test_transformed)
-                                            angle_test = np.linalg.norm(rvec_test) * 180 / np.pi
-                                            if angle_test > 0.01:
-                                                axis_test = rvec_test.flatten() / np.linalg.norm(rvec_test)
-                                                print(f"\nTest: Pure Z-axis 90° rotation through similarity transform:")
-                                                print(f"  Result: {angle_test:.2f}° around axis [{axis_test[0]:.3f}, {axis_test[1]:.3f}, {axis_test[2]:.3f}]")
-                                                print(f"  Expected robot axis: [-0.804, 0.033, -0.594]")
-                                                
-                                                expected_axis = np.array([-0.804, 0.033, -0.594])
-                                                dot_product = np.abs(np.dot(axis_test, expected_axis))
-                                                angle_between = np.arccos(np.clip(dot_product, -1, 1)) * 180 / np.pi
-                                                print(f"  Angle between transformed and expected: {angle_between:.2f}°")
-                                                if angle_between < 5:
-                                                    print(f"  ✅ Hand-eye transform looks correct!")
-                                                else:
-                                                    print(f"  ❌ Hand-eye transform NOT producing expected axis")
-                                            
                                         else:
                                             print(f"Warning: Frame configuration is not a dictionary")
                                     else:
@@ -581,20 +539,10 @@ async def main(
                 json.dump(rotation_data, f, indent=2)
             print(f"Saved rotation {i+1} data")
             
-            # Compute robot motion in WORLD frame
+            # A = Robot motion in WORLD frame
             T_delta_A_world_frame = np.linalg.inv(T_A_i_world_frame) @ T_A_0_world_frame
             
-            # Compute robot motion in GRIPPER's LOCAL frame (for proper comparison with similarity transform)
-            # A_local = inv(T_A_0) @ T_A_i expressed in gripper_0's frame
-            T_delta_A_gripper_frame = np.linalg.inv(T_A_i_world_frame) @ T_A_0_world_frame @ np.linalg.inv(T_A_i_world_frame).T
-            
-            # Actually, simpler: transform world-frame motion to gripper-frame motion
-            R_A_0 = T_A_0_world_frame[:3, :3]
-            T_delta_A_gripper_frame = np.eye(4)
-            T_delta_A_gripper_frame[:3, :3] = R_A_0.T @ T_delta_A_world_frame[:3, :3] @ R_A_0
-            T_delta_A_gripper_frame[:3, 3] = R_A_0.T @ T_delta_A_world_frame[:3, 3]
-            
-            # B = motion of target as observed in camera frame
+            # B = Camera motion in CAMERA frame (motion of target as observed by camera)
             T_delta_B_camera_frame = T_B_i_camera_frame @ np.linalg.inv(T_B_0_camera_frame)
             
             # Debug: Print detailed transformation info
@@ -607,7 +555,7 @@ async def main(
             # Compute verification errors using modular function
             errors = compute_hand_eye_verification_errors(
                 T_hand_eye, 
-                T_delta_A_gripper_frame, 
+                T_delta_A_world_frame, 
                 T_delta_B_camera_frame
             )
             
