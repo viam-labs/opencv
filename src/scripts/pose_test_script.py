@@ -4,6 +4,9 @@ import copy
 import os
 import numpy as np
 import cv2
+import json
+import pickle
+from datetime import datetime
 from dotenv import load_dotenv
 from viam.robot.client import RobotClient
 from viam.app.app_client import AppClient
@@ -99,104 +102,6 @@ async def _get_current_arm_pose(motion: MotionClient, arm_name: str) -> Pose:
     )
     return pose_in_frame.pose
 
-async def _get_current_camera_pose(pose_tracker: PoseTracker, body_name: str) -> Pose:
-    pose_in_frame = await pose_tracker.get_poses(body_names=[body_name])
-    if not pose_in_frame or body_name not in pose_in_frame:
-        raise Exception(f"Could not find tracked body '{body_name}' in pose tracker observations")
-    return pose_in_frame[body_name].pose
-
-def hand_eye_calibration_ax_xb(A_motions, B_motions):
-    """
-    Simple hand-eye calibration using AX = XB formulation.
-    Uses a basic least-squares approach.
-    
-    Args:
-        A_motions: List of robot motion matrices (4x4)
-        B_motions: List of camera motion matrices (4x4)
-    
-    Returns:
-        X: Hand-eye transformation matrix (4x4)
-    """
-    print(f"\n=== HAND-EYE CALIBRATION (AX = XB) ===")
-    print(f"Number of motion pairs: {len(A_motions)}")
-    
-    n = len(A_motions)
-    
-    # For pure rotation around Z-axis, we can use a simplified approach
-    # Since we're doing rotations around Z, the hand-eye transformation
-    # should also be primarily around Z-axis
-    
-    # Extract rotation angles around Z-axis
-    angles_A = []
-    angles_B = []
-    
-    for i in range(n):
-        # Get rotation matrix
-        R_A = A_motions[i][:3, :3]
-        R_B = B_motions[i][:3, :3]
-        
-        # Convert to axis-angle
-        rvec_A, _ = cv2.Rodrigues(R_A)
-        rvec_B, _ = cv2.Rodrigues(R_B)
-        
-        # Get rotation angles
-        angle_A = np.linalg.norm(rvec_A) * 180 / np.pi
-        angle_B = np.linalg.norm(rvec_B) * 180 / np.pi
-        
-        # Determine sign based on Z-component of rotation vector
-        if rvec_A[2] < 0:
-            angle_A = -angle_A
-        if rvec_B[2] < 0:
-            angle_B = -angle_B
-            
-        angles_A.append(angle_A)
-        angles_B.append(angle_B)
-        
-        print(f"Motion {i+1}: Robot={angle_A:.3f}°, Camera={angle_B:.3f}°")
-    
-    # For pure Z-axis rotations, the hand-eye transformation should be
-    # a rotation around Z-axis plus translation
-    
-    # Estimate rotation angle from the relationship
-    # For small angles: angle_A ≈ angle_B (if hand-eye is identity)
-    # For general case: angle_A = angle_B + offset
-    
-    # Calculate the average offset
-    offsets = [angles_A[i] - angles_B[i] for i in range(n)]
-    avg_offset = np.mean(offsets)
-    
-    print(f"Average angle offset: {avg_offset:.3f}°")
-    
-    # Create hand-eye transformation
-    # For Z-axis rotation, we need to account for the coordinate system
-    # The hand-eye transformation should align the camera and robot coordinate systems
-    
-    # Simple approach: assume the hand-eye transformation is primarily
-    # a rotation around Z-axis to align coordinate systems
-    
-    # Calculate the required rotation to align the coordinate systems
-    # If camera rotates by angle_B and robot rotates by angle_A,
-    # then the hand-eye transformation should account for the difference
-    
-    # For now, let's use a simple identity transformation
-    # and let the user see the raw data
-    X = np.eye(4)
-    
-    # Add a small rotation to account for coordinate system alignment
-    # This is a simplified approach - in practice, you'd solve the full AX=XB problem
-    
-    # Calculate average translation
-    avg_translation_A = np.mean([A_motions[i][:3, 3] for i in range(n)], axis=0)
-    avg_translation_B = np.mean([B_motions[i][:3, 3] for i in range(n)], axis=0)
-    
-    print(f"Average robot translation: [{avg_translation_A[0]:.3f}, {avg_translation_A[1]:.3f}, {avg_translation_A[2]:.3f}]")
-    print(f"Average camera translation: [{avg_translation_B[0]:.3f}, {avg_translation_B[1]:.3f}, {avg_translation_B[2]:.3f}]")
-    
-    # Set translation to the difference
-    X[:3, 3] = avg_translation_A - avg_translation_B
-    
-    return X
-
 def frame_config_to_transformation_matrix(frame_config):
     """
     Convert Viam frame configuration to a 4x4 transformation matrix.
@@ -248,6 +153,84 @@ def frame_config_to_transformation_matrix(frame_config):
     T[:3, 3] = t
     
     return T
+
+async def get_camera_image(camera: Camera) -> np.ndarray:
+    cam_images = await camera.get_images()
+    pil_image = None
+    for cam_image in cam_images[0]:
+        # Accept any standard image format that viam_to_pil_image can handle
+        if cam_image.mime_type in [CameraMimeType.JPEG, CameraMimeType.PNG, CameraMimeType.VIAM_RGBA]:
+            pil_image = viam_to_pil_image(cam_image)
+            break
+    if pil_image is None:
+        raise Exception("Could not get latest image from camera")        
+    image = np.array(pil_image)
+    return image
+    
+async def get_camera_intrinsics(camera: Camera) -> tuple:
+    """Get camera intrinsic parameters"""
+    camera_params = await camera.do_command({"get_camera_params": None})
+    intrinsics = camera_params["Color"]["intrinsics"]
+    dist_params = camera_params["Color"]["distortion"]
+    
+    K = np.array([
+        [intrinsics["fx"], 0, intrinsics["cx"]],
+        [0, intrinsics["fy"], intrinsics["cy"]],
+        [0, 0, 1]
+    ], dtype=np.float32)
+
+    dist = np.array([dist_params["k1"], dist_params["k2"], dist_params["p1"], dist_params["p2"], dist_params["k3"]], dtype=np.float32)
+    
+    if K is None or dist is None:
+        raise Exception("Could not get camera intrinsic parameters")
+    
+    return K, dist
+
+def rvec_tvec_to_matrix(rvec, tvec):
+    """Convert rotation vector and translation vector to 4x4 transformation matrix"""
+    # Convert rotation vector to rotation matrix
+    R, _ = cv2.Rodrigues(rvec)
+    
+    # Create 4x4 transformation matrix
+    T = np.eye(4)
+    T[:3, :3] = R
+    T[:3, 3] = tvec.flatten()
+    
+    return T
+
+def get_camera_pose_from_chessboard(image, camera_matrix, dist_coeffs, chessboard_size, square_size=30.0):
+    """
+    Get camera pose relative to chessboard using PnP
+    Returns: (success, rotation_vector, translation_vector, corners)
+    """
+    # Convert to grayscale if needed
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image
+    
+    # Prepare 3D object points (chessboard corners in world coordinates)
+    objp = np.zeros((chessboard_size[0] * chessboard_size[1], 3), np.float32)
+    objp[:,:2] = np.mgrid[0:chessboard_size[0], 0:chessboard_size[1]].T.reshape(-1,2)
+    objp *= square_size  # Scale by square size (e.g., 25mm)
+    
+    # Find chessboard corners
+    ret, corners = cv2.findChessboardCorners(gray, chessboard_size, None)
+    
+    if ret:
+        # Refine corners to sub-pixel accuracy
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+        corners = cv2.cornerSubPix(gray, corners, (11,11), (-1,-1), criteria)
+        
+        # Solve PnP to get camera pose
+        success, rvec, tvec = cv2.solvePnP(objp, corners, camera_matrix, dist_coeffs)
+        
+        if success:
+            return True, rvec, tvec, corners
+        else:
+            return False, None, None, None
+    else:
+        return False, None, None, None
 
 async def main(
     arm_name: str,
@@ -333,10 +316,51 @@ async def main(
                                             # Extract rotation matrix and translation vector
                                             R = T_hand_eye[:3, :3]
                                             t = T_hand_eye[:3, 3]
-                                            print(f"\nRotation Matrix (3x3):")
+                                            print(f"\nRotation Matrix (3x3) - as stored in config:")
                                             for i in range(3):
                                                 print(f"  [{R[i,0]:8.4f} {R[i,1]:8.4f} {R[i,2]:8.4f}]")
                                             print(f"Translation Vector: [{t[0]:8.4f}, {t[1]:8.4f}, {t[2]:8.4f}]")
+                                            
+                                            # Config stores T_gripper2cam, but we need T_cam2gripper for verification
+                                            # Invert the transformation: T^(-1) = [R^T, -R^T*t; 0, 1]
+                                            R_cam2gripper = R.T
+                                            t_cam2gripper = -R.T @ t
+                                            T_hand_eye = np.eye(4)
+                                            T_hand_eye[:3, :3] = R_cam2gripper
+                                            T_hand_eye[:3, 3] = t_cam2gripper
+                                            
+                                            # Analyze what transformation T_hand_eye represents
+                                            print(f"\n=== ANALYZING HAND-EYE TRANSFORM ===")
+                                            rvec_he, _ = cv2.Rodrigues(R_cam2gripper)
+                                            angle_he = np.linalg.norm(rvec_he) * 180 / np.pi
+                                            if angle_he > 0.01:
+                                                axis_he = rvec_he.flatten() / np.linalg.norm(rvec_he)
+                                                print(f"Hand-eye rotation: {angle_he:.2f}° around axis [{axis_he[0]:.3f}, {axis_he[1]:.3f}, {axis_he[2]:.3f}]")
+                                            
+                                            # Test: Apply similarity transform to a pure Z-axis 90° rotation
+                                            R_test_z = np.array([
+                                                [0, -1, 0],
+                                                [1,  0, 0],
+                                                [0,  0, 1]
+                                            ], dtype=np.float64)  # 90° around Z
+                                            
+                                            R_test_transformed = R_cam2gripper @ R_test_z @ R_cam2gripper.T
+                                            rvec_test, _ = cv2.Rodrigues(R_test_transformed)
+                                            angle_test = np.linalg.norm(rvec_test) * 180 / np.pi
+                                            if angle_test > 0.01:
+                                                axis_test = rvec_test.flatten() / np.linalg.norm(rvec_test)
+                                                print(f"\nTest: Pure Z-axis 90° rotation through similarity transform:")
+                                                print(f"  Result: {angle_test:.2f}° around axis [{axis_test[0]:.3f}, {axis_test[1]:.3f}, {axis_test[2]:.3f}]")
+                                                print(f"  Expected robot axis: [-0.804, 0.033, -0.594]")
+                                                
+                                                expected_axis = np.array([-0.804, 0.033, -0.594])
+                                                dot_product = np.abs(np.dot(axis_test, expected_axis))
+                                                angle_between = np.arccos(np.clip(dot_product, -1, 1)) * 180 / np.pi
+                                                print(f"  Angle between transformed and expected: {angle_between:.2f}°")
+                                                if angle_between < 5:
+                                                    print(f"  ✅ Hand-eye transform looks correct!")
+                                                else:
+                                                    print(f"  ❌ Hand-eye transform NOT producing expected axis")
                                             
                                         else:
                                             print(f"Warning: Frame configuration is not a dictionary")
@@ -363,16 +387,53 @@ async def main(
         # Get initial poses
         A_0_pose_world_frame = await _get_current_arm_pose(motion_service, arm.name)
         T_A_0_world_frame = _pose_to_matrix(A_0_pose_world_frame)
-        B_0_pose_camera_frame = await _get_current_camera_pose(pt, body_names[0])
-        T_B_0_camera_frame = _pose_to_matrix(B_0_pose_camera_frame)
 
-        if T_hand_eye is None:
-            print("❌ Could not extract hand-eye transformation from camera configuration")
+        camera_matrix, dist_coeffs = await get_camera_intrinsics(camera)
+        image = await get_camera_image(camera)
+
+        success, rvec, tvec, corners = get_camera_pose_from_chessboard(image, camera_matrix, dist_coeffs, chessboard_size=(11, 8), square_size=30.0)
+        if not success:
+            print("Failed to detect chessboard in reference image")
             return
         
-        print(f"\n=== HAND-EYE TRANSFORMATION VERIFICATION TEST ===")
-        print(f"Reference robot pose: x={A_0_pose_world_frame.x:.2f}, y={A_0_pose_world_frame.y:.2f}, z={A_0_pose_world_frame.z:.2f}, theta={A_0_pose_world_frame.theta:.2f}°")
-        print(f"Reference camera pose: x={B_0_pose_camera_frame.x:.2f}, y={B_0_pose_camera_frame.y:.2f}, z={B_0_pose_camera_frame.z:.2f}, theta={B_0_pose_camera_frame.theta:.2f}°")
+        # Convert rvec, tvec to 4x4 transformation matrix (chessboard in camera frame)
+        # Don't transpose - solvePnP output is already in OpenCV convention
+        T_B_0_camera_frame = rvec_tvec_to_matrix(rvec, tvec)
+        
+        # Create directory for saving data
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        data_dir = f"calibration_data_{timestamp}"
+        os.makedirs(data_dir, exist_ok=True)
+        print(f"\n=== SAVING DATA TO: {data_dir} ===")
+        
+        # Save camera calibration and chessboard config
+        calibration_data = {
+            "camera_matrix": camera_matrix.tolist(),
+            "dist_coeffs": dist_coeffs.tolist(),
+            "chessboard_size": [11, 8],  # (width, height)
+            "square_size": 30.0,  # mm
+            "hand_eye_transform": T_hand_eye.tolist() if T_hand_eye is not None else None,
+            "timestamp": timestamp,
+            "A_0_pose": {
+                "x": A_0_pose_world_frame.x,
+                "y": A_0_pose_world_frame.y,
+                "z": A_0_pose_world_frame.z,
+                "o_x": A_0_pose_world_frame.o_x,
+                "o_y": A_0_pose_world_frame.o_y,
+                "o_z": A_0_pose_world_frame.o_z,
+                "theta": A_0_pose_world_frame.theta
+            },
+            "T_B_0_camera_frame": T_B_0_camera_frame.tolist()
+        }
+        with open(os.path.join(data_dir, "calibration_config.json"), "w") as f:
+            json.dump(calibration_data, f, indent=2)
+        
+        # Save reference image
+        cv2.imwrite(os.path.join(data_dir, "image_reference.jpg"), image)
+        print(f"Saved reference image and config")
+        
+        # List to store all rotation data
+        rotation_data = []
         
         # Test the hand-eye transformation with 4 rotations
         for i in range(4):
@@ -387,61 +448,141 @@ async def main(
             
             # Move to target pose
             target_pose_in_frame = PoseInFrame(reference_frame=DEFAULT_WORLD_FRAME, pose=target_pose)
-            await motion_service.move(component_name=arm.name, destination=target_pose_in_frame)
+            if(rotation_angle == 360):
+                await motion_service.move(component_name=arm.name, destination=PoseInFrame(reference_frame=DEFAULT_WORLD_FRAME, pose=A_0_pose_world_frame))
+            else:
+                await motion_service.move(component_name=arm.name, destination=target_pose_in_frame)
             await asyncio.sleep(2.0)
+            
+            image = await get_camera_image(camera)
+            success, rvec, tvec, corners = get_camera_pose_from_chessboard(image, camera_matrix, dist_coeffs, chessboard_size=(11, 8), square_size=30.0)
+            if not success:
+                print(f"Failed to detect chessboard in rotation {i+1}")
+                continue
+            
+            # Debug: Save image with detected corners
+            debug_img = image.copy()
+            cv2.drawChessboardCorners(debug_img, (11, 8), corners, success)
+            # Draw coordinate axes on the chessboard
+            cv2.drawFrameAxes(debug_img, camera_matrix, dist_coeffs, rvec, tvec, 50)
+            cv2.imwrite(f"debug_rotation_{i+1}.jpg", debug_img)
+            print(f"Saved debug image: debug_rotation_{i+1}.jpg")
             
             # Get current poses
             A_i_pose_world_frame = await _get_current_arm_pose(motion_service, arm.name)
             T_A_i_world_frame = _pose_to_matrix(A_i_pose_world_frame)
-            B_i_pose_camera_frame = await _get_current_camera_pose(pt, body_names[0])
-            T_B_i_camera_frame = _pose_to_matrix(B_i_pose_camera_frame)
+
+            # Convert chessboard pose (don't transpose - solvePnP is OpenCV convention)
+            T_B_i_camera_frame = rvec_tvec_to_matrix(rvec, tvec)
             
-            # Calculate motion matrices (relative to reference)
-            T_delta_A_world_frame = np.linalg.inv(T_A_0_world_frame) @ T_A_i_world_frame
+            # Save rotation data
+            rotation_info = {
+                "rotation_index": i,
+                "rotation_angle": rotation_angle,
+                "A_i_pose": {
+                    "x": A_i_pose_world_frame.x,
+                    "y": A_i_pose_world_frame.y,
+                    "z": A_i_pose_world_frame.z,
+                    "o_x": A_i_pose_world_frame.o_x,
+                    "o_y": A_i_pose_world_frame.o_y,
+                    "o_z": A_i_pose_world_frame.o_z,
+                    "theta": A_i_pose_world_frame.theta
+                },
+                "rvec": rvec.tolist(),
+                "tvec": tvec.tolist(),
+                "T_B_i_camera_frame": T_B_i_camera_frame.tolist()
+            }
+            rotation_data.append(rotation_info)
+            
+            # Save image for this rotation
+            cv2.imwrite(os.path.join(data_dir, f"image_rotation_{i+1}.jpg"), image)
+            
+            # Save rotation data incrementally (in case of crash)
+            with open(os.path.join(data_dir, "rotation_data.json"), "w") as f:
+                json.dump(rotation_data, f, indent=2)
+            print(f"Saved rotation {i+1} data")
+            
+            # Compute robot motion in WORLD frame
+            T_delta_A_world_frame = np.linalg.inv(T_A_i_world_frame) @ T_A_0_world_frame
+            
+            # Compute robot motion in GRIPPER's LOCAL frame (for proper comparison with similarity transform)
+            # A_local = inv(T_A_0) @ T_A_i expressed in gripper_0's frame
+            T_delta_A_gripper_frame = np.linalg.inv(T_A_i_world_frame) @ T_A_0_world_frame @ np.linalg.inv(T_A_i_world_frame).T
+            
+            # Actually, simpler: transform world-frame motion to gripper-frame motion
+            R_A_0 = T_A_0_world_frame[:3, :3]
+            T_delta_A_gripper_frame = np.eye(4)
+            T_delta_A_gripper_frame[:3, :3] = R_A_0.T @ T_delta_A_world_frame[:3, :3] @ R_A_0
+            T_delta_A_gripper_frame[:3, 3] = R_A_0.T @ T_delta_A_world_frame[:3, 3]
+            
+            # B = motion of target as observed in camera frame
             T_delta_B_camera_frame = T_B_i_camera_frame @ np.linalg.inv(T_B_0_camera_frame)
             
-            # Calculate rotation angles
-            R_delta_A_world_frame = T_delta_A_world_frame[:3, :3]
-            rvec_delta_A_world_frame, _ = cv2.Rodrigues(R_delta_A_world_frame)
-            angle_delta_A_world_frame = np.linalg.norm(rvec_delta_A_world_frame) * 180 / np.pi
+            # Debug: Print detailed transformation info
+            print(f"\n  DEBUG - Transformations:")
+            print(f"  Robot pose 0: ({A_0_pose_world_frame.x:.1f}, {A_0_pose_world_frame.y:.1f}, {A_0_pose_world_frame.z:.1f}) θ={A_0_pose_world_frame.theta:.1f}°")
+            print(f"  Robot pose i: ({A_i_pose_world_frame.x:.1f}, {A_i_pose_world_frame.y:.1f}, {A_i_pose_world_frame.z:.1f}) θ={A_i_pose_world_frame.theta:.1f}°")
+            print(f"  Robot delta translation: [{T_delta_A_world_frame[0,3]:.2f}, {T_delta_A_world_frame[1,3]:.2f}, {T_delta_A_world_frame[2,3]:.2f}]")
+            print(f"  Camera delta translation: [{T_delta_B_camera_frame[0,3]:.2f}, {T_delta_B_camera_frame[1,3]:.2f}, {T_delta_B_camera_frame[2,3]:.2f}]")
             
-            R_delta_B_camera_frame = T_delta_B_camera_frame[:3, :3]
-            rvec_delta_B_camera_frame, _ = cv2.Rodrigues(R_delta_B_camera_frame)
-            angle_delta_B_camera_frame = np.linalg.norm(rvec_delta_B_camera_frame) * 180 / np.pi
+            # Paper's method (Equation 47): Predict robot motion from camera motion
+            # Â_i0 = X B_i0 X^(-1) (similarity transform)
+            # This predicts motion in GRIPPER frame
+            T_A_predicted = T_hand_eye @ T_delta_B_camera_frame @ np.linalg.inv(T_hand_eye)
             
-            print(f"Robot rotation: {angle_delta_A_world_frame:.3f}° (target: {rotation_angle}°)")
-            print(f"Camera rotation: {angle_delta_B_camera_frame:.3f}°")
-            print(f"Translation: A=[{T_delta_A_world_frame[0,3]:.3f}, {T_delta_A_world_frame[1,3]:.3f}, {T_delta_A_world_frame[2,3]:.3f}]")
-            print(f"Translation: B=[{T_delta_B_camera_frame[0,3]:.3f}, {T_delta_B_camera_frame[1,3]:.3f}, {T_delta_B_camera_frame[2,3]:.3f}]")
+            # Extract rotation matrices (compare in gripper frame!)
+            R_A_actual = T_delta_A_gripper_frame[:3, :3]
+            R_A_predicted = T_A_predicted[:3, :3]
             
-            # Apply hand-eye transformation to predict robot motion from camera motion
-            # A_predicted = T_hand_eye @ B_motion @ T_hand_eye^-1
-            T_A_predicted_world_frame = T_hand_eye @ T_delta_B_camera_frame @ np.linalg.inv(T_hand_eye)
+            # Extract translations
+            t_A_actual = T_delta_A_gripper_frame[:3, 3]
+            t_A_predicted = T_A_predicted[:3, 3]
             
-            # Calculate predicted rotation angle
-            R_predicted_world_frame = T_A_predicted_world_frame[:3, :3]
-            rvec_predicted_world_frame, _ = cv2.Rodrigues(R_predicted_world_frame)
-            angle_predicted_world_frame = np.linalg.norm(rvec_predicted_world_frame) * 180 / np.pi
+            # Debug: Print rotation matrices
+            print(f"\n  DEBUG - Predicted vs Actual robot motion:")
+            print(f"  R_A_actual:")
+            for row in R_A_actual:
+                print(f"    [{row[0]:7.4f}, {row[1]:7.4f}, {row[2]:7.4f}]")
+            print(f"  R_A_predicted:")
+            for row in R_A_predicted:
+                print(f"    [{row[0]:7.4f}, {row[1]:7.4f}, {row[2]:7.4f}]")
             
-            # Calculate errors
-            rotation_error = abs(angle_predicted_world_frame - angle_delta_A_world_frame)
-            translation_error = np.linalg.norm(T_A_predicted_world_frame[:3, 3] - T_delta_A_world_frame[:3, 3])
+            # Convert to axis-angle to understand the rotations better
+            rvec_actual, _ = cv2.Rodrigues(R_A_actual)
+            rvec_pred, _ = cv2.Rodrigues(R_A_predicted)
+            angle_actual = np.linalg.norm(rvec_actual) * 180 / np.pi
+            angle_pred = np.linalg.norm(rvec_pred) * 180 / np.pi
+            if angle_actual > 0.01:
+                axis_actual = rvec_actual.flatten() / np.linalg.norm(rvec_actual)
+                print(f"  Actual: {angle_actual:.2f}° around axis [{axis_actual[0]:.3f}, {axis_actual[1]:.3f}, {axis_actual[2]:.3f}]")
+            if angle_pred > 0.01:
+                axis_pred = rvec_pred.flatten() / np.linalg.norm(rvec_pred)
+                print(f"  Predicted: {angle_pred:.2f}° around axis [{axis_pred[0]:.3f}, {axis_pred[1]:.3f}, {axis_pred[2]:.3f}]")
 
-            #Calulate error according to paper
-            rotation_error_paper = R_predicted_world_frame.T @ R_delta_A_world_frame
-            translation_error_paper = T_A_predicted_world_frame[:3, 3] - T_delta_A_world_frame[:3, 3]
-            translation_error_paper_norm = np.linalg.norm(translation_error_paper)
-            rotation_error_paper_vec_angle, _ = cv2.Rodrigues(rotation_error_paper.T)
-            rotation_error_paper_angle = np.linalg.norm(rotation_error_paper_vec_angle) * 180 / np.pi
-            print(f"Rotation error according to paper: {rotation_error_paper_angle:.3f}°")
-            print(f"Translation error according to paper: {translation_error_paper_norm:.3f} mm")
+            # Calculate error according to paper (Equation 48)
+            # R_error = (R̂_A_i0)^T R_A_i0
+            R_error = R_A_predicted.T @ R_A_actual
+            rvec_error, _ = cv2.Rodrigues(R_error)
+            rotation_error = np.linalg.norm(rvec_error) * 180 / np.pi
             
-            print(f"Predicted robot rotation: {angle_predicted_world_frame:.3f}°")
-            print(f"Rotation error: {rotation_error:.3f}°")
-            print(f"Translation error: {translation_error:.3f} mm")
+            # t_error = t̂_A_i0 - t_A_i0
+            t_error = t_A_predicted - t_A_actual
+            translation_error = np.linalg.norm(t_error)
+            
+            print(f"\n  ERRORS (Paper's method - Eq. 48):")
+            print(f"  Rotation error: {rotation_error:.3f}°")
+            print(f"  Translation error: {translation_error:.3f} mm")
+            if rotation_error > 0.1:
+                error_axis = rvec_error.flatten() / np.linalg.norm(rvec_error)
+                print(f"  Error rotation: {rotation_error:.2f}° around axis [{error_axis[0]:.3f}, {error_axis[1]:.3f}, {error_axis[2]:.3f}]")
             
             # Wait between measurements
             await asyncio.sleep(1.0)
+        
+        print(f"\n✅ ALL DATA SAVED TO: {data_dir}")
+        print(f"   - calibration_config.json (camera params, hand-eye, reference pose)")
+        print(f"   - image_reference.jpg + image_rotation_1-4.jpg")
+        print(f"   - rotation_data.json (all arm poses and chessboard detections)")
         
         # Return to reference pose
         print(f"\n=== RETURNING TO REFERENCE POSE ===")
