@@ -16,61 +16,28 @@ import glob
 # Add src to path
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 
-try:
-    from utils.utils import call_go_ov2mat
-except ModuleNotFoundError:
-    print("Warning: Could not import go utilities, using basic rotation conversion")
-    def call_go_ov2mat(ox, oy, oz, theta):
-        """Fallback: convert axis-angle to rotation matrix"""
-        angle_rad = np.deg2rad(theta)
-        axis = np.array([ox, oy, oz])
-        axis = axis / np.linalg.norm(axis)
-        K = np.array([[0, -axis[2], axis[1]],
-                      [axis[2], 0, -axis[0]],
-                      [-axis[1], axis[0], 0]])
-        R = np.eye(3) + np.sin(angle_rad) * K + (1 - np.cos(angle_rad)) * (K @ K)
-        return R
-
-def rvec_tvec_to_matrix(rvec, tvec):
-    """Convert rotation vector and translation vector to 4x4 transformation matrix."""
-    R, _ = cv2.Rodrigues(rvec)
-    T = np.eye(4)
-    T[0:3, 0:3] = R
-    T[0:3, 3] = tvec.flatten()
-    return T
-
-def detect_chessboard(image, camera_matrix, dist_coeffs, chessboard_size, square_size):
-    """Detect chessboard in image and return pose"""
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    success, corners = cv2.findChessboardCorners(gray, chessboard_size, None)
-    
-    if not success:
-        return None, None, None
-    
-    # Refine corner positions
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
-    corners = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
-    
-    # Create 3D object points
-    objp = np.zeros((chessboard_size[0] * chessboard_size[1], 3), np.float32)
-    objp[:, :2] = np.mgrid[0:chessboard_size[0], 0:chessboard_size[1]].T.reshape(-1, 2)
-    objp *= square_size
-    
-    # Solve PnP
-    success, rvec, tvec = cv2.solvePnP(objp, corners, camera_matrix, dist_coeffs)
-    
-    if not success:
-        return None, None, None
-    
-    return rvec, tvec, corners
+# Import functions from pose_test_script
+from scripts.pose_test_script import (
+    _pose_to_matrix, 
+    rvec_tvec_to_matrix, 
+    get_camera_pose_from_chessboard,
+    compute_hand_eye_verification_errors
+)
 
 def pose_dict_to_matrix(pose_dict):
-    """Convert pose dictionary to 4x4 transformation matrix"""
-    R = call_go_ov2mat(pose_dict["o_x"], pose_dict["o_y"], pose_dict["o_z"], pose_dict["theta"])
-    T = np.eye(4)
-    T[:3, :3] = R
-    T[:3, 3] = [pose_dict["x"], pose_dict["y"], pose_dict["z"]]
-    return T
+    """Convert pose dictionary to 4x4 transformation matrix using pose_test_script function"""
+    # Create a simple object to pass to _pose_to_matrix
+    from types import SimpleNamespace
+    pose = SimpleNamespace(
+        x=pose_dict["x"],
+        y=pose_dict["y"],
+        z=pose_dict["z"],
+        o_x=pose_dict["o_x"],
+        o_y=pose_dict["o_y"],
+        o_z=pose_dict["o_z"],
+        theta=pose_dict["theta"]
+    )
+    return _pose_to_matrix(pose)
 
 def run_verification(data_dir):
     """Run the verification using saved data"""
@@ -105,8 +72,12 @@ def run_verification(data_dir):
     # Detect chessboard in reference image
     print(f"\nProcessing reference image...")
     ref_image = cv2.imread(os.path.join(data_dir, "image_reference.jpg"))
-    rvec_0, tvec_0, corners_0 = detect_chessboard(ref_image, camera_matrix, dist_coeffs, chessboard_size, square_size)
-    if rvec_0 is None:
+    success, rvec_0, tvec_0, corners_0 = get_camera_pose_from_chessboard(
+        ref_image, camera_matrix, dist_coeffs, 
+        chessboard_size=chessboard_size, 
+        square_size=square_size
+    )
+    if not success:
         print("ERROR: Could not detect chessboard in reference image!")
         return
     
@@ -126,9 +97,13 @@ def run_verification(data_dir):
         
         # Detect chessboard
         image = cv2.imread(img_path)
-        rvec_i, tvec_i, corners_i = detect_chessboard(image, camera_matrix, dist_coeffs, chessboard_size, square_size)
+        success, rvec_i, tvec_i, corners_i = get_camera_pose_from_chessboard(
+            image, camera_matrix, dist_coeffs,
+            chessboard_size=chessboard_size,
+            square_size=square_size
+        )
         
-        if rvec_i is None:
+        if not success:
             print(f"WARNING: Could not detect chessboard in {img_name}")
             continue
         
@@ -154,37 +129,25 @@ def run_verification(data_dir):
             T_delta_A_gripper_frame[:3, :3] = R_A_0.T @ T_delta_A_world_frame[:3, :3] @ R_A_0
             T_delta_A_gripper_frame[:3, 3] = R_A_0.T @ T_delta_A_world_frame[:3, 3]
             
-            # Extract rotations and translations
-            R_A_actual = T_delta_A_gripper_frame[:3, :3]
-            R_A_predicted = T_A_predicted[:3, :3]
-            t_A_actual = T_delta_A_gripper_frame[:3, 3]
-            t_A_predicted = T_A_predicted[:3, 3]
+            # Compute errors using modular function
+            errors = compute_hand_eye_verification_errors(
+                T_hand_eye,
+                T_delta_A_gripper_frame,
+                T_delta_B_camera_frame
+            )
             
-            # Convert to axis-angle
-            rvec_actual, _ = cv2.Rodrigues(R_A_actual)
-            rvec_pred, _ = cv2.Rodrigues(R_A_predicted)
-            angle_actual = np.linalg.norm(rvec_actual) * 180 / np.pi
-            angle_pred = np.linalg.norm(rvec_pred) * 180 / np.pi
-            
+            # Print results
             print(f"  Predicted vs Actual robot motion (in gripper frame):")
-            if angle_actual > 0.01:
-                axis_actual = rvec_actual.flatten() / np.linalg.norm(rvec_actual)
-                print(f"    Actual: {angle_actual:.2f}° around axis [{axis_actual[0]:.3f}, {axis_actual[1]:.3f}, {axis_actual[2]:.3f}]")
-            if angle_pred > 0.01:
-                axis_pred = rvec_pred.flatten() / np.linalg.norm(rvec_pred)
-                print(f"    Predicted: {angle_pred:.2f}° around axis [{axis_pred[0]:.3f}, {axis_pred[1]:.3f}, {axis_pred[2]:.3f}]")
-            
-            # Calculate errors
-            R_error = R_A_predicted.T @ R_A_actual
-            rvec_error, _ = cv2.Rodrigues(R_error)
-            rotation_error = np.linalg.norm(rvec_error) * 180 / np.pi
-            
-            t_error = t_A_predicted - t_A_actual
-            translation_error = np.linalg.norm(t_error)
+            if errors['axis_actual'] is not None:
+                axis = errors['axis_actual']
+                print(f"    Actual: {errors['angle_actual']:.2f}° around axis [{axis[0]:.3f}, {axis[1]:.3f}, {axis[2]:.3f}]")
+            if errors['axis_predicted'] is not None:
+                axis = errors['axis_predicted']
+                print(f"    Predicted: {errors['angle_predicted']:.2f}° around axis [{axis[0]:.3f}, {axis[1]:.3f}, {axis[2]:.3f}]")
             
             print(f"\n  ERRORS (Paper's method - Eq. 48):")
-            print(f"    Rotation error: {rotation_error:.3f}°")
-            print(f"    Translation error: {translation_error:.3f} mm")
+            print(f"    Rotation error: {errors['rotation_error']:.3f}°")
+            print(f"    Translation error: {errors['translation_error']:.3f} mm")
         else:
             # No actual robot pose data - only show predictions
             R_A_predicted = T_A_predicted[:3, :3]

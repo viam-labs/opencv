@@ -232,6 +232,85 @@ def get_camera_pose_from_chessboard(image, camera_matrix, dist_coeffs, chessboar
     else:
         return False, None, None, None
 
+def compute_hand_eye_verification_errors(T_hand_eye, T_delta_A_gripper_frame, T_delta_B_camera_frame):
+    """
+    Compute hand-eye calibration verification errors using the paper's method.
+    
+    Args:
+        T_hand_eye: 4x4 hand-eye transformation matrix (camera to gripper)
+        T_delta_A_gripper_frame: 4x4 actual robot motion in gripper frame
+        T_delta_B_camera_frame: 4x4 camera motion (chessboard motion in camera frame)
+    
+    Returns:
+        dict with keys:
+            - R_A_actual: 3x3 actual rotation matrix
+            - R_A_predicted: 3x3 predicted rotation matrix
+            - t_A_actual: 3x1 actual translation vector
+            - t_A_predicted: 3x1 predicted translation vector
+            - angle_actual: actual rotation angle in degrees
+            - angle_predicted: predicted rotation angle in degrees
+            - axis_actual: actual rotation axis (if angle > 0.01)
+            - axis_predicted: predicted rotation axis (if angle > 0.01)
+            - rotation_error: rotation error in degrees (Equation 48)
+            - translation_error: translation error in mm (Equation 48)
+            - error_axis: error rotation axis (if error > 0.01)
+    """
+    # Paper's method (Equation 47): Predict robot motion from camera motion
+    # Â_i0 = X B_i0 X^(-1) (similarity transform)
+    T_A_predicted = T_hand_eye @ T_delta_B_camera_frame @ np.linalg.inv(T_hand_eye)
+    
+    # Extract rotation matrices and translations
+    R_A_actual = T_delta_A_gripper_frame[:3, :3]
+    R_A_predicted = T_A_predicted[:3, :3]
+    t_A_actual = T_delta_A_gripper_frame[:3, 3]
+    t_A_predicted = T_A_predicted[:3, 3]
+    
+    # Convert to axis-angle
+    rvec_actual, _ = cv2.Rodrigues(R_A_actual)
+    rvec_pred, _ = cv2.Rodrigues(R_A_predicted)
+    angle_actual = np.linalg.norm(rvec_actual) * 180 / np.pi
+    angle_pred = np.linalg.norm(rvec_pred) * 180 / np.pi
+    
+    # Calculate errors according to paper (Equation 48)
+    # R_error = (R̂_A_i0)^T R_A_i0
+    R_error = R_A_predicted.T @ R_A_actual
+    rvec_error, _ = cv2.Rodrigues(R_error)
+    rotation_error = np.linalg.norm(rvec_error) * 180 / np.pi
+    
+    # t_error = t̂_A_i0 - t_A_i0
+    t_error = t_A_predicted - t_A_actual
+    translation_error = np.linalg.norm(t_error)
+    
+    # Build result dictionary
+    result = {
+        'R_A_actual': R_A_actual,
+        'R_A_predicted': R_A_predicted,
+        't_A_actual': t_A_actual,
+        't_A_predicted': t_A_predicted,
+        'angle_actual': angle_actual,
+        'angle_predicted': angle_pred,
+        'rotation_error': rotation_error,
+        'translation_error': translation_error,
+    }
+    
+    # Add rotation axes if angles are significant
+    if angle_actual > 0.01:
+        result['axis_actual'] = rvec_actual.flatten() / np.linalg.norm(rvec_actual)
+    else:
+        result['axis_actual'] = None
+        
+    if angle_pred > 0.01:
+        result['axis_predicted'] = rvec_pred.flatten() / np.linalg.norm(rvec_pred)
+    else:
+        result['axis_predicted'] = None
+    
+    if rotation_error > 0.01:
+        result['error_axis'] = rvec_error.flatten() / np.linalg.norm(rvec_error)
+    else:
+        result['error_axis'] = None
+    
+    return result
+
 async def main(
     arm_name: str,
     pose_tracker_name: str,
@@ -525,56 +604,37 @@ async def main(
             print(f"  Robot delta translation: [{T_delta_A_world_frame[0,3]:.2f}, {T_delta_A_world_frame[1,3]:.2f}, {T_delta_A_world_frame[2,3]:.2f}]")
             print(f"  Camera delta translation: [{T_delta_B_camera_frame[0,3]:.2f}, {T_delta_B_camera_frame[1,3]:.2f}, {T_delta_B_camera_frame[2,3]:.2f}]")
             
-            # Paper's method (Equation 47): Predict robot motion from camera motion
-            # Â_i0 = X B_i0 X^(-1) (similarity transform)
-            # This predicts motion in GRIPPER frame
-            T_A_predicted = T_hand_eye @ T_delta_B_camera_frame @ np.linalg.inv(T_hand_eye)
-            
-            # Extract rotation matrices (compare in gripper frame!)
-            R_A_actual = T_delta_A_gripper_frame[:3, :3]
-            R_A_predicted = T_A_predicted[:3, :3]
-            
-            # Extract translations
-            t_A_actual = T_delta_A_gripper_frame[:3, 3]
-            t_A_predicted = T_A_predicted[:3, 3]
+            # Compute verification errors using modular function
+            errors = compute_hand_eye_verification_errors(
+                T_hand_eye, 
+                T_delta_A_gripper_frame, 
+                T_delta_B_camera_frame
+            )
             
             # Debug: Print rotation matrices
             print(f"\n  DEBUG - Predicted vs Actual robot motion:")
             print(f"  R_A_actual:")
-            for row in R_A_actual:
+            for row in errors['R_A_actual']:
                 print(f"    [{row[0]:7.4f}, {row[1]:7.4f}, {row[2]:7.4f}]")
             print(f"  R_A_predicted:")
-            for row in R_A_predicted:
+            for row in errors['R_A_predicted']:
                 print(f"    [{row[0]:7.4f}, {row[1]:7.4f}, {row[2]:7.4f}]")
             
-            # Convert to axis-angle to understand the rotations better
-            rvec_actual, _ = cv2.Rodrigues(R_A_actual)
-            rvec_pred, _ = cv2.Rodrigues(R_A_predicted)
-            angle_actual = np.linalg.norm(rvec_actual) * 180 / np.pi
-            angle_pred = np.linalg.norm(rvec_pred) * 180 / np.pi
-            if angle_actual > 0.01:
-                axis_actual = rvec_actual.flatten() / np.linalg.norm(rvec_actual)
-                print(f"  Actual: {angle_actual:.2f}° around axis [{axis_actual[0]:.3f}, {axis_actual[1]:.3f}, {axis_actual[2]:.3f}]")
-            if angle_pred > 0.01:
-                axis_pred = rvec_pred.flatten() / np.linalg.norm(rvec_pred)
-                print(f"  Predicted: {angle_pred:.2f}° around axis [{axis_pred[0]:.3f}, {axis_pred[1]:.3f}, {axis_pred[2]:.3f}]")
+            # Print axis-angle representation
+            if errors['axis_actual'] is not None:
+                axis = errors['axis_actual']
+                print(f"  Actual: {errors['angle_actual']:.2f}° around axis [{axis[0]:.3f}, {axis[1]:.3f}, {axis[2]:.3f}]")
+            if errors['axis_predicted'] is not None:
+                axis = errors['axis_predicted']
+                print(f"  Predicted: {errors['angle_predicted']:.2f}° around axis [{axis[0]:.3f}, {axis[1]:.3f}, {axis[2]:.3f}]")
 
-            # Calculate error according to paper (Equation 48)
-            # R_error = (R̂_A_i0)^T R_A_i0
-            R_error = R_A_predicted.T @ R_A_actual
-            rvec_error, _ = cv2.Rodrigues(R_error)
-            rotation_error = np.linalg.norm(rvec_error) * 180 / np.pi
-            
-            # t_error = t̂_A_i0 - t_A_i0
-            t_error = t_A_predicted - t_A_actual
-            translation_error = np.linalg.norm(t_error)
-            
+            # Print errors
             print(f"\n  ERRORS (Paper's method - Eq. 48):")
-            print(f"  Rotation error: {rotation_error:.3f}°")
-            print(f"  Translation error: {translation_error:.3f} mm")
-            if rotation_error > 0.1:
-                error_axis = rvec_error.flatten() / np.linalg.norm(rvec_error)
-                print(f"  Error rotation: {rotation_error:.2f}° around axis [{error_axis[0]:.3f}, {error_axis[1]:.3f}, {error_axis[2]:.3f}]")
+            print(f"  Rotation error: {errors['rotation_error']:.3f}°")
+            print(f"  Translation error: {errors['translation_error']:.3f} mm")
+            if errors['error_axis'] is not None:
+                axis = errors['error_axis']
+                print(f"  Error rotation: {errors['rotation_error']:.2f}° around axis [{axis[0]:.3f}, {axis[1]:.3f}, {axis[2]:.3f}]")
             
             # Wait between measurements
             await asyncio.sleep(1.0)
