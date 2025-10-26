@@ -227,7 +227,7 @@ def get_chessboard_pose_in_camera_frame(image, camera_matrix, dist_coeffs, chess
         corners = cv2.cornerSubPix(gray, corners, (11,11), (-1,-1), criteria)
         
         # Solve PnP to get camera pose
-        success, rvec, tvec = cv2.solvePnP(objp, corners, camera_matrix, dist_coeffs)
+        success, rvec, tvec = cv2.solvePnP(objp, corners, camera_matrix, dist_coeffs, flags=cv2.SOLVEPNP_IPPE)
 
         if not success:
             print("Failed to solve PnP")
@@ -237,6 +237,102 @@ def get_chessboard_pose_in_camera_frame(image, camera_matrix, dist_coeffs, chess
         return True, rvec, tvec, corners
     else:
         return False, None, None, None
+
+def get_aruco_dict_constant(dict_name: str):
+    """Convert string aruco dictionary name to cv2.aruco constant."""
+    dict_map = {
+        '4X4_50': cv2.aruco.DICT_4X4_50,
+        '4X4_100': cv2.aruco.DICT_4X4_100,
+        '4X4_250': cv2.aruco.DICT_4X4_250,
+        '4X4_1000': cv2.aruco.DICT_4X4_1000,
+        '5X5_50': cv2.aruco.DICT_5X5_50,
+        '5X5_100': cv2.aruco.DICT_5X5_100,
+        '5X5_250': cv2.aruco.DICT_5X5_250,
+        '5X5_1000': cv2.aruco.DICT_5X5_1000,
+        '6X6_50': cv2.aruco.DICT_6X6_50,
+        '6X6_100': cv2.aruco.DICT_6X6_100,
+        '6X6_250': cv2.aruco.DICT_6X6_250,
+        '6X6_1000': cv2.aruco.DICT_6X6_1000,
+        '7X7_50': cv2.aruco.DICT_7X7_50,
+        '7X7_100': cv2.aruco.DICT_7X7_100,
+        '7X7_250': cv2.aruco.DICT_7X7_250,
+        '7X7_1000': cv2.aruco.DICT_7X7_1000,
+    }
+    return dict_map.get(dict_name, cv2.aruco.DICT_6X6_250)
+
+def get_aruco_pose_in_camera_frame(image, camera_matrix, dist_coeffs, marker_id=0, marker_size=200.0, aruco_dict=cv2.aruco.DICT_6X6_250):
+    """
+    Get ArUco marker pose in camera frame using PnP.
+    
+    Args:
+        image: Input image
+        camera_matrix: Camera intrinsic matrix
+        dist_coeffs: Distortion coefficients
+        marker_id: ID of the marker to detect (if None, uses first detected marker)
+        marker_size: Size of the marker in mm
+        aruco_dict: ArUco dictionary to use
+        
+    Returns: (success, rotation_vector, translation_vector, corners, detected_id)
+        - rvec, tvec represent the marker's pose in the camera's coordinate system
+    """
+    # Convert to grayscale if needed
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image
+    
+    # Create ArUco detector
+    aruco_dictionary = cv2.aruco.getPredefinedDictionary(aruco_dict)
+    parameters = cv2.aruco.DetectorParameters()
+    detector = cv2.aruco.ArucoDetector(aruco_dictionary, parameters)
+    
+    # Detect markers
+    corners, ids, rejected = detector.detectMarkers(gray)
+    
+    if ids is not None and len(ids) > 0:
+        # Find the requested marker (or use first one if marker_id is None)
+        marker_idx = None
+        if marker_id is None:
+            marker_idx = 0
+            detected_id = ids[0][0]
+        else:
+            for i, id_val in enumerate(ids):
+                if id_val[0] == marker_id:
+                    marker_idx = i
+                    detected_id = marker_id
+                    break
+        
+        if marker_idx is None:
+            print(f"Marker ID {marker_id} not found. Detected IDs: {ids.flatten()}")
+            return False, None, None, None, None
+        
+        # Get corners for the detected marker
+        marker_corners = corners[marker_idx][0]  # Shape: (4, 2)
+        
+        # Define 3D points of the marker (centered at origin)
+        objp = np.array([
+            [-marker_size/2,  marker_size/2, 0],
+            [ marker_size/2,  marker_size/2, 0],
+            [ marker_size/2, -marker_size/2, 0],
+            [-marker_size/2, -marker_size/2, 0]
+        ], dtype=np.float32)
+        
+        # Solve PnP for this marker - IPPE_SQUARE is perfect for 4-point square markers
+        success, rvec, tvec = cv2.solvePnP(
+            objp, marker_corners, camera_matrix, dist_coeffs,
+            flags=cv2.SOLVEPNP_IPPE_SQUARE
+        )
+        
+        if not success:
+            print("Failed to solve PnP for ArUco marker")
+            return False, None, None, None, None
+        
+        # Refine with VVS
+        rvec, tvec = cv2.solvePnPRefineVVS(objp, marker_corners, camera_matrix, dist_coeffs, rvec, tvec)
+        
+        return True, rvec, tvec, marker_corners, detected_id
+    else:
+        return False, None, None, None, None
 
 def visualize_transformation_difference(T_actual, T_predicted, rotation_num, save_dir="."):
     """
@@ -574,6 +670,10 @@ async def main(
     motion_service_name: str,
     body_names: list[str],
     camera_name: str,
+    marker_type: str = 'chessboard',
+    aruco_id: int = 0,
+    aruco_size: float = 200.0,
+    aruco_dict: str = '6X6_250',
 ):
     app_client: Optional[AppClient] = None
     machine: Optional[RobotClient] = None
@@ -685,14 +785,42 @@ async def main(
         camera_matrix, dist_coeffs = await get_camera_intrinsics(camera)
         image = await get_camera_image(camera)
 
-        success, rvec, tvec, corners = get_chessboard_pose_in_camera_frame(image, camera_matrix, dist_coeffs, chessboard_size=(11, 8), square_size=30.0)
-        if not success:
-            print("Failed to detect chessboard in reference image")
-            return
+        # Detect marker based on type
+        if marker_type == 'aruco':
+            aruco_dict_const = get_aruco_dict_constant(aruco_dict)
+            success, rvec, tvec, corners, detected_id = get_aruco_pose_in_camera_frame(
+                image, camera_matrix, dist_coeffs, 
+                marker_id=aruco_id, marker_size=aruco_size, aruco_dict=aruco_dict_const
+            )
+            if not success:
+                print(f"Failed to detect ArUco marker (ID: {aruco_id}) in reference image")
+                return
+            print(f"Detected ArUco marker ID: {detected_id}")
+        else:  # chessboard
+            success, rvec, tvec, corners = get_chessboard_pose_in_camera_frame(
+                image, camera_matrix, dist_coeffs, chessboard_size=(11, 8), square_size=30.0
+            )
+            if not success:
+                print("Failed to detect chessboard in reference image")
+                return
         
         # Convert rvec, tvec to 4x4 transformation matrix (chessboard in camera frame)
         # Don't transpose - solvePnP output is already in OpenCV convention
         T_B_0_camera_frame = rvec_tvec_to_matrix(rvec, tvec)
+        T_B_0_camera_frame_pose = _matrix_to_pose(T_B_0_camera_frame)
+        T_B_0_world_frame_pose_in_frame = await machine.transform_pose(
+            PoseInFrame(reference_frame=camera_name, pose=T_B_0_camera_frame_pose), 
+            "world"
+        )
+        T_B_0_world_frame_pose = T_B_0_world_frame_pose_in_frame.pose
+        T_B_0_world_frame = _pose_to_matrix(T_B_0_world_frame_pose)
+        print(f"\n=== REFERENCE CHESSBOARD ===")
+        print(f"In camera frame:")
+        print(f"  Position: [{T_B_0_camera_frame_pose.x:.2f}, {T_B_0_camera_frame_pose.y:.2f}, {T_B_0_camera_frame_pose.z:.2f}] mm")
+        print(f"  Orientation: ({T_B_0_camera_frame_pose.o_x:.4f}, {T_B_0_camera_frame_pose.o_y:.4f}, {T_B_0_camera_frame_pose.o_z:.4f}, θ={T_B_0_camera_frame_pose.theta:.2f}°)")
+        print(f"In world frame:")
+        print(f"  Position: [{T_B_0_world_frame_pose.x:.2f}, {T_B_0_world_frame_pose.y:.2f}, {T_B_0_world_frame_pose.z:.2f}] mm")
+        print(f"  Orientation: ({T_B_0_world_frame_pose.o_x:.4f}, {T_B_0_world_frame_pose.o_y:.4f}, {T_B_0_world_frame_pose.o_z:.4f}, θ={T_B_0_world_frame_pose.theta:.2f}°)")
         
         # Create directory for saving data
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -722,8 +850,47 @@ async def main(
         with open(os.path.join(data_dir, "calibration_config.json"), "w") as f:
             json.dump(calibration_data, f, indent=2)
         
-        # Save reference image
-        cv2.imwrite(os.path.join(data_dir, "image_reference.jpg"), image)
+        # Save reference image with visualization
+        ref_debug_img = image.copy()
+        if marker_type == 'aruco':
+            # Draw marker outline
+            pts = corners.reshape(4, 2).astype(np.int32)
+            cv2.polylines(ref_debug_img, [pts], True, (0, 255, 0), 2)
+            center = np.mean(pts, axis=0).astype(np.int32)
+            cv2.putText(ref_debug_img, f"ID: {detected_id}", tuple(center), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        else:
+            cv2.drawChessboardCorners(ref_debug_img, (11, 8), corners, success)
+        
+        # Draw coordinate axes
+        cv2.drawFrameAxes(ref_debug_img, camera_matrix, dist_coeffs, rvec, tvec, 50)
+        
+        # Draw rotation vector
+        rotation_angle = np.linalg.norm(rvec)
+        if rotation_angle > 0.01:
+            rotation_axis = rvec.flatten() / rotation_angle
+            marker_center_3d = tvec.reshape(3, 1)
+            marker_center_2d, _ = cv2.projectPoints(
+                marker_center_3d.T, np.zeros(3), np.zeros(3), 
+                camera_matrix, dist_coeffs
+            )
+            start_pt = tuple(marker_center_2d[0, 0].astype(np.int32))
+            arrow_length = min(100, rotation_angle * 180 / np.pi * 0.5)
+            end_point_3d = marker_center_3d + rotation_axis.reshape(3, 1) * arrow_length
+            end_pt_2d, _ = cv2.projectPoints(
+                end_point_3d.T, np.zeros(3), np.zeros(3),
+                camera_matrix, dist_coeffs
+            )
+            end_pt = tuple(end_pt_2d[0, 0].astype(np.int32))
+            cv2.arrowedLine(ref_debug_img, start_pt, end_pt, (255, 0, 255), 3, tipLength=0.3)
+            rotation_text = f"Rot: {rotation_angle*180/np.pi:.1f}deg"
+            axis_text = f"Axis: [{rotation_axis[0]:.2f}, {rotation_axis[1]:.2f}, {rotation_axis[2]:.2f}]"
+            cv2.putText(ref_debug_img, rotation_text, (10, 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
+            cv2.putText(ref_debug_img, axis_text, (10, 60), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
+        
+        cv2.imwrite(os.path.join(data_dir, "image_reference.jpg"), ref_debug_img)
         print(f"Saved reference image and config")
         
         # List to store all rotation data
@@ -749,16 +916,78 @@ async def main(
             await asyncio.sleep(2.0)
             
             image = await get_camera_image(camera)
-            success, rvec, tvec, corners = get_chessboard_pose_in_camera_frame(image, camera_matrix, dist_coeffs, chessboard_size=(11, 8), square_size=30.0)
-            if not success:
-                print(f"Failed to detect chessboard in rotation {i+1}")
-                continue
+            
+            # Detect marker based on type
+            if marker_type == 'aruco':
+                aruco_dict_const = get_aruco_dict_constant(aruco_dict)
+                success, rvec, tvec, corners, detected_id = get_aruco_pose_in_camera_frame(
+                    image, camera_matrix, dist_coeffs,
+                    marker_id=aruco_id, marker_size=aruco_size, aruco_dict=aruco_dict_const
+                )
+                if not success:
+                    print(f"Failed to detect ArUco marker in rotation {i+1}")
+                    continue
+            else:  # chessboard
+                success, rvec, tvec, corners = get_chessboard_pose_in_camera_frame(
+                    image, camera_matrix, dist_coeffs, chessboard_size=(11, 8), square_size=30.0
+                )
+                if not success:
+                    print(f"Failed to detect chessboard in rotation {i+1}")
+                    continue
             
             # Debug: Save image with detected corners
             debug_img = image.copy()
-            cv2.drawChessboardCorners(debug_img, (11, 8), corners, success)
-            # Draw coordinate axes on the chessboard
+            if marker_type == 'aruco':
+                # For ArUco, just draw the axes (marker outline is less important)
+                # Draw a simple polygon around the marker
+                pts = corners.reshape(4, 2).astype(np.int32)
+                cv2.polylines(debug_img, [pts], True, (0, 255, 0), 2)
+                # Add marker ID text
+                center = np.mean(pts, axis=0).astype(np.int32)
+                cv2.putText(debug_img, f"ID: {detected_id}", tuple(center), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            else:
+                # Draw chessboard corners
+                cv2.drawChessboardCorners(debug_img, (11, 8), corners, success)
+            
+            # Draw coordinate axes (X=red, Y=green, Z=blue)
             cv2.drawFrameAxes(debug_img, camera_matrix, dist_coeffs, rvec, tvec, 50)
+            
+            # Draw rotation vector (axis-angle representation) as a magenta arrow
+            rotation_angle = np.linalg.norm(rvec)
+            if rotation_angle > 0.01:  # Only draw if there's significant rotation
+                # Normalize to get rotation axis
+                rotation_axis = rvec.flatten() / rotation_angle
+                
+                # Project marker center to image
+                marker_center_3d = tvec.reshape(3, 1)
+                marker_center_2d, _ = cv2.projectPoints(
+                    marker_center_3d.T, np.zeros(3), np.zeros(3), 
+                    camera_matrix, dist_coeffs
+                )
+                start_pt = tuple(marker_center_2d[0, 0].astype(np.int32))
+                
+                # Draw arrow in direction of rotation axis
+                # Scale by rotation angle (in degrees) for visualization
+                arrow_length = min(100, rotation_angle * 180 / np.pi * 0.5)  # Scale for visibility
+                end_point_3d = marker_center_3d + rotation_axis.reshape(3, 1) * arrow_length
+                end_pt_2d, _ = cv2.projectPoints(
+                    end_point_3d.T, np.zeros(3), np.zeros(3),
+                    camera_matrix, dist_coeffs
+                )
+                end_pt = tuple(end_pt_2d[0, 0].astype(np.int32))
+                
+                # Draw magenta arrow for rotation vector
+                cv2.arrowedLine(debug_img, start_pt, end_pt, (255, 0, 255), 3, tipLength=0.3)
+                
+                # Add rotation info text
+                rotation_text = f"Rot: {rotation_angle*180/np.pi:.1f}deg"
+                axis_text = f"Axis: [{rotation_axis[0]:.2f}, {rotation_axis[1]:.2f}, {rotation_axis[2]:.2f}]"
+                cv2.putText(debug_img, rotation_text, (10, 30), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
+                cv2.putText(debug_img, axis_text, (10, 60), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
+            
             cv2.imwrite(f"debug_rotation_{i+1}.jpg", debug_img)
             print(f"Saved debug image: debug_rotation_{i+1}.jpg")
             
@@ -768,6 +997,20 @@ async def main(
 
             # Convert chessboard pose (don't transpose - solvePnP is OpenCV convention)
             T_B_i_camera_frame = rvec_tvec_to_matrix(rvec, tvec)
+            T_B_i_world_frame_pose = _matrix_to_pose(T_B_i_camera_frame)
+            T_B_i_world_frame_pose_in_frame = await machine.transform_pose(
+                PoseInFrame(reference_frame=camera_name, pose=T_B_i_world_frame_pose), 
+                "world"
+            )
+            T_B_i_world_frame_pose_result = T_B_i_world_frame_pose_in_frame.pose
+            T_B_i_world_frame = _pose_to_matrix(T_B_i_world_frame_pose_result)
+            print(f"\n=== CHESSBOARD IN WORLD FRAME ===")
+            print(f"In camera frame:")
+            print(f"  Position: [{T_B_i_camera_frame[0,3]:.2f}, {T_B_i_camera_frame[1,3]:.2f}, {T_B_i_camera_frame[2,3]:.2f}] mm")
+            print(f"  Orientation: ({T_B_i_camera_frame[0,0]:.4f}, {T_B_i_camera_frame[0,1]:.4f}, {T_B_i_camera_frame[0,2]:.4f}, θ={T_B_i_camera_frame[0,3]:.2f}°)")
+            print(f"In world frame:")
+            print(f"  Position: [{T_B_i_world_frame[0,3]:.2f}, {T_B_i_world_frame[1,3]:.2f}, {T_B_i_world_frame[2,3]:.2f}] mm")
+            print(f"  Orientation: ({T_B_i_world_frame[0,0]:.4f}, {T_B_i_world_frame[0,1]:.4f}, {T_B_i_world_frame[0,2]:.4f}, θ={T_B_i_world_frame[0,3]:.2f}°)")
             
             # Save rotation data
             rotation_info = {
@@ -801,7 +1044,25 @@ async def main(
             
             # B = Camera motion in CAMERA frame (motion of target as observed by camera)
             T_delta_B_camera_frame = T_B_i_camera_frame @ np.linalg.inv(T_B_0_camera_frame)
-            
+
+            T_delta_B_camera_frame_pose = _matrix_to_pose(T_delta_B_camera_frame)
+            T_delta_B_world_frame_pose_in_frame = await machine.transform_pose(
+                PoseInFrame(reference_frame=camera_name, pose=T_delta_B_camera_frame_pose), 
+                "world"
+            )
+            T_delta_B_world_frame_pose_result = T_delta_B_world_frame_pose_in_frame.pose
+            T_delta_B_world_frame = _pose_to_matrix(T_delta_B_world_frame_pose_result)
+            T_delta_B_world_frame_2 = np.linalg.inv(T_B_0_world_frame) @ T_B_i_world_frame
+            print(f"\n=== DELTA BETWEEN CHESSBOARD IN WORLD FRAME ===")
+            print(f"In camera frame:")
+            print(f"  Position: [{T_delta_B_camera_frame[0,3]:.2f}, {T_delta_B_camera_frame[1,3]:.2f}, {T_delta_B_camera_frame[2,3]:.2f}] mm")
+            print(f"  Orientation: ({T_delta_B_camera_frame[0,0]:.4f}, {T_delta_B_camera_frame[0,1]:.4f}, {T_delta_B_camera_frame[0,2]:.4f}, θ={T_delta_B_camera_frame[0,3]:.2f}°)")
+            print(f"In world frame:")
+            print(f"  Position: [{T_delta_B_world_frame[0,3]:.2f}, {T_delta_B_world_frame[1,3]:.2f}, {T_delta_B_world_frame[2,3]:.2f}] mm")
+            print(f"  Orientation: ({T_delta_B_world_frame[0,0]:.4f}, {T_delta_B_world_frame[0,1]:.4f}, {T_delta_B_world_frame[0,2]:.4f}, θ={T_delta_B_world_frame[0,3]:.2f}°)")
+            print(f"In world frame 2:")
+            print(f"  Position: [{T_delta_B_world_frame_2[0,3]:.2f}, {T_delta_B_world_frame_2[1,3]:.2f}, {T_delta_B_world_frame_2[2,3]:.2f}] mm")
+            print(f"  Orientation: ({T_delta_B_world_frame_2[0,0]:.4f}, {T_delta_B_world_frame_2[0,1]:.4f}, {T_delta_B_world_frame_2[0,2]:.4f}, θ={T_delta_B_world_frame_2[0,3]:.2f}°)")
             # Debug: Print detailed transformation info
             print(f"\n  DEBUG - Transformations:")
             print(f"  Robot pose 0: ({A_0_pose_world_frame.x:.1f}, {A_0_pose_world_frame.y:.1f}, {A_0_pose_world_frame.z:.1f}) θ={A_0_pose_world_frame.theta:.1f}°")
@@ -898,6 +1159,35 @@ if __name__ == '__main__':
         required=True,
         help='Name of the pose tracker resource'
     )
+    parser.add_argument(
+        '--marker-type',
+        type=str,
+        choices=['chessboard', 'aruco'],
+        default='chessboard',
+        help='Type of fiducial marker to use (default: chessboard)'
+    )
+    parser.add_argument(
+        '--aruco-id',
+        type=int,
+        default=0,
+        help='ArUco marker ID to detect (default: 0)'
+    )
+    parser.add_argument(
+        '--aruco-size',
+        type=float,
+        default=200.0,
+        help='ArUco marker size in mm (default: 200.0)'
+    )
+    parser.add_argument(
+        '--aruco-dict',
+        type=str,
+        choices=['4X4_50', '4X4_100', '4X4_250', '4X4_1000',
+                 '5X5_50', '5X5_100', '5X5_250', '5X5_1000',
+                 '6X6_50', '6X6_100', '6X6_250', '6X6_1000',
+                 '7X7_50', '7X7_100', '7X7_250', '7X7_1000'],
+        default='6X6_250',
+        help='ArUco dictionary to use (default: 6X6_250)'
+    )
     args = parser.parse_args()
     asyncio.run(main(
         arm_name=args.arm_name,
@@ -905,4 +1195,8 @@ if __name__ == '__main__':
         motion_service_name="motion",
         body_names=["corner_45",],
         camera_name=args.camera_name,
+        marker_type=args.marker_type,
+        aruco_id=args.aruco_id,
+        aruco_size=args.aruco_size,
+        aruco_dict=args.aruco_dict,
     ))
