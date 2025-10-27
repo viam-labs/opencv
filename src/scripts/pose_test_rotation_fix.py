@@ -501,6 +501,8 @@ async def main(
         if poses is None:
             print("No poses provided, using default poses")
             initial_pose = await _get_current_arm_pose(motion_service, arm.name, arm)
+            print(f"Initial pose theta: {initial_pose.theta:.1f}°")
+            
             poses = []
             for i in range(4):
                 new_pose = Pose(
@@ -510,9 +512,10 @@ async def main(
                     o_x=initial_pose.o_x,
                     o_y=initial_pose.o_y,
                     o_z=initial_pose.o_z,
-                    theta=initial_pose.theta + i * 90
+                    theta=i * 90  # Normalize to 0°, 90°, 180°, 270°
                 )
                 poses.append(new_pose)
+            print(f"Created poses at: 0°, 90°, 180°, 270°")
         
         print(f"\n=== TESTING {len(poses)} POSES ===")
         for i, pose_spec in enumerate(poses):
