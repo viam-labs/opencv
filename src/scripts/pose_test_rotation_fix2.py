@@ -77,7 +77,13 @@ def analyze_hand_eye_error(T_hand_eye, T_delta_A_world_frame, T_delta_B_camera_f
     angle_B = np.degrees(np.arccos(np.clip((np.trace(R_B) - 1) / 2, -1, 1)))
     print(f"  Arm rotation:      {angle_A:8.2f}°")
     print(f"  Board rotation:    {angle_B:8.2f}°")
-    
+    axis_angle_A = cv2.Rodrigues(R_A)[0]
+    axis_A = axis_angle_A.flatten() / (np.linalg.norm(axis_angle_A) + 1e-10)
+    axis_angle_B = cv2.Rodrigues(R_B)[0]
+    axis_B = axis_angle_B.flatten() / (np.linalg.norm(axis_angle_B) + 1e-10)
+    print(f"  Arm rotation axis: [{axis_A[0]:6.3f}, {axis_A[1]:6.3f}, {axis_A[2]:6.3f}]")
+    print(f"  Board rotation axis: [{axis_B[0]:6.3f}, {axis_B[1]:6.3f}, {axis_B[2]:6.3f}]")
+
     print(f"\n🔍 HAND-EYE TRANSFORM:")
     print(f"  Translation: [{t_X[0]:7.2f}, {t_X[1]:7.2f}, {t_X[2]:7.2f}] mm")
     angle_X = np.degrees(np.arccos(np.clip((np.trace(R_X) - 1) / 2, -1, 1)))
@@ -92,42 +98,25 @@ def analyze_hand_eye_error(T_hand_eye, T_delta_A_world_frame, T_delta_B_camera_f
     
     print(f"\n🧮 VERIFICATION EQUATION TESTING:")
     
-    # Method 1: Standard X⁻¹BX (your current method)
+    # Method 1: Try XBX⁻¹
     X_inv = np.linalg.inv(T_hand_eye)
-    T_predicted_1 = X_inv @ T_delta_B_camera_frame @ T_hand_eye
+    T_predicted_1 = T_hand_eye @ T_delta_B_camera_frame @ X_inv
     error_1_rot = rotation_error(T_predicted_1[:3,:3], R_A)
     error_1_trans = np.linalg.norm(T_predicted_1[:3,3] - t_A)
     
-    print(f"  Method 1 (X⁻¹BX):   rot={error_1_rot:.3f}°, trans={error_1_trans:.2f}mm")
+    print(f"  Method 1 (XBX⁻¹):   rot={error_1_rot:.3f}°, trans={error_1_trans:.2f}mm")
     
-    # Method 2: Try XBX⁻¹
-    T_predicted_2 = T_hand_eye @ T_delta_B_camera_frame @ X_inv
-    error_2_rot = rotation_error(T_predicted_2[:3,:3], R_A)
-    error_2_trans = np.linalg.norm(T_predicted_2[:3,3] - t_A)
+    # Method 2: Try X⁻¹AX (predicting B from A)
+    T_predicted_2 = X_inv @ T_delta_A_world_frame @ T_hand_eye
+    error_2_rot = rotation_error(T_predicted_2[:3,:3], R_B)
+    error_2_trans = np.linalg.norm(T_predicted_2[:3,3] - t_B)
     
-    print(f"  Method 2 (XBX⁻¹):   rot={error_2_rot:.3f}°, trans={error_2_trans:.2f}mm")
-    
-    # Method 3: Try XA⁻¹X⁻¹ (predicting B from A)
-    T_A_inv = np.linalg.inv(T_delta_A_world_frame)
-    T_predicted_3 = T_hand_eye @ T_A_inv @ X_inv
-    error_3_rot = rotation_error(T_predicted_3[:3,:3], R_B)
-    error_3_trans = np.linalg.norm(T_predicted_3[:3,3] - t_B)
-    
-    print(f"  Method 3 (XA⁻¹X⁻¹): rot={error_3_rot:.3f}°, trans={error_3_trans:.2f}mm (predicting B)")
-    
-    # Method 4: Try X⁻¹AX (predicting B from A)
-    T_predicted_4 = X_inv @ T_delta_A_world_frame @ T_hand_eye
-    error_4_rot = rotation_error(T_predicted_4[:3,:3], R_B)
-    error_4_trans = np.linalg.norm(T_predicted_4[:3,3] - t_B)
-    
-    print(f"  Method 4 (X⁻¹AX):   rot={error_4_rot:.3f}°, trans={error_4_trans:.2f}mm (predicting B)")
+    print(f"  Method 2 (X⁻¹AX):   rot={error_2_rot:.3f}°, trans={error_2_trans:.2f}mm (predicting B)")
     
     print(f"\n🎯 BEST METHOD: ", end="")
     errors = [
-        (1, error_1_rot, error_1_trans, "X⁻¹BX (current)"),
-        (2, error_2_rot, error_2_trans, "XBX⁻¹"),
-        (3, error_3_rot, error_3_trans, "XA⁻¹X⁻¹ (inverse direction)"),
-        (4, error_4_rot, error_4_trans, "X⁻¹AX (inverse direction)")
+        (1, error_1_rot, error_1_trans, "XBX⁻¹ (current)"),
+        (2, error_2_rot, error_2_trans, "X⁻¹AX (predicting B)"),
     ]
     best = min(errors, key=lambda x: x[1] + x[2]/10)  # Weight rotation more
     print(f"Method {best[0]} - {best[3]}")
