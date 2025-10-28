@@ -1209,14 +1209,14 @@ async def main(
             T_delta_B_camera_frame = T_B_i_camera_frame @ np.linalg.inv(T_B_0_camera_frame)
 
             # ADD THIS: Detailed debug analysis
-            best_method = analyze_hand_eye_error(
-                T_hand_eye, 
-                T_delta_A_world_frame, 
-                T_delta_B_camera_frame,
-                A_0_pose_world_frame_raw,
-                A_i_pose_world_frame_raw,
-                i+1
-            )
+            # best_method = analyze_hand_eye_error(
+            #     T_hand_eye, 
+            #     T_delta_A_world_frame, 
+            #     T_delta_B_camera_frame,
+            #     A_0_pose_world_frame_raw,
+            #     A_i_pose_world_frame_raw,
+            #     i+1
+            # )
 
             # Compute verification errors (keep your existing code)
             errors = compute_hand_eye_verification_errors(
