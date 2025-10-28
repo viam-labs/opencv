@@ -112,11 +112,8 @@ class HandEyeCalibration(Generic, EasyResource):
             if not isinstance(body_name, str):
                 raise Exception(f"'{BODY_NAME_ATTR}' must be a string, got {type(body_name)}")
 
-        # Motion service is required when using poses
         motion = attrs.get(MOTION_ATTR)
         optional_deps = []
-        if poses is not None and motion is None:
-            raise Exception(f"Motion service is required when using {POSES_ATTR}. Set the {MOTION_ATTR} attribute to the name of the motion service.")
         if motion is not None:
             optional_deps.append(str(motion))
 
@@ -213,7 +210,7 @@ class HandEyeCalibration(Generic, EasyResource):
         return R_base2gripper, t_base2gripper, R_cam2target, t_cam2target
 
     async def _move_arm_to_position(self, position_data, position_index, total_positions):
-        """Move arm to specified position using either direct joint control or motion planning.
+        """Move arm to specified position using joint control, direct pose control, or motion planning.
 
         Args:
             position_data: Either a list of joint positions (radians) or a Pose object
@@ -222,15 +219,9 @@ class HandEyeCalibration(Generic, EasyResource):
         """
         self.logger.debug(f"Moving to position {position_index+1}/{total_positions}")
 
-        if self.motion is None:
-            # Direct joint position control
-            joints_deg = [np.degrees(joint) for joint in position_data]
-            jp = JointPositions(values=joints_deg)
-            await self.arm.move_to_joint_positions(jp)
-            while await self.arm.is_moving():
-                await asyncio.sleep(0.05)
-            self.logger.debug(f"Moved arm to joint position: {jp}")
-        else:
+        is_pose = isinstance(position_data, Pose)
+
+        if self.motion is not None and is_pose:
             # Motion planning approach with pose
             pif = PoseInFrame(reference_frame="world", pose=position_data)
 
@@ -241,6 +232,20 @@ class HandEyeCalibration(Generic, EasyResource):
             if not success:
                 raise Exception(f"Could not move to pose {position_index+1}/{total_positions}")
             self.logger.debug(f"Moved arm to pose using motion planning")
+        elif is_pose:
+            # Direct pose control using arm.move_to_position
+            await self.arm.move_to_position(pose=position_data)
+            while await self.arm.is_moving():
+                await asyncio.sleep(0.05)
+            self.logger.debug(f"Moved arm to pose: {position_data}")
+        else:
+            # Direct joint position control
+            joints_deg = [np.degrees(joint) for joint in position_data]
+            jp = JointPositions(values=joints_deg)
+            await self.arm.move_to_joint_positions(jp)
+            while await self.arm.is_moving():
+                await asyncio.sleep(0.05)
+            self.logger.debug(f"Moved arm to joint position: {jp}")
 
     async def _collect_calibration_data(self):
         """Collect calibration data for all joint positions or poses."""

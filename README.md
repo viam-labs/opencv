@@ -42,10 +42,11 @@ The following attributes are available for this model:
 
 A calibration service that performs hand-eye calibration for robotic arms with mounted or fixed cameras. This service automates the process of determining the transformation between the robot's end-effector and camera coordinate frames by moving the arm through predefined positions while tracking bodies. The resulting calibration enables accurate coordination between robot motion and visual perception.
 
-This service supports two operation modes:
+This service supports three operation modes:
 
-1. **Joint Position Mode** (no motion service): Uses direct joint control to move the arm through predefined joint positions
-2. **Pose Mode** (with motion service): Uses motion planning to move the arm through predefined poses
+1. **Joint Position Mode**: Uses direct joint control to move the arm through predefined joint positions
+2. **Direct Pose Mode**: Uses `arm.move_to_position` to move the arm through predefined poses without motion planning, assuming the arm implements that method.
+3. **Motion Planning Mode**: Uses the motion service to move the arm through predefined poses with obstacle avoidance and motion planning
 
 ### Hand Eye Calibration Configuration
 
@@ -74,10 +75,10 @@ The following attributes are available for this model:
 | `arm_name`        | `string` | `Required` | Name of the arm component used for calibration.                                    |
 | `calibration_type`| `string` | `Required` | Type of calibration to perform (see available calibrations below).                 |
 | `joint_positions` | `list`   | `Required*` | List of joint positions (in radians) for calibration poses. Required if `poses` is not provided. |
-| `poses`           | `list`   | `Required*` | List of poses (with x, y, z, o_x, o_y, o_z, theta) for calibration. Required if `joint_positions` is not provided. When using poses, the `motion` service is also required. If both are provided, `poses` will be used. |
+| `poses`           | `list`   | `Required*` | List of poses (with x, y, z, o_x, o_y, o_z, theta) for calibration. Required if `joint_positions` is not provided. Can be used with or without the `motion` service. If both `joint_positions` and `poses` are provided, `poses` will be used. |
 | `method`          | `string` | `Required` | Calibration method to use (see available methods below).                           |
 | `pose_tracker`    | `string` | `Required` | Name of the pose tracker component to detect tracked bodies.                       |
-| `motion`          | `string` | `Optional*` | Name of the motion service for coordinated movement. Required when using `poses`.  |
+| `motion`          | `string` | `Optional` | Name of the motion service for motion planning with obstacle avoidance. When provided with `poses`, uses motion planning. When not provided with `poses`, uses direct `arm.move_to_position`. |
 | `sleep_seconds`   | `float`  | `Optional` | Sleep time between movements to allow for arm to settle (defaults to 2.0 seconds). |
 | `body_name`       | `string` | `Optional` | Name of the specific tracked body to use (e.g., AprilTag ID like "tag36h11:0" or chessboard corner like "corner_0"). Calibration expects exactly one pose, so if the pose tracker's `get_poses` returns more than one pose, this attribute will be necessary to specify. **Important**: When using chessboard corners, ensure the chessboard maintains consistent orientation across all calibration poses to ensure the same corner is tracked. |
 
@@ -98,7 +99,7 @@ Available methods are:
 
 #### Hand Eye Calibration Example Configurations
 
-**Joint Position Mode (no motion service):**
+**Joint Position Mode:**
 
 ```json
 {
@@ -112,7 +113,24 @@ Available methods are:
 }
 ```
 
-**Pose Mode (with motion service):**
+**Direct Pose Mode (using arm.move_to_position):**
+
+```json
+{
+  "arm_name": "my_arm",
+  "body_name": "corner_1",
+  "calibration_type": "eye-in-hand",
+  "poses": [
+    {"x": 100, "y": 200, "z": 300, "o_x": 0, "o_y": 0, "o_z": 1, "theta": 0},
+    {"x": 150, "y": 200, "z": 350, "o_x": 0, "o_y": 0, "o_z": 1, "theta": 45}
+  ],
+  "method": "CALIB_HAND_EYE_TSAI",
+  "pose_tracker": "pose_tracker_opencv",
+  "sleep_seconds": 2.0
+}
+```
+
+**Motion Planning Mode (with motion service):**
 
 ```json
 {
@@ -157,7 +175,10 @@ pose = await hand_eye_service.do_command({"get_current_arm_pose": True})
 
 #### `move_arm_to_position`
 
-Moves the arm to a configured position by index. Automatically uses the appropriate mode (joint positions or poses with motion planning).
+Moves the arm to a configured position by index. Automatically uses the appropriate mode based on configuration:
+- **Joint Position Mode**: Uses `arm.move_to_joint_positions`
+- **Direct Pose Mode**: Uses `arm.move_to_position` (when poses are provided without motion service)
+- **Motion Planning Mode**: Uses motion planning (when poses are provided with motion service)
 
 **Parameters:**
 - `index`: Index of the position to move to.
