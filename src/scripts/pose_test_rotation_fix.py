@@ -52,8 +52,6 @@ def parse_poses_from_json(json_path: str) -> list:
           {"x": 150, "y": 100, "z": 250, "o_x": 0, "o_y": 0, "o_z": 1, "theta": 90}
         ]
     """
-    if json_path is None:
-        return None
     if not os.path.exists(json_path):
         raise FileNotFoundError(f"Poses file not found: {json_path}")
 
@@ -498,44 +496,20 @@ async def main(
         rotation_data = []
 
         # Test the hand-eye transformation with provided poses
-        if poses is None:
-            print("No poses provided, using default poses")
-            initial_pose = await _get_current_arm_pose(motion_service, arm.name, arm)
-            print(f"Initial pose theta: {initial_pose.theta:.1f}°")
-            
-            poses = []
-            for i in range(4):
-                new_pose = Pose(
-                    x=initial_pose.x,
-                    y=initial_pose.y,
-                    z=initial_pose.z,
-                    o_x=initial_pose.o_x,
-                    o_y=initial_pose.o_y,
-                    o_z=initial_pose.o_z,
-                    theta=i * 90  # Normalize to 0°, 90°, 180°, 270°
-                )
-                poses.append(new_pose)
-            print(f"Created poses at: 0°, 90°, 180°, 270°")
-        
         print(f"\n=== TESTING {len(poses)} POSES ===")
         for i, pose_spec in enumerate(poses):
             print(f"\n=== POSE {i+1}/{len(poses)} ===")
 
             # Create target pose from specification
-            if isinstance(pose_spec, dict):
-                # Pose from file (dictionary)
-                target_pose = Pose(
-                    x=pose_spec['x'],
-                    y=pose_spec['y'],
-                    z=pose_spec['z'],
-                    o_x=pose_spec['o_x'],
-                    o_y=pose_spec['o_y'],
-                    o_z=pose_spec['o_z'],
-                    theta=pose_spec['theta']
-                )
-            else:
-                # Pose object (default poses)
-                target_pose = pose_spec
+            target_pose = Pose(
+                x=pose_spec['x'],
+                y=pose_spec['y'],
+                z=pose_spec['z'],
+                o_x=pose_spec['o_x'],
+                o_y=pose_spec['o_y'],
+                o_z=pose_spec['o_z'],
+                theta=pose_spec['theta']
+            )
             print(f"  Position: ({target_pose.x:.1f}, {target_pose.y:.1f}, {target_pose.z:.1f})")
             print(f"  Orientation: ({target_pose.o_x:.3f}, {target_pose.o_y:.3f}, {target_pose.o_z:.3f}) @ {target_pose.theta:.1f}°")
 
@@ -560,23 +534,9 @@ async def main(
             T_B_i_camera_frame = rvec_tvec_to_matrix(rvec, tvec)
             
             # Save pose data
-            # Convert pose_spec to dictionary if it's a Pose object
-            if isinstance(pose_spec, Pose):
-                pose_spec_dict = {
-                    "x": pose_spec.x,
-                    "y": pose_spec.y,
-                    "z": pose_spec.z,
-                    "o_x": pose_spec.o_x,
-                    "o_y": pose_spec.o_y,
-                    "o_z": pose_spec.o_z,
-                    "theta": pose_spec.theta
-                }
-            else:
-                pose_spec_dict = pose_spec
-            
             pose_info = {
                 "pose_index": i,
-                "pose_spec": pose_spec_dict,
+                "pose_spec": pose_spec,
                 "A_i_pose_raw": {
                     "x": A_i_pose_world_frame_raw.x,
                     "y": A_i_pose_world_frame_raw.y,
@@ -691,7 +651,7 @@ All pose objects must have: x, y, z, o_x, o_y, o_z, theta
     parser.add_argument(
         '--poses',
         type=str,
-        required=False,
+        required=True,
         help='Path to JSON file containing list of pose objects'
     )
     args = parser.parse_args()
@@ -699,11 +659,7 @@ All pose objects must have: x, y, z, o_x, o_y, o_z, theta
     # Parse poses from JSON file
     try:
         poses = parse_poses_from_json(args.poses)
-        if poses is None:
-            print("No poses provided, using default poses")
-            poses = None
-        else:
-            print(f"Loaded {len(poses)} poses to test")
+        print(f"Loaded {len(poses)} poses to test")
     except Exception as e:
         print(f"Error parsing poses: {e}")
         exit(1)
