@@ -369,13 +369,14 @@ def frame_config_to_transformation_matrix(frame_config):
 
 
 def validate_chessboard_detection(image, corners, rvec, tvec, camera_matrix, dist_coeffs, 
-                                   chessboard_size, square_size=30.0, objp=None):
+                                   chessboard_size, square_size=30.0, objp=None, data_dir=None):
     """
     Validate chessboard detection quality by computing reprojection error and sharpness.
     
     Args:
         objp: If provided, use this object points array. Otherwise generate from chessboard_size.
               This is important when corners have been filtered for outliers!
+        data_dir: Directory to save histogram. If None, saves in current directory.
     
     Returns: (mean_reprojection_error, max_reprojection_error, reprojected_points, sharpness, errors)
     """
@@ -483,7 +484,13 @@ def validate_chessboard_detection(image, corners, rvec, tvec, camera_matrix, dis
         
         # Save histogram
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        histogram_path = f"reprojection_error_histogram_{timestamp}.png"
+        histogram_filename = f"reprojection_error_histogram_{timestamp}.png"
+        
+        if data_dir:
+            histogram_path = os.path.join(data_dir, histogram_filename)
+        else:
+            histogram_path = histogram_filename
+            
         plt.savefig(histogram_path, dpi=150, bbox_inches='tight')
         print(f"Saved reprojection error histogram: {histogram_path}")
         
@@ -499,9 +506,12 @@ def validate_chessboard_detection(image, corners, rvec, tvec, camera_matrix, dis
 
 def get_chessboard_pose_in_camera_frame(image, camera_matrix, dist_coeffs, chessboard_size, 
                                        square_size=30.0, pnp_method=cv2.SOLVEPNP_IPPE, 
-                                       use_sb_detection=True):
+                                       use_sb_detection=True, data_dir=None):
     """
     Get chessboard pose in camera frame using PnP with improved outlier filtering.
+    
+    Args:
+        data_dir: Directory to save histogram. If None, saves in current directory.
     
     Note: cv2.solvePnP returns the transformation from chessboard coordinates to camera coordinates.
     This is T_chessboard_to_camera, NOT T_camera_to_chessboard.
@@ -623,7 +633,7 @@ def get_chessboard_pose_in_camera_frame(image, camera_matrix, dist_coeffs, chess
         
         # Validate detection quality
         mean_error, max_error, reprojected_points, errors = validate_chessboard_detection(
-            image, corners, rvec, tvec, camera_matrix, dist_coeffs, chessboard_size, square_size, objp
+            image, corners, rvec, tvec, camera_matrix, dist_coeffs, chessboard_size, square_size, objp, data_dir
         )
         
         print(f"Chessboard detection quality: mean={mean_error:.3f}px, max={max_error:.3f}px")
@@ -841,16 +851,19 @@ def draw_marker_debug(image, rvec, tvec, camera_matrix, dist_coeffs, marker_type
 
 def get_marker_pose_in_camera_frame(image, camera_matrix, dist_coeffs, marker_type='chessboard', 
                                    chessboard_size=(11, 8), square_size=30.0,
-                                   aruco_id=0, aruco_size=200.0, aruco_dict='6X6_250', pnp_method='IPPE_SQUARE', use_sb_detection=True):
+                                   aruco_id=0, aruco_size=200.0, aruco_dict='6X6_250', pnp_method='IPPE_SQUARE', use_sb_detection=True, data_dir=None):
     """
     Get marker pose in camera frame using PnP.
     Supports both chessboard and ArUco markers.
+    
+    Args:
+        data_dir: Directory to save histogram. If None, saves in current directory.
     
     Returns: (success, rotation_vector, translation_vector, corners, marker_info)
     """
     if marker_type == 'chessboard':
         pnp_method_const = get_pnp_method_constant(pnp_method)
-        return get_chessboard_pose_in_camera_frame(image, camera_matrix, dist_coeffs, chessboard_size, square_size, pnp_method=pnp_method_const, use_sb_detection=use_sb_detection)
+        return get_chessboard_pose_in_camera_frame(image, camera_matrix, dist_coeffs, chessboard_size, square_size, pnp_method=pnp_method_const, use_sb_detection=use_sb_detection, data_dir=data_dir)
     elif marker_type == 'aruco':
         aruco_dict_const = get_aruco_dict_constant(aruco_dict)
         pnp_method_const = get_pnp_method_constant(pnp_method)
@@ -1014,12 +1027,19 @@ async def main(
         T_A_0_world_frame = _pose_to_matrix(A_0_pose_world_frame)
 
         camera_matrix, dist_coeffs = await get_camera_intrinsics(camera)
+        
+        # Create directory for saving data (needed for histogram saving)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        data_dir = f"calibration_data_{timestamp}"
+        os.makedirs(data_dir, exist_ok=True)
+        print(f"\n=== SAVING DATA TO: {data_dir} ===")
+        
         image = await get_camera_image(camera)
 
         success, rvec, tvec, _, marker_info = get_marker_pose_in_camera_frame(
             image, camera_matrix, dist_coeffs, marker_type=marker_type,
             chessboard_size=(11, 8), square_size=30.0,
-            aruco_id=aruco_id, aruco_size=aruco_size, aruco_dict=aruco_dict, pnp_method=pnp_method, use_sb_detection=use_sb_detection
+            aruco_id=aruco_id, aruco_size=aruco_size, aruco_dict=aruco_dict, pnp_method=pnp_method, use_sb_detection=use_sb_detection, data_dir=data_dir
         )
         if not success:
             print(f"Failed to detect {marker_type} in reference image")
@@ -1031,12 +1051,6 @@ async def main(
         # Convert rvec, tvec to 4x4 transformation matrix (chessboard in camera frame)
         # Don't transpose - solvePnP output is already in OpenCV convention
         T_B_0_camera_frame = rvec_tvec_to_matrix(rvec, tvec)
-        
-        # Create directory for saving data
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        data_dir = f"calibration_data_{timestamp}"
-        os.makedirs(data_dir, exist_ok=True)
-        print(f"\n=== SAVING DATA TO: {data_dir} ===")
         
         # Save camera calibration and chessboard config
         calibration_data = {
@@ -1133,7 +1147,7 @@ async def main(
             success, rvec, tvec, _, marker_info = get_marker_pose_in_camera_frame(
                 image, camera_matrix, dist_coeffs, marker_type=marker_type,
                 chessboard_size=(11, 8), square_size=30.0,
-                aruco_id=aruco_id, aruco_size=aruco_size, aruco_dict=aruco_dict, pnp_method=pnp_method, use_sb_detection=use_sb_detection
+                aruco_id=aruco_id, aruco_size=aruco_size, aruco_dict=aruco_dict, pnp_method=pnp_method, use_sb_detection=use_sb_detection, data_dir=data_dir
             )
             if not success:
                 print(f"  Failed to detect {marker_type}, skipping pose {i+1}")
@@ -1332,7 +1346,7 @@ All pose objects must have: x, y, z, o_x, o_y, o_z, theta
     parser.add_argument(
         '--pnp-method',
         type=str,
-        default='IPPE_SQUARE',
+        default='IPPE',
         choices=['IPPE_SQUARE', 'IPPE', 'ITERATIVE', 'SQPNP'],
         help='PnP method to use for ArUco detection (default: IPPE_SQUARE)'
     )
