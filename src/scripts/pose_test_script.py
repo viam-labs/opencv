@@ -1,41 +1,220 @@
+#!/usr/bin/env python3
+
 import argparse
 import asyncio
-import copy
 import os
 import numpy as np
 import cv2
 import json
-import pickle
 from datetime import datetime
 from dotenv import load_dotenv
 from viam.robot.client import RobotClient
 from viam.app.app_client import AppClient
 from viam.components.arm import Arm
 from viam.components.pose_tracker import PoseTracker
-from viam.services.motion import MotionClient, Constraints
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
-from viam.proto.service.motion import CollisionSpecification
+from viam.services.motion import MotionClient
 from viam.proto.common import PoseInFrame, Pose
 from viam.media.utils.pil import viam_to_pil_image
 from viam.media.video import CameraMimeType
 from viam.components.camera import Camera
-from viam.rpc.dial import DialOptions, Credentials
+from viam.rpc.dial import DialOptions
 from viam.app.viam_client import ViamClient
-
-from typing import Dict, Optional
+from typing import Optional
 
 import sys
-import os
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 try:
     from utils.utils import call_go_ov2mat, call_go_mat2ov
+    from utils.chessboard_utils import (
+        generate_object_points,
+    )
 except ModuleNotFoundError:
     from ..utils.utils import call_go_ov2mat, call_go_mat2ov
+    from ..utils.chessboard_utils import (
+        generate_object_points,
+    )
 
-# Default values for optional args
 DEFAULT_WORLD_FRAME = "world"
+DEFAULT_VELOCITY_NORMAL = 25
+DEFAULT_VELOCITY_SLOW = 10
+DEFAULT_SETTLE_TIME = 5.0
+
+import cv2  # Make sure cv2 is imported
+
+def rotation_error(R1, R2):
+    """Compute rotation error in degrees between two rotation matrices."""
+    R_error = R1.T @ R2
+    angle_rad = np.arccos(np.clip((np.trace(R_error) - 1) / 2, -1.0, 1.0))
+    return np.degrees(angle_rad)
+
+def analyze_hand_eye_error(T_hand_eye, T_delta_A_world_frame, T_delta_B_camera_frame, 
+                          A_0_pose, A_i_pose, pose_num):
+    """
+    Detailed analysis of hand-eye verification errors.
+    """
+    print(f"\n{'='*60}")
+    print(f"DETAILED ERROR ANALYSIS - POSE {pose_num}")
+    print(f"{'='*60}")
+    
+    # Extract components
+    R_X = T_hand_eye[:3, :3]
+    t_X = T_hand_eye[:3, 3]
+    
+    R_A = T_delta_A_world_frame[:3, :3]
+    t_A = T_delta_A_world_frame[:3, 3]
+    
+    R_B = T_delta_B_camera_frame[:3, :3]
+    t_B = T_delta_B_camera_frame[:3, 3]
+    
+    print(f"\n📊 MOTION MAGNITUDES:")
+    print(f"  Arm translation:   {np.linalg.norm(t_A):8.2f} mm")
+    print(f"  Board translation: {np.linalg.norm(t_B):8.2f} mm")
+    print(f"  Ratio (arm/board): {np.linalg.norm(t_A)/np.linalg.norm(t_B):.3f}x")
+    
+    # Rotation magnitudes
+    angle_A = np.degrees(np.arccos(np.clip((np.trace(R_A) - 1) / 2, -1, 1)))
+    angle_B = np.degrees(np.arccos(np.clip((np.trace(R_B) - 1) / 2, -1, 1)))
+    print(f"  Arm rotation:      {angle_A:8.2f}°")
+    print(f"  Board rotation:    {angle_B:8.2f}°")
+    axis_angle_A = cv2.Rodrigues(R_A)[0]
+    axis_A = axis_angle_A.flatten() / (np.linalg.norm(axis_angle_A) + 1e-10)
+    axis_angle_B = cv2.Rodrigues(R_B)[0]
+    axis_B = axis_angle_B.flatten() / (np.linalg.norm(axis_angle_B) + 1e-10)
+    print(f"  Arm rotation axis: [{axis_A[0]:6.3f}, {axis_A[1]:6.3f}, {axis_A[2]:6.3f}]")
+    print(f"  Board rotation axis: [{axis_B[0]:6.3f}, {axis_B[1]:6.3f}, {axis_B[2]:6.3f}]")
+
+    print(f"\n🔍 HAND-EYE TRANSFORM:")
+    print(f"  Translation: [{t_X[0]:7.2f}, {t_X[1]:7.2f}, {t_X[2]:7.2f}] mm")
+    angle_X = np.degrees(np.arccos(np.clip((np.trace(R_X) - 1) / 2, -1, 1)))
+    print(f"  Rotation magnitude: {angle_X:.2f}°")
+    
+    # Check rotation axis of hand-eye
+    if angle_X > 1.0:  # Only compute axis if rotation is significant
+        # Convert rotation matrix to axis-angle
+        axis_angle = cv2.Rodrigues(R_X)[0]
+        axis = axis_angle.flatten() / (np.linalg.norm(axis_angle) + 1e-10)
+        print(f"  Rotation axis: [{axis[0]:6.3f}, {axis[1]:6.3f}, {axis[2]:6.3f}]")
+    
+    print(f"\n🧮 VERIFICATION EQUATION TESTING:")
+    
+    # Method 1: Try XBX⁻¹
+    X_inv = np.linalg.inv(T_hand_eye)
+    T_predicted_1 = T_hand_eye @ T_delta_B_camera_frame @ X_inv
+    error_1_rot = rotation_error(T_predicted_1[:3,:3], R_A)
+    error_1_trans = np.linalg.norm(T_predicted_1[:3,3] - t_A)
+    
+    print(f"  Method 1 (XBX⁻¹):   rot={error_1_rot:.3f}°, trans={error_1_trans:.2f}mm")
+    
+    # Method 2: Try X⁻¹AX (predicting B from A)
+    T_predicted_2 = X_inv @ T_delta_A_world_frame @ T_hand_eye
+    error_2_rot = rotation_error(T_predicted_2[:3,:3], R_B)
+    error_2_trans = np.linalg.norm(T_predicted_2[:3,3] - t_B)
+    
+    print(f"  Method 2 (X⁻¹AX):   rot={error_2_rot:.3f}°, trans={error_2_trans:.2f}mm (predicting B)")
+    
+    print(f"\n🎯 BEST METHOD: ", end="")
+    errors = [
+        (1, error_1_rot, error_1_trans, "XBX⁻¹ (current)"),
+        (2, error_2_rot, error_2_trans, "X⁻¹AX (predicting B)"),
+    ]
+    best = min(errors, key=lambda x: x[1] + x[2]/10)  # Weight rotation more
+    print(f"Method {best[0]} - {best[3]}")
+    print(f"           rot={best[1]:.3f}°, trans={best[2]:.2f}mm")
+    
+    # Check for scale issues
+    print(f"\n⚠️  DIAGNOSTIC CHECKS:")
+    
+    # Translation scale mismatch
+    ratio = np.linalg.norm(t_A) / (np.linalg.norm(t_B) + 1e-10)
+    if ratio < 0.5 or ratio > 2.0:
+        print(f"  ❌ Motion scale mismatch: arm/board = {ratio:.2f}x")
+        print(f"     Expected: ratio should be 0.5-2.0x")
+        print(f"     Possible causes:")
+        print(f"       - Hand-eye calibration is incorrect")
+        print(f"       - Units mismatch (mm vs m)")
+        print(f"       - Wrong transformation chain")
+    else:
+        print(f"  ✅ Motion scale OK: arm/board = {ratio:.2f}x")
+    
+    # Check if rotations are similar
+    if abs(angle_A - angle_B) > 10.0:
+        print(f"  ⚠️  Rotation mismatch: arm={angle_A:.1f}° vs board={angle_B:.1f}°")
+    else:
+        print(f"  ✅ Rotation magnitudes match: ~{angle_A:.1f}°")
+    
+    # Check hand-eye rotation magnitude
+    if 170 < angle_X < 190:
+        print(f"  ℹ️  Hand-eye has ~180° rotation (camera mounted upside-down/backwards)")
+    
+    print(f"\n📍 ABSOLUTE POSITIONS:")
+    print(f"  A_0: [{A_0_pose.x:7.1f}, {A_0_pose.y:7.1f}, {A_0_pose.z:7.1f}] mm")
+    print(f"  A_i: [{A_i_pose.x:7.1f}, {A_i_pose.y:7.1f}, {A_i_pose.z:7.1f}] mm")
+    actual_motion = np.sqrt((A_i_pose.x - A_0_pose.x)**2 + 
+                           (A_i_pose.y - A_0_pose.y)**2 + 
+                           (A_i_pose.z - A_0_pose.z)**2)
+    print(f"  Actual arm motion: {actual_motion:.1f} mm")
+    
+    return best[0]  # Return best method number
+
+def get_aruco_dict_constant(dict_name: str):
+    """Convert string aruco dictionary name to cv2.aruco constant."""
+    dict_map = {
+        '4X4_50': cv2.aruco.DICT_4X4_50,
+        '4X4_100': cv2.aruco.DICT_4X4_100,
+        '4X4_250': cv2.aruco.DICT_4X4_250,
+        '4X4_1000': cv2.aruco.DICT_4X4_1000,
+        '5X5_50': cv2.aruco.DICT_5X5_50,
+        '5X5_100': cv2.aruco.DICT_5X5_100,
+        '5X5_250': cv2.aruco.DICT_5X5_250,
+        '5X5_1000': cv2.aruco.DICT_5X5_1000,
+        '6X6_50': cv2.aruco.DICT_6X6_50,
+        '6X6_100': cv2.aruco.DICT_6X6_100,
+        '6X6_250': cv2.aruco.DICT_6X6_250,
+        '6X6_1000': cv2.aruco.DICT_6X6_1000,
+        '7X7_50': cv2.aruco.DICT_7X7_50,
+        '7X7_100': cv2.aruco.DICT_7X7_100,
+        '7X7_250': cv2.aruco.DICT_7X7_250,
+        '7X7_1000': cv2.aruco.DICT_7X7_1000,
+    }
+    return dict_map.get(dict_name, cv2.aruco.DICT_6X6_250)
+
+
+def parse_poses_from_json(json_path: str) -> list:
+    """
+    Parse poses from a JSON file.
+
+    Args:
+        json_path: Path to JSON file containing list of pose objects
+
+    Returns:
+        List of dicts with pose attributes: x, y, z, o_x, o_y, o_z, theta
+
+    Example JSON format:
+        [
+          {"x": 100, "y": 200, "z": 300, "o_x": 0, "o_y": 0, "o_z": 1, "theta": 45},
+          {"x": 150, "y": 100, "z": 250, "o_x": 0, "o_y": 0, "o_z": 1, "theta": 90}
+        ]
+    """
+    if json_path is None:
+        return None
+    if not os.path.exists(json_path):
+        raise FileNotFoundError(f"Poses file not found: {json_path}")
+
+    with open(json_path, 'r') as f:
+        poses = json.load(f)
+
+    if not isinstance(poses, list):
+        raise ValueError("JSON file must contain a list of pose objects")
+
+    # Validate each pose has required attributes
+    required_attrs = ['x', 'y', 'z', 'o_x', 'o_y', 'o_z', 'theta']
+    for i, pose in enumerate(poses):
+        for attr in required_attrs:
+            if attr not in pose:
+                raise ValueError(f"Pose {i} missing required attribute '{attr}'")
+
+    return poses
 
 def _pose_to_matrix(pose: Pose) -> np.ndarray:
     """Convert a Viam Pose to a 4x4 homogeneous transformation matrix."""
@@ -75,6 +254,26 @@ def _matrix_to_pose(T: np.ndarray) -> Pose:
         o_z=oz,
         theta=theta
     )
+
+def _invert_pose_rotation_only(pose: Pose) -> Pose:
+    """Invert only the rotation of a pose, keeping translation unchanged."""
+    # Convert pose to matrix
+    T = _pose_to_matrix(pose)
+
+    # Extract rotation and translation
+    R = T[0:3, 0:3]
+    t = T[0:3, 3]
+
+    # Invert rotation (transpose for rotation matrices)
+    R_inv = R.T
+
+    # Build new transformation with inverted rotation but same translation
+    T_inv_rot = np.eye(4)
+    T_inv_rot[0:3, 0:3] = R_inv
+    T_inv_rot[0:3, 3] = t  # Keep original translation
+
+    # Convert back to pose
+    return _matrix_to_pose(T_inv_rot)
 
 async def connect():
     load_dotenv()
@@ -143,15 +342,308 @@ def frame_config_to_transformation_matrix(frame_config):
             axis = np.array([0, 0, 1])
             th = 0
     
-    # Convert axis-angle to rotation matrix
-    R = call_go_ov2mat(axis[0], axis[1], axis[2], th)
+    # Normalize axis
+    axis_norm = np.linalg.norm(axis)
+    if axis_norm > 0:
+        axis = axis / axis_norm
     
-    # Create 4x4 transformation matrix
+    # Build rotation matrix from axis-angle
+    th_rad = np.deg2rad(th)
+    c = np.cos(th_rad)
+    s = np.sin(th_rad)
+    t_temp = 1 - c
+    
+    x, y, z = axis
+    R = np.array([
+        [t_temp*x*x + c,      t_temp*x*y - s*z,  t_temp*x*z + s*y],
+        [t_temp*x*y + s*z,    t_temp*y*y + c,    t_temp*y*z - s*x],
+        [t_temp*x*z - s*y,    t_temp*y*z + s*x,  t_temp*z*z + c]
+    ])
+    
+    # Build transformation matrix
     T = np.eye(4)
-    T[:3, :3] = R
-    T[:3, 3] = t
+    T[0:3, 0:3] = R
+    T[0:3, 3] = t
     
     return T
+
+
+def validate_chessboard_detection(image, corners, rvec, tvec, camera_matrix, dist_coeffs, 
+                                   chessboard_size, square_size=30.0, objp=None):
+    """
+    Validate chessboard detection quality by computing reprojection error and sharpness.
+    
+    Args:
+        objp: If provided, use this object points array. Otherwise generate from chessboard_size.
+              This is important when corners have been filtered for outliers!
+    
+    Returns: (mean_reprojection_error, max_reprojection_error, reprojected_points, sharpness, errors)
+    """
+    # Generate 3D object points ONLY if not provided
+    if objp is None:
+        objp = np.zeros((chessboard_size[0] * chessboard_size[1], 3), np.float32)
+        objp[:, :2] = np.mgrid[0:chessboard_size[0], 0:chessboard_size[1]].T.reshape(-1, 2)
+        objp *= square_size
+    
+    # CRITICAL FIX: Reshape corners to (N, 2) to match reprojected_points
+    # OpenCV returns corners as (N, 1, 2), but we need (N, 2) for calculations
+    corners_2d = corners.reshape(-1, 2)
+    
+    # Verify dimensions match
+    if len(corners_2d) != len(objp):
+        raise ValueError(f"Dimension mismatch: {len(corners_2d)} corners but {len(objp)} object points")
+    
+    # Calculate reprojection errors using the same method as camera_calibration.py
+    # Project 3D points back to image space
+    reprojected_points, _ = cv2.projectPoints(objp, rvec, tvec, camera_matrix, dist_coeffs)
+    reprojected_points = reprojected_points.reshape(-1, 2)
+    
+    # Calculate reprojection error using camera_calibration.py method (OpenCV standard)
+    imgpoints2, _ = cv2.projectPoints(objp, rvec, tvec, camera_matrix, dist_coeffs)
+    error = cv2.norm(corners, imgpoints2, cv2.NORM_L2) / len(imgpoints2)
+    mean_error = error
+    
+    # Calculate per-point errors (NOW WITH CORRECT DIMENSIONS!)
+    errors = np.linalg.norm(corners_2d - reprojected_points, axis=1)
+    
+    # Filter outliers using multiple methods
+    # Method 1: Remove errors > 3 standard deviations
+    mean_error_raw = np.mean(errors)
+    std_error = np.std(errors)
+    threshold_3std = mean_error_raw + 3 * std_error
+    filtered_errors_3std = errors[errors < threshold_3std]
+    
+    # Method 2: Remove top 5% of errors (percentile-based)
+    threshold_95th = np.percentile(errors, 95)
+    filtered_errors_95th = errors[errors < threshold_95th]
+    
+    # Method 3: Remove errors > 2 pixels (tighter absolute threshold for calibration)
+    threshold_abs = 2.0
+    filtered_errors_abs = errors[errors < threshold_abs]
+    
+    # Calculate statistics
+    mean_error2 = np.mean(errors)
+    max_error2 = np.max(errors)
+    mean_error_filtered_3std = np.mean(filtered_errors_3std) if len(filtered_errors_3std) > 0 else 0
+    mean_error_filtered_95th = np.mean(filtered_errors_95th) if len(filtered_errors_95th) > 0 else 0
+    mean_error_filtered_abs = np.mean(filtered_errors_abs) if len(filtered_errors_abs) > 0 else 0
+    
+    print(f"Reprojection error (OpenCV method): {mean_error:.3f} pixels")
+    print(f"Reprojection error (mean): {mean_error2:.3f} pixels")
+    print(f"Reprojection error (3σ filtered): {mean_error_filtered_3std:.3f} pixels ({len(filtered_errors_3std)}/{len(errors)} points)")
+    print(f"Reprojection error (95th percentile): {mean_error_filtered_95th:.3f} pixels ({len(filtered_errors_95th)}/{len(errors)} points)")
+    print(f"Reprojection error (<2px): {mean_error_filtered_abs:.3f} pixels ({len(filtered_errors_abs)}/{len(errors)} points)")
+    print(f"Max individual error: {max_error2:.3f} pixels")
+    
+    # Count outliers with different thresholds
+    outliers_1px = np.sum(errors > 1.0)
+    outliers_2px = np.sum(errors > 2.0)
+    outliers_5px = np.sum(errors > 5.0)
+    print(f"Outliers: {outliers_1px} >1px, {outliers_2px} >2px, {outliers_5px} >5px")
+    
+    # Create histogram of reprojection errors
+    try:
+        import matplotlib.pyplot as plt
+        
+        plt.figure(figsize=(12, 7))
+        
+        # Create histogram with appropriate bins for sub-pixel errors
+        max_bin_value = min(max_error2 * 1.1, 10.0)  # Cap at 10 pixels for better visualization
+        bins = np.linspace(0, max_bin_value, 51)
+        
+        plt.hist(errors, bins=bins, alpha=0.7, color='blue', edgecolor='black')
+        plt.axvline(mean_error2, color='red', linestyle='--', linewidth=2, label=f'Mean: {mean_error2:.3f}px')
+        plt.axvline(threshold_abs, color='green', linestyle='--', linewidth=2, label=f'{threshold_abs}px threshold')
+        
+        # Add percentile lines
+        p50 = np.percentile(errors, 50)
+        p95 = np.percentile(errors, 95)
+        plt.axvline(p50, color='purple', linestyle=':', linewidth=1.5, label=f'Median: {p50:.3f}px')
+        plt.axvline(p95, color='orange', linestyle=':', linewidth=1.5, label=f'95th %ile: {p95:.3f}px')
+        
+        plt.xlabel('Reprojection Error (pixels)', fontsize=12)
+        plt.ylabel('Number of Corners', fontsize=12)
+        plt.title('Distribution of Reprojection Errors\n(After Outlier Filtering)', fontsize=14)
+        plt.legend(fontsize=10)
+        plt.grid(True, alpha=0.3)
+        
+        # Add comprehensive statistics text
+        stats_text = (f'Total points: {len(errors)}\n'
+                     f'Mean: {mean_error2:.3f}px\n'
+                     f'Median: {p50:.3f}px\n'
+                     f'Std: {np.std(errors):.3f}px\n'
+                     f'Max: {max_error2:.3f}px\n'
+                     f'Outliers >2px: {outliers_2px}')
+        plt.text(0.98, 0.98, stats_text, transform=plt.gca().transAxes, 
+                verticalalignment='top', horizontalalignment='right',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8),
+                fontsize=10, family='monospace')
+        
+        plt.tight_layout()
+        
+        # Save histogram
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        histogram_path = f"reprojection_error_histogram_{timestamp}.png"
+        plt.savefig(histogram_path, dpi=150, bbox_inches='tight')
+        print(f"Saved reprojection error histogram: {histogram_path}")
+        
+        plt.close()  # Close to free memory
+        
+    except ImportError:
+        print("Matplotlib not available, skipping histogram")
+    except Exception as e:
+        print(f"Failed to create histogram: {e}")
+    
+    return mean_error, max_error2, reprojected_points, errors
+
+
+def get_chessboard_pose_in_camera_frame(image, camera_matrix, dist_coeffs, chessboard_size, 
+                                       square_size=30.0, pnp_method=cv2.SOLVEPNP_IPPE, 
+                                       use_sb_detection=True):
+    """
+    Get chessboard pose in camera frame using PnP with improved outlier filtering.
+    
+    Note: cv2.solvePnP returns the transformation from chessboard coordinates to camera coordinates.
+    This is T_chessboard_to_camera, NOT T_camera_to_chessboard.
+    
+    Args:
+        use_sb_detection: If True, use findChessboardCornersSB (more robust), otherwise use findChessboardCorners
+    
+    Returns: (success, rotation_vector, translation_vector, corners, marker_info)
+        - rvec, tvec represent the chessboard's pose in the camera's coordinate system
+        - marker_info contains validation info (reprojection error, sharpness)
+    """
+    # Convert to grayscale if needed
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image
+    
+    # Prepare 3D object points (chessboard corners in world coordinates)
+    objp = np.zeros((chessboard_size[0] * chessboard_size[1], 3), np.float32)
+    objp[:,:2] = np.mgrid[0:chessboard_size[0], 0:chessboard_size[1]].T.reshape(-1,2)
+    objp *= square_size  # Scale by square size (e.g., 25mm)
+    
+    # Find chessboard corners using selected method
+    corners = None
+    if use_sb_detection:
+        print("Using findChessboardCornersSB (subpixel detection)")
+        flags = (cv2.CALIB_CB_NORMALIZE_IMAGE + cv2.CALIB_CB_EXHAUSTIVE + cv2.CALIB_CB_ACCURACY)
+        ret, corners = cv2.findChessboardCornersSB(gray, chessboard_size, flags=flags)
+    else:
+        print("Using findChessboardCorners (traditional detection)")
+        ret, corners = cv2.findChessboardCorners(gray, chessboard_size, None)
+    
+    if ret:
+        # Enhanced corner refinement for higher accuracy (only for traditional method)
+        if not use_sb_detection:
+            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 50, 0.0001)  # More iterations, stricter convergence
+            corners = cv2.cornerSubPix(gray, corners, (15,15), (-1,-1), criteria)  # Larger refinement window
+
+        # Estimate chessboard sharpness (only when detection succeeds)
+        sharpness = float('inf')
+        try:
+            sharpness_result = cv2.estimateChessboardSharpness(image, chessboard_size, corners)
+            # The function returns a tuple ((sharpness_value, ...), sharpness_map)
+            sharpness = sharpness_result[0][0]  # First element of first tuple
+            print(f"Chessboard sharpness: {sharpness:.2f} pixels")
+        except Exception as e:
+            print(f"Could not estimate sharpness: {e}")
+            sharpness = float('inf')  # Mark as unknown
+        
+        
+        # Filter outliers before solvePnP with IMPROVED thresholds
+        print(f"Original corners: {len(corners)} points")
+        
+        # Method 1: Use iterative outlier filtering with tighter threshold
+        try:
+            # First, try to get an initial pose estimate with all points
+            success_init, rvec_init, tvec_init = cv2.solvePnP(objp, corners, camera_matrix, dist_coeffs, flags=pnp_method)
+            
+            if success_init:
+                # Project points back and calculate errors
+                projected_points, _ = cv2.projectPoints(objp, rvec_init, tvec_init, camera_matrix, dist_coeffs)
+                projected_points = projected_points.reshape(-1, 2)
+                corners_2d = corners.reshape(-1, 2)
+                
+                # Calculate reprojection errors
+                errors = np.linalg.norm(corners_2d - projected_points, axis=1)
+                
+                # IMPROVED: Use statistical outlier detection
+                # Filter using median absolute deviation (more robust than std)
+                median_error = np.median(errors)
+                mad = np.median(np.abs(errors - median_error))
+                
+                # Modified z-score using MAD
+                modified_z_scores = 0.6745 * (errors - median_error) / (mad + 1e-10)
+                
+                # Keep points with modified z-score < 3.5 (equivalent to ~3 sigma)
+                # OR use absolute threshold of 2 pixels (whichever is stricter)
+                threshold_statistical = median_error + 3.5 * mad
+                threshold_absolute = 2.0
+                threshold = min(threshold_statistical, threshold_absolute)
+                
+                good_indices = errors < threshold
+                
+                n_filtered = len(corners) - np.sum(good_indices)
+                if n_filtered > 0:
+                    print(f"Filtering {n_filtered} outliers (threshold: {threshold:.2f}px)")
+                    print(f"  Error range: {np.min(errors):.3f} to {np.max(errors):.3f}px")
+                    print(f"  Median: {median_error:.3f}px, MAD: {mad:.3f}px")
+                
+                if np.sum(good_indices) >= 20:  # Need at least 20 points for reliable PnP
+                    filtered_corners = corners[good_indices]
+                    filtered_objp = objp[good_indices]
+                    print(f"Filtered corners: {len(filtered_corners)}/{len(corners)} points (error < {threshold:.2f}px)")
+                    
+                    # Use filtered points for final solvePnP
+                    success, rvec, tvec = cv2.solvePnP(filtered_objp, filtered_corners, camera_matrix, dist_coeffs, flags=pnp_method)
+                    corners = filtered_corners  # Update corners for validation
+                    objp = filtered_objp  # Update objp for validation
+                else:
+                    print(f"Not enough good points ({np.sum(good_indices)}), using all points")
+                    success, rvec, tvec = cv2.solvePnP(objp, corners, camera_matrix, dist_coeffs, flags=pnp_method)
+            else:
+                print("Initial solvePnP failed, using all points")
+                success, rvec, tvec = cv2.solvePnP(objp, corners, camera_matrix, dist_coeffs, flags=pnp_method)
+                
+        except Exception as e:
+            print(f"Outlier filtering failed: {e}, using all points")
+            success, rvec, tvec = cv2.solvePnP(objp, corners, camera_matrix, dist_coeffs, flags=pnp_method)
+
+        if not success:
+            print("Failed to solve PnP")
+            return False, None, None, None, None
+
+        # Enhanced refinement with VVS
+        rvec, tvec = cv2.solvePnPRefineVVS(objp, corners, camera_matrix, dist_coeffs, rvec, tvec)
+        
+        # Additional refinement with LM method
+        rvec, tvec = cv2.solvePnPRefineLM(objp, corners, camera_matrix, dist_coeffs, rvec, tvec)
+        
+        # Validate detection quality
+        mean_error, max_error, reprojected_points, errors = validate_chessboard_detection(
+            image, corners, rvec, tvec, camera_matrix, dist_coeffs, chessboard_size, square_size, objp
+        )
+        
+        print(f"Chessboard detection quality: mean={mean_error:.3f}px, max={max_error:.3f}px")
+        
+        # Return validation info as marker_info
+        validation_info = {
+            'mean_reprojection_error': mean_error,
+            'max_reprojection_error': max_error,
+            'reprojected_points': reprojected_points,
+            'sharpness': sharpness,
+            'errors': errors
+        }
+        
+        return True, rvec, tvec, corners, validation_info
+    else:
+        return False, None, None, None, None
+
+
+# [Rest of the file remains the same - just include the complete original file from line 696 onwards]
+# I'll mark this with a comment so you know where to append the rest
 
 async def get_camera_image(camera: Camera) -> np.ndarray:
     cam_images = await camera.get_images()
@@ -197,70 +689,7 @@ def rvec_tvec_to_matrix(rvec, tvec):
     
     return T
 
-def get_chessboard_pose_in_camera_frame(image, camera_matrix, dist_coeffs, chessboard_size, square_size=30.0):
-    """
-    Get chessboard pose in camera frame using PnP.
-    
-    Note: cv2.solvePnP returns the transformation from chessboard coordinates to camera coordinates.
-    This is T_chessboard_to_camera, NOT T_camera_to_chessboard.
-    
-    Returns: (success, rotation_vector, translation_vector, corners)
-        - rvec, tvec represent the chessboard's pose in the camera's coordinate system
-    """
-    # Convert to grayscale if needed
-    if len(image.shape) == 3:
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = image
-    
-    # Prepare 3D object points (chessboard corners in world coordinates)
-    objp = np.zeros((chessboard_size[0] * chessboard_size[1], 3), np.float32)
-    objp[:,:2] = np.mgrid[0:chessboard_size[0], 0:chessboard_size[1]].T.reshape(-1,2)
-    objp *= square_size  # Scale by square size (e.g., 25mm)
-    
-    # Find chessboard corners
-    ret, corners = cv2.findChessboardCorners(gray, chessboard_size, None)
-    
-    if ret:
-        # Refine corners to sub-pixel accuracy
-        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
-        corners = cv2.cornerSubPix(gray, corners, (11,11), (-1,-1), criteria)
-        
-        # Solve PnP to get camera pose
-        success, rvec, tvec = cv2.solvePnP(objp, corners, camera_matrix, dist_coeffs, flags=cv2.SOLVEPNP_IPPE)
-
-        if not success:
-            print("Failed to solve PnP")
-            return False, None, None, None
-
-        rvec, tvec = cv2.solvePnPRefineVVS(objp, corners, camera_matrix, dist_coeffs, rvec, tvec)
-        return True, rvec, tvec, corners
-    else:
-        return False, None, None, None
-
-def get_aruco_dict_constant(dict_name: str):
-    """Convert string aruco dictionary name to cv2.aruco constant."""
-    dict_map = {
-        '4X4_50': cv2.aruco.DICT_4X4_50,
-        '4X4_100': cv2.aruco.DICT_4X4_100,
-        '4X4_250': cv2.aruco.DICT_4X4_250,
-        '4X4_1000': cv2.aruco.DICT_4X4_1000,
-        '5X5_50': cv2.aruco.DICT_5X5_50,
-        '5X5_100': cv2.aruco.DICT_5X5_100,
-        '5X5_250': cv2.aruco.DICT_5X5_250,
-        '5X5_1000': cv2.aruco.DICT_5X5_1000,
-        '6X6_50': cv2.aruco.DICT_6X6_50,
-        '6X6_100': cv2.aruco.DICT_6X6_100,
-        '6X6_250': cv2.aruco.DICT_6X6_250,
-        '6X6_1000': cv2.aruco.DICT_6X6_1000,
-        '7X7_50': cv2.aruco.DICT_7X7_50,
-        '7X7_100': cv2.aruco.DICT_7X7_100,
-        '7X7_250': cv2.aruco.DICT_7X7_250,
-        '7X7_1000': cv2.aruco.DICT_7X7_1000,
-    }
-    return dict_map.get(dict_name, cv2.aruco.DICT_6X6_250)
-
-def get_aruco_pose_in_camera_frame(image, camera_matrix, dist_coeffs, marker_id=0, marker_size=200.0, aruco_dict=cv2.aruco.DICT_6X6_250):
+def get_aruco_pose_in_camera_frame(image, camera_matrix, dist_coeffs, marker_id=0, marker_size=300.0, aruco_dict=cv2.aruco.DICT_6X6_250, pnp_method=cv2.SOLVEPNP_IPPE_SQUARE):
     """
     Get ArUco marker pose in camera frame using PnP.
     
@@ -271,6 +700,7 @@ def get_aruco_pose_in_camera_frame(image, camera_matrix, dist_coeffs, marker_id=
         marker_id: ID of the marker to detect (if None, uses first detected marker)
         marker_size: Size of the marker in mm
         aruco_dict: ArUco dictionary to use
+        pnp_method: PnP method to use (cv2.SOLVEPNP_* constant)
         
     Returns: (success, rotation_vector, translation_vector, corners, detected_id)
         - rvec, tvec represent the marker's pose in the camera's coordinate system
@@ -281,9 +711,32 @@ def get_aruco_pose_in_camera_frame(image, camera_matrix, dist_coeffs, marker_id=
     else:
         gray = image
     
-    # Create ArUco detector
+    # Create ArUco detector with optimized parameters
     aruco_dictionary = cv2.aruco.getPredefinedDictionary(aruco_dict)
     parameters = cv2.aruco.DetectorParameters()
+    
+    # Optimize corner refinement for higher accuracy
+    parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+    parameters.cornerRefinementMaxIterations = 50
+    parameters.cornerRefinementMinAccuracy = 0.01
+    parameters.cornerRefinementWinSize = 7
+    parameters.relativeCornerRefinmentWinSize = 0.4
+    
+    # Optimize detection sensitivity
+    parameters.minMarkerPerimeterRate = 0.02
+    parameters.maxMarkerPerimeterRate = 3.0
+    parameters.minCornerDistanceRate = 0.03
+    
+    # Improve error correction
+    parameters.errorCorrectionRate = 0.8
+    parameters.maxErroneousBitsInBorderRate = 0.2
+    
+    # Optimize adaptive thresholding
+    parameters.adaptiveThreshWinSizeMin = 5
+    parameters.adaptiveThreshWinSizeMax = 25
+    parameters.adaptiveThreshWinSizeStep = 8
+    parameters.adaptiveThreshConstant = 5
+    
     detector = cv2.aruco.ArucoDetector(aruco_dictionary, parameters)
     
     # Detect markers
@@ -309,18 +762,19 @@ def get_aruco_pose_in_camera_frame(image, camera_matrix, dist_coeffs, marker_id=
         # Get corners for the detected marker
         marker_corners = corners[marker_idx][0]  # Shape: (4, 2)
         
-        # Define 3D points of the marker (centered at origin)
+        # Define 3D points of the marker (standard ArUco coordinate system)
+        # Origin at top-left, X-right, Y-down, Z-out
         objp = np.array([
-            [-marker_size/2,  marker_size/2, 0],
-            [ marker_size/2,  marker_size/2, 0],
-            [ marker_size/2, -marker_size/2, 0],
-            [-marker_size/2, -marker_size/2, 0]
+            [0, 0, 0],                    # Top-left
+            [marker_size, 0, 0],          # Top-right
+            [marker_size, marker_size, 0], # Bottom-right
+            [0, marker_size, 0]           # Bottom-left
         ], dtype=np.float32)
         
-        # Solve PnP for this marker - IPPE_SQUARE is perfect for 4-point square markers
+        # Solve PnP for this marker using specified method
         success, rvec, tvec = cv2.solvePnP(
             objp, marker_corners, camera_matrix, dist_coeffs,
-            flags=cv2.SOLVEPNP_IPPE_SQUARE
+            flags=pnp_method
         )
         
         if not success:
@@ -334,346 +788,201 @@ def get_aruco_pose_in_camera_frame(image, camera_matrix, dist_coeffs, marker_id=
     else:
         return False, None, None, None, None
 
-def visualize_transformation_difference(T_actual, T_predicted, rotation_num, save_dir="."):
+def get_pnp_method_constant(method_name: str):
+    """Convert string PnP method name to cv2 constant."""
+    method_map = {
+        'IPPE_SQUARE': cv2.SOLVEPNP_IPPE_SQUARE,
+        'IPPE': cv2.SOLVEPNP_IPPE,
+        'ITERATIVE': cv2.SOLVEPNP_ITERATIVE,
+        'SQPNP': cv2.SOLVEPNP_SQPNP,
+    }
+    return method_map.get(method_name, cv2.SOLVEPNP_IPPE_SQUARE)
+
+def draw_marker_debug(image, rvec, tvec, camera_matrix, dist_coeffs, marker_type='chessboard', 
+                     chessboard_size=(11, 8), square_size=30.0, aruco_size=200.0, validation_info=None):
     """
-    Visualize the difference between actual and predicted transformations.
-    Creates a multi-panel figure with 3D view and 2D projections.
-    
-    Args:
-        T_actual: 4x4 actual transformation matrix
-        T_predicted: 4x4 predicted transformation matrix
-        rotation_num: rotation number for labeling
-        save_dir: directory to save the plot
+    Draw debug visualization on image showing detected marker and coordinate axes.
     """
-    fig = plt.figure(figsize=(16, 10))
+    debug_image = image.copy()
     
-    # Create 3D subplot
-    ax3d = fig.add_subplot(2, 3, (1, 4), projection='3d')
-    ax = ax3d  # Keep compatibility with existing code
-    
-    # Helper function to draw a coordinate frame
-    def draw_frame(T, label, colors, linestyle='-'):
-        # Origin
-        origin = T[:3, 3]
+    if marker_type == 'chessboard':
+        # Draw coordinate axes for chessboard
+        cv2.drawFrameAxes(debug_image, camera_matrix, dist_coeffs, rvec, tvec, length=50)
         
-        # Axes (X, Y, Z)
-        scale = 50  # mm
-        for i, (color, axis_label) in enumerate(zip(colors, ['X', 'Y', 'Z'])):
-            axis = T[:3, i] * scale
-            ax.quiver(origin[0], origin[1], origin[2],
-                     axis[0], axis[1], axis[2],
-                     color=color, arrow_length_ratio=0.25, linewidth=2.5, linestyle=linestyle, alpha=0.8)
-        
-        # Label the frame
-        ax.text(origin[0], origin[1], origin[2], label, fontsize=10, weight='bold')
+        # Draw reprojection validation if available
+        if validation_info and 'reprojected_points' in validation_info:
+            reprojected_points = validation_info['reprojected_points']
+            mean_error = validation_info['mean_reprojection_error']
+            max_error = validation_info['max_reprojection_error']
+            
+            # Draw reprojected points in green
+            for point in reprojected_points:
+                cv2.circle(debug_image, tuple(point.astype(int)), 2, (0, 255, 0), -1)
+            
+            # Add error text
+            cv2.putText(debug_image, f"Reprojection Error: {mean_error:.1f}px", 
+                       (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(debug_image, f"Max Error: {max_error:.1f}px", 
+                       (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            
+            # Add sharpness text with color coding
+            if 'sharpness' in validation_info:
+                sharpness = validation_info['sharpness']
+                if sharpness != float('inf'):
+                    sharpness_color = (0, 255, 0) if sharpness < 3.0 else (0, 165, 255) if sharpness < 5.0 else (0, 0, 255)
+                    sharpness_text = f"Sharpness: {sharpness:.1f}px"
+                    cv2.putText(debug_image, sharpness_text, 
+                               (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, sharpness_color, 2)
+    elif marker_type == 'aruco':
+        # Draw coordinate axes for ArUco marker
+        cv2.drawFrameAxes(debug_image, camera_matrix, dist_coeffs, rvec, tvec, aruco_size/2)
     
-    # Draw identity frame (starting position)
-    T_identity = np.eye(4)
-    draw_frame(T_identity, 'Origin', ['#888888', '#888888', '#888888'])
-    
-    # Draw actual transformation result
-    draw_frame(T_actual, 'Actual', ['#FF0000', '#FF4444', '#FF8888'])
-    
-    # Draw predicted transformation result
-    draw_frame(T_predicted, 'Predicted', ['#0000FF', '#4444FF', '#8888FF'], linestyle='--')
-    
-    # Add dummy artists for legend (coordinate frames)
-    from matplotlib.lines import Line2D
-    legend_frame_actual = Line2D([0], [0], color='red', linewidth=2, label='Actual frame (XYZ)', alpha=0.8)
-    legend_frame_predicted = Line2D([0], [0], color='blue', linestyle='--', linewidth=2, label='Predicted frame (XYZ)', alpha=0.8)
-    
-    # Draw translation vectors
-    origin = np.zeros(3)
-    t_actual = T_actual[:3, 3]
-    t_predicted = T_predicted[:3, 3]
-    
-    # Actual translation vector
-    ax.plot([origin[0], t_actual[0]], 
-            [origin[1], t_actual[1]], 
-            [origin[2], t_actual[2]], 
-            'r-', linewidth=2, label='Actual translation', alpha=0.6)
-    
-    # Predicted translation vector
-    ax.plot([origin[0], t_predicted[0]], 
-            [origin[1], t_predicted[1]], 
-            [origin[2], t_predicted[2]], 
-            'b--', linewidth=2, label='Predicted translation', alpha=0.6)
-    
-    # Extract and draw rotation axes
-    R_actual = T_actual[:3, :3]
-    R_predicted = T_predicted[:3, :3]
-    
-    rvec_actual, _ = cv2.Rodrigues(R_actual)
-    rvec_predicted, _ = cv2.Rodrigues(R_predicted)
-    
-    angle_actual = np.linalg.norm(rvec_actual) * 180 / np.pi
-    angle_predicted = np.linalg.norm(rvec_predicted) * 180 / np.pi
-    
-    if angle_actual > 0.1:
-        axis_actual = rvec_actual.flatten() / np.linalg.norm(rvec_actual) * 30  # Scale for visibility
-        ax.quiver(0, 0, 0, axis_actual[0], axis_actual[1], axis_actual[2],
-                 color='orange', arrow_length_ratio=0.2, linewidth=4, label=f'Actual axis ({angle_actual:.1f}°)', alpha=0.9)
-    else:
-        axis_actual = None
-    
-    if angle_predicted > 0.1:
-        axis_predicted = rvec_predicted.flatten() / np.linalg.norm(rvec_predicted) * 30
-        ax.quiver(0, 0, 0, axis_predicted[0], axis_predicted[1], axis_predicted[2],
-                 color='cyan', arrow_length_ratio=0.2, linewidth=4, label=f'Predicted axis ({angle_predicted:.1f}°)', alpha=0.9)
-    else:
-        axis_predicted = None
-    
-    # Set labels and title for 3D plot
-    ax.set_xlabel('X (mm)', fontsize=10)
-    ax.set_ylabel('Y (mm)', fontsize=10)
-    ax.set_zlabel('Z (mm)', fontsize=10)
-    ax.set_title('3D View', fontsize=11, weight='bold')
-    
-    # Set equal aspect ratio
-    max_range = max(np.abs(t_actual).max(), np.abs(t_predicted).max(), 50)
-    ax.set_xlim([-max_range, max_range])
-    ax.set_ylim([-max_range, max_range])
-    ax.set_zlim([-max_range, max_range])
-    
-    # Add legend with all elements
-    handles, labels = ax.get_legend_handles_labels()
-    handles.extend([legend_frame_actual, legend_frame_predicted])
-    ax.legend(handles=handles, loc='upper right', fontsize=8)
-    
-    # Add grid
-    ax.grid(True, alpha=0.3)
-    
-    # Add 2D projection views showing rotation axes
-    # Get normalized rotation axes for 2D plots
-    rvec_actual_norm = rvec_actual.flatten() / np.linalg.norm(rvec_actual) if angle_actual > 0.1 else np.array([0, 0, 0])
-    rvec_pred_norm = rvec_predicted.flatten() / np.linalg.norm(rvec_predicted) if angle_predicted > 0.1 else np.array([0, 0, 0])
-    
-    # XY projection
-    ax_xy = fig.add_subplot(2, 3, 2)
-    ax_xy.arrow(0, 0, rvec_actual_norm[0], rvec_actual_norm[1], head_width=0.1, head_length=0.1, 
-                fc='orange', ec='orange', linewidth=3, alpha=0.9, label=f'Actual ({angle_actual:.1f}°)')
-    ax_xy.arrow(0, 0, rvec_pred_norm[0], rvec_pred_norm[1], head_width=0.1, head_length=0.1, 
-                fc='cyan', ec='cyan', linewidth=3, alpha=0.9, label=f'Predicted ({angle_predicted:.1f}°)')
-    ax_xy.set_xlim([-1.2, 1.2])
-    ax_xy.set_ylim([-1.2, 1.2])
-    ax_xy.set_xlabel('X', fontsize=10, weight='bold')
-    ax_xy.set_ylabel('Y', fontsize=10, weight='bold')
-    ax_xy.set_title('XY Projection (Top View)', fontsize=11, weight='bold')
-    ax_xy.grid(True, alpha=0.3)
-    ax_xy.set_aspect('equal')
-    ax_xy.legend(fontsize=8)
-    ax_xy.axhline(0, color='k', linewidth=0.5, alpha=0.3)
-    ax_xy.axvline(0, color='k', linewidth=0.5, alpha=0.3)
-    
-    # XZ projection
-    ax_xz = fig.add_subplot(2, 3, 3)
-    ax_xz.arrow(0, 0, rvec_actual_norm[0], rvec_actual_norm[2], head_width=0.1, head_length=0.1, 
-                fc='orange', ec='orange', linewidth=3, alpha=0.9, label=f'Actual ({angle_actual:.1f}°)')
-    ax_xz.arrow(0, 0, rvec_pred_norm[0], rvec_pred_norm[2], head_width=0.1, head_length=0.1, 
-                fc='cyan', ec='cyan', linewidth=3, alpha=0.9, label=f'Predicted ({angle_predicted:.1f}°)')
-    ax_xz.set_xlim([-1.2, 1.2])
-    ax_xz.set_ylim([-1.2, 1.2])
-    ax_xz.set_xlabel('X', fontsize=10, weight='bold')
-    ax_xz.set_ylabel('Z', fontsize=10, weight='bold')
-    ax_xz.set_title('XZ Projection (Front View)', fontsize=11, weight='bold')
-    ax_xz.grid(True, alpha=0.3)
-    ax_xz.set_aspect('equal')
-    ax_xz.legend(fontsize=8)
-    ax_xz.axhline(0, color='k', linewidth=0.5, alpha=0.3)
-    ax_xz.axvline(0, color='k', linewidth=0.5, alpha=0.3)
-    
-    # YZ projection
-    ax_yz = fig.add_subplot(2, 3, 5)
-    ax_yz.arrow(0, 0, rvec_actual_norm[1], rvec_actual_norm[2], head_width=0.1, head_length=0.1, 
-                fc='orange', ec='orange', linewidth=3, alpha=0.9, label=f'Actual ({angle_actual:.1f}°)')
-    ax_yz.arrow(0, 0, rvec_pred_norm[1], rvec_pred_norm[2], head_width=0.1, head_length=0.1, 
-                fc='cyan', ec='cyan', linewidth=3, alpha=0.9, label=f'Predicted ({angle_predicted:.1f}°)')
-    ax_yz.set_xlim([-1.2, 1.2])
-    ax_yz.set_ylim([-1.2, 1.2])
-    ax_yz.set_xlabel('Y', fontsize=10, weight='bold')
-    ax_yz.set_ylabel('Z', fontsize=10, weight='bold')
-    ax_yz.set_title('YZ Projection (Side View)', fontsize=11, weight='bold')
-    ax_yz.grid(True, alpha=0.3)
-    ax_yz.set_aspect('equal')
-    ax_yz.legend(fontsize=8)
-    ax_yz.axhline(0, color='k', linewidth=0.5, alpha=0.3)
-    ax_yz.axvline(0, color='k', linewidth=0.5, alpha=0.3)
-    
-    # Add error summary text
-    ax_text = fig.add_subplot(2, 3, 6)
-    ax_text.axis('off')
-    
-    # Compute rotation error
-    R_error = R_predicted.T @ R_actual
-    trace = np.trace(R_error)
-    rotation_error = np.arccos(np.clip((trace - 1) / 2, -1, 1)) * 180 / np.pi
-    translation_error = np.linalg.norm(t_predicted - t_actual)
-    
-    # Compute angle between axes
-    if angle_actual > 0.1 and angle_predicted > 0.1:
-        axis_angle = np.arccos(np.clip(np.dot(rvec_actual_norm, rvec_pred_norm), -1, 1)) * 180 / np.pi
-        axis_angle_text = f"{axis_angle:.1f}°"
-    else:
-        axis_angle_text = "N/A"
-    
-    summary_text = f"""ROTATION {rotation_num} SUMMARY
-    
-Rotation Angles:
-  Actual:    {angle_actual:.2f}°
-  Predicted: {angle_predicted:.2f}°
-  
-Rotation Axes:
-  Actual:    [{rvec_actual_norm[0]:6.3f}, {rvec_actual_norm[1]:6.3f}, {rvec_actual_norm[2]:6.3f}]
-  Predicted: [{rvec_pred_norm[0]:6.3f}, {rvec_pred_norm[1]:6.3f}, {rvec_pred_norm[2]:6.3f}]
-  Angle between axes: {axis_angle_text}
-  
-ERRORS (AX=XB verification):
-  Rotation error:    {rotation_error:.2f}°
-  Translation error: {translation_error:.2f} mm
+    return debug_image
+
+def get_marker_pose_in_camera_frame(image, camera_matrix, dist_coeffs, marker_type='chessboard', 
+                                   chessboard_size=(11, 8), square_size=30.0,
+                                   aruco_id=0, aruco_size=200.0, aruco_dict='6X6_250', pnp_method='IPPE_SQUARE', use_sb_detection=True):
     """
-    ax_text.text(0.1, 0.5, summary_text, fontsize=10, verticalalignment='center',
-                 fontfamily='monospace', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
+    Get marker pose in camera frame using PnP.
+    Supports both chessboard and ArUco markers.
     
-    # Overall title
-    fig.suptitle(f'Rotation {rotation_num}: Actual vs Predicted Transformation', 
-                 fontsize=14, weight='bold', y=0.98)
-    
-    # Save figure
-    filepath = os.path.join(save_dir, f"transform_viz_rotation_{rotation_num}.png")
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
-    plt.savefig(filepath, dpi=150, bbox_inches='tight')
-    plt.close()
-    
-    print(f"  Saved visualization: {filepath}")
+    Returns: (success, rotation_vector, translation_vector, corners, marker_info)
+    """
+    if marker_type == 'chessboard':
+        pnp_method_const = get_pnp_method_constant(pnp_method)
+        return get_chessboard_pose_in_camera_frame(image, camera_matrix, dist_coeffs, chessboard_size, square_size, pnp_method=pnp_method_const, use_sb_detection=use_sb_detection)
+    elif marker_type == 'aruco':
+        aruco_dict_const = get_aruco_dict_constant(aruco_dict)
+        pnp_method_const = get_pnp_method_constant(pnp_method)
+        return get_aruco_pose_in_camera_frame(image, camera_matrix, dist_coeffs, 
+                                            marker_id=aruco_id, marker_size=aruco_size, aruco_dict=aruco_dict_const, pnp_method=pnp_method_const)
+    else:
+        raise ValueError(f"Unknown marker type: {marker_type}")
+
+
+async def get_hand_eye_from_machine(app_client: AppClient, camera_name: str):
+    """Get the hand-eye transformation from the machine's frame configuration"""
+    print(f"\n=== EXTRACTING HAND-EYE TRANSFORMATION ===")
+
+    try:
+        organizations = await app_client.list_organizations()
+        if not organizations:
+            print("Warning: No organizations found")
+            return None
+
+        org = organizations[0]
+        locations = await app_client.list_locations(org_id=org.id)
+        if not locations:
+            print("Warning: No locations found")
+            return None
+
+        location = locations[0]
+        robots = await app_client.list_robots(location_id=location.id)
+        if not robots:
+            print("Warning: No robots found")
+            return None
+
+        robot = robots[0]
+        robot_parts = await app_client.get_robot_parts(robot.id)
+        if not robot_parts:
+            print("Warning: No robot parts found")
+            return None
+
+        robot_part_config = await app_client.get_robot_part(robot_parts[0].id)
+        if not robot_part_config:
+            print("Warning: Could not retrieve robot configuration")
+            return None
+
+        robot_config = robot_part_config.robot_config
+        if 'components' not in robot_config:
+            print("Warning: Robot config does not have 'components' key")
+            return None
+
+        # Find the camera component configuration
+        camera_config = None
+        for component in robot_config['components']:
+            if component.get('name') == camera_name:
+                camera_config = component
+                break
+
+        if not camera_config or 'frame' not in camera_config or not camera_config['frame']:
+            print(f"Warning: No frame configuration found for camera '{camera_name}'")
+            return None
+
+        frame_config = camera_config['frame']
+        if not isinstance(frame_config, dict):
+            print(f"Warning: Frame configuration is not a dictionary")
+            return None
+
+        print(f"Found camera frame configuration")
+
+        parent = frame_config.get('parent', 'unknown')
+        translation = frame_config.get('translation', {})
+        print(f"Parent frame: {parent}")
+        print(f"Translation: x={translation.get('x', 0):.3f}, y={translation.get('y', 0):.3f}, z={translation.get('z', 0):.3f}")
+
+        T_hand_eye = frame_config_to_transformation_matrix(frame_config)
+
+        print(f"\nHand-Eye Transformation Matrix:")
+        for i in range(4):
+            print(f"  [{T_hand_eye[i,0]:8.4f} {T_hand_eye[i,1]:8.4f} {T_hand_eye[i,2]:8.4f} {T_hand_eye[i,3]:8.4f}]")
+
+        return T_hand_eye
+
+    except Exception as e:
+        print(f"Error retrieving frame configuration: {e}")
+        return None
+
 
 def compute_hand_eye_verification_errors(T_hand_eye, T_delta_A_world_frame, T_delta_B_camera_frame):
     """
-    Compute hand-eye calibration verification errors using the paper's method.
-    
+    Compute hand-eye calibration verification errors.
+
     Args:
         T_hand_eye: 4x4 hand-eye transformation matrix (camera to gripper)
         T_delta_A_world_frame: 4x4 actual robot motion in world frame
         T_delta_B_camera_frame: 4x4 camera motion (chessboard motion in camera frame)
-    
+
     Returns:
-        dict with keys:
-            - R_A_actual: 3x3 actual rotation matrix
-            - R_A_predicted: 3x3 predicted rotation matrix
-            - t_A_actual: 3x1 actual translation vector
-            - t_A_predicted: 3x1 predicted translation vector
-            - angle_actual: actual rotation angle in degrees
-            - angle_predicted: predicted rotation angle in degrees
-            - axis_actual: actual rotation axis (if angle > 0.01)
-            - axis_predicted: predicted rotation axis (if angle > 0.01)
-            - rotation_error: rotation error in degrees (Equation 48)
-            - translation_error: translation error in mm (Equation 48)
-            - error_axis: error rotation axis (if error > 0.01)
+        dict with rotation_error (degrees) and translation_error (mm)
     """
-    # Paper's method (Equation 47): Predict robot motion from camera motion
-    # Â_i0 = X B_i0 X^(-1) (similarity transform)
+    # Predict robot motion from camera motion: A_predicted = X^(-1) @ B @ X
     T_eye_hand = np.linalg.inv(T_hand_eye)
-    
-    # Decompose the similarity transform to see where axis deviation occurs
-    # Step 1: Start with camera-observed motion (B)
-    R_B = T_delta_B_camera_frame[:3, :3]
-    rvec_B, _ = cv2.Rodrigues(R_B)
-    angle_B = np.linalg.norm(rvec_B) * 180 / np.pi
-    
-    # Step 2: Apply T_hand_eye (gripper→camera) on the right
-    T_intermediate = T_delta_B_camera_frame @ T_hand_eye
-    R_intermediate = T_intermediate[:3, :3]
-    rvec_intermediate, _ = cv2.Rodrigues(R_intermediate)
-    angle_intermediate = np.linalg.norm(rvec_intermediate) * 180 / np.pi
-    
-    # Step 3: Apply T_eye_hand (camera→gripper) on the left to get final prediction
-    T_A_predicted = T_eye_hand @ T_delta_B_camera_frame @ T_hand_eye
-    
-    # Debug: Show axis transformation at each step
-    if angle_B > 0.1:
-        axis_B = rvec_B.flatten() / np.linalg.norm(rvec_B)
-        print(f"\n  DECOMPOSITION - Rotation axis at each step:")
-        print(f"  1. Camera observed (B):           [{axis_B[0]:7.3f}, {axis_B[1]:7.3f}, {axis_B[2]:7.3f}] ({angle_B:.2f}°)")
-        
-        if angle_intermediate > 0.1:
-            axis_intermediate = rvec_intermediate.flatten() / np.linalg.norm(rvec_intermediate)
-            print(f"  2. After B @ T_hand_eye:          [{axis_intermediate[0]:7.3f}, {axis_intermediate[1]:7.3f}, {axis_intermediate[2]:7.3f}] ({angle_intermediate:.2f}°)")
-    
+    T_A_predicted = T_hand_eye @ T_delta_B_camera_frame @ T_eye_hand 
+
+
     # Extract rotation matrices and translations
     R_A_actual = T_delta_A_world_frame[:3, :3]
     R_A_predicted = T_A_predicted[:3, :3]
     t_A_actual = T_delta_A_world_frame[:3, 3]
     t_A_predicted = T_A_predicted[:3, 3]
-    
-    # Convert to axis-angle
-    rvec_actual, _ = cv2.Rodrigues(R_A_actual)
-    rvec_pred, _ = cv2.Rodrigues(R_A_predicted)
-    angle_actual = np.linalg.norm(rvec_actual) * 180 / np.pi
-    angle_pred = np.linalg.norm(rvec_pred) * 180 / np.pi
-    
-    # Continue decomposition debug output
-    if angle_B > 0.1:
-        axis_pred = rvec_pred.flatten() / np.linalg.norm(rvec_pred) if angle_pred > 0.1 else np.array([0, 0, 0])
-        axis_actual = rvec_actual.flatten() / np.linalg.norm(rvec_actual) if angle_actual > 0.1 else np.array([0, 0, 0])
-        print(f"  3. After T_eye_hand @ ... (final): [{axis_pred[0]:7.3f}, {axis_pred[1]:7.3f}, {axis_pred[2]:7.3f}] ({angle_pred:.2f}°)")
-        print(f"  4. Actual robot motion (A):        [{axis_actual[0]:7.3f}, {axis_actual[1]:7.3f}, {axis_actual[2]:7.3f}] ({angle_actual:.2f}°)")
-        
-        # Compute angle between final axes
-        if angle_pred > 0.1 and angle_actual > 0.1:
-            dot_product = np.dot(axis_pred, axis_actual)
-            angle_between = np.arccos(np.clip(dot_product, -1, 1)) * 180 / np.pi
-            print(f"  → Angle between predicted and actual axes: {angle_between:.1f}°")
-    
-    # Calculate errors according to paper (Equation 48)
-    # R_error = (R̂_A_i0)^T R_A_i0
+
+    # Calculate rotation error
     R_error = R_A_predicted.T @ R_A_actual
-    rvec_error, _ = cv2.Rodrigues(R_error)
-    rotation_error = np.linalg.norm(rvec_error) * 180 / np.pi
-    
-    # t_error = t̂_A_i0 - t_A_i0
+    angle_rad = np.arccos(np.clip((np.trace(R_error) - 1) / 2, -1.0, 1.0))
+    rotation_error = np.degrees(angle_rad)
+
+    # Calculate translation error
     t_error = t_A_predicted - t_A_actual
     translation_error = np.linalg.norm(t_error)
-    
-    # Build result dictionary
-    result = {
-        'R_A_actual': R_A_actual,
-        'R_A_predicted': R_A_predicted,
-        't_A_actual': t_A_actual,
-        't_A_predicted': t_A_predicted,
-        'T_A_predicted': T_A_predicted,  # Full 4x4 predicted transformation
-        'angle_actual': angle_actual,
-        'angle_predicted': angle_pred,
+
+    return {
         'rotation_error': rotation_error,
-        'translation_error': translation_error,
+        'translation_error': translation_error
     }
-    
-    # Add rotation axes if angles are significant
-    if angle_actual > 0.01:
-        result['axis_actual'] = rvec_actual.flatten() / np.linalg.norm(rvec_actual)
-    else:
-        result['axis_actual'] = None
-        
-    if angle_pred > 0.01:
-        result['axis_predicted'] = rvec_pred.flatten() / np.linalg.norm(rvec_pred)
-    else:
-        result['axis_predicted'] = None
-    
-    if rotation_error > 0.01:
-        result['error_axis'] = rvec_error.flatten() / np.linalg.norm(rvec_error)
-    else:
-        result['error_axis'] = None
-    
-    return result
 
 async def main(
     arm_name: str,
     pose_tracker_name: str,
     motion_service_name: str,
-    body_names: list[str],
     camera_name: str,
+    poses: list,
     marker_type: str = 'chessboard',
     aruco_id: int = 0,
     aruco_size: float = 200.0,
     aruco_dict: str = '6X6_250',
+    pnp_method: str = 'IPPE_SQUARE',
+    use_sb_detection: bool = True,
 ):
     app_client: Optional[AppClient] = None
     machine: Optional[RobotClient] = None
@@ -690,137 +999,38 @@ async def main(
         motion_service = MotionClient.from_robot(machine, motion_service_name)
         pt = PoseTracker.from_robot(machine, pose_tracker_name)
 
-        print(f"Connected to robot: {machine}")
-        
+        print(f"Connected to robot")
+
         # Get the hand-eye transformation from camera configuration
-        print(f"\n=== EXTRACTING HAND-EYE TRANSFORMATION ===")
-        try:
-            # Get robot configuration from app client
-            organizations = await app_client.list_organizations()
-            if organizations:
-                org = organizations[0]
-                org_id = org.id
-                locations = await app_client.list_locations(org_id=org_id)
-                if locations:
-                    location = locations[0]
-                    location_id = location.id
-                    robots = await app_client.list_robots(location_id=location_id)
-                    if robots:
-                        robot = robots[0]
-                        robot_id = robot.id
-                        robot_parts = await app_client.get_robot_parts(robot_id)
-                        if robot_parts:
-                            robot_part = robot_parts[0]
-                            robot_part_id = robot_part.id
-                            robot_part_config = await app_client.get_robot_part(robot_part_id)
-                            
-                            if robot_part_config:
-                                robot_config = robot_part_config.robot_config
-                                
-                                if 'components' in robot_config:
-                                    components = robot_config['components']
-                                    
-                                    # Find the camera component configuration
-                                    camera_config = None
-                                    for component in components:
-                                        if component.get('name') == camera_name:
-                                            camera_config = component
-                                            break
-                                    
-                                    if camera_config and 'frame' in camera_config and camera_config['frame']:
-                                        frame_config = camera_config['frame']
-                                        print(f"Found camera frame configuration")
-                                        
-                                        # Handle frame configuration as dictionary
-                                        if isinstance(frame_config, dict):
-                                            parent = frame_config.get('parent', 'unknown')
-                                            translation = frame_config.get('translation', {})
-                                            orientation = frame_config.get('orientation', {})
-                                            
-                                            print(f"Parent frame: {parent}")
-                                            print(f"Translation: x={translation.get('x', 0):.6f}, y={translation.get('y', 0):.6f}, z={translation.get('z', 0):.6f}")
-                                            print(f"Orientation: {orientation}")
-                                            
-                                            # Convert frame configuration directly to transformation matrix
-                                            T_hand_eye = frame_config_to_transformation_matrix(frame_config)
-                                            
-                                            print(f"\nHand-Eye Transformation Matrix (4x4):")
-                                            print(f"T_camera_to_{parent} =")
-                                            for i in range(4):
-                                                print(f"  [{T_hand_eye[i,0]:8.4f} {T_hand_eye[i,1]:8.4f} {T_hand_eye[i,2]:8.4f} {T_hand_eye[i,3]:8.4f}]")
-                                            
-                                            # Extract rotation matrix and translation vector
-                                            R = T_hand_eye[:3, :3]
-                                            t = T_hand_eye[:3, 3]
-                                            print(f"\nRotation Matrix (3x3) - as stored in config:")
-                                            for i in range(3):
-                                                print(f"  [{R[i,0]:8.4f} {R[i,1]:8.4f} {R[i,2]:8.4f}]")
-                                            print(f"Translation Vector: [{t[0]:8.4f}, {t[1]:8.4f}, {t[2]:8.4f}]")
-                                        else:
-                                            print(f"Warning: Frame configuration is not a dictionary")
-                                    else:
-                                        print(f"Warning: No frame configuration found for camera '{camera_name}'")
-                                else:
-                                    print(f"Warning: Robot config does not have 'components' key")
-                            else:
-                                print(f"Warning: Could not retrieve robot configuration")
-                        else:
-                            print(f"Warning: No robot parts found")
-                    else:
-                        print(f"Warning: No robots found")
-                else:
-                    print(f"Warning: No locations found")
-            else:
-                print(f"Warning: No organizations found")
-                
-        except Exception as e:
-            print(f"Error retrieving frame configuration: {e}")
-            print("Continuing without frame configuration...")
-            T_hand_eye = None
-        
+        T_hand_eye = await get_hand_eye_from_machine(app_client, camera_name)
+        if T_hand_eye is None:
+            print("ERROR: Could not retrieve hand-eye transformation")
+            return
+
         # Get initial poses
-        A_0_pose_world_frame = await _get_current_arm_pose(motion_service, arm.name, arm)
+        A_0_pose_world_frame_raw = await _get_current_arm_pose(motion_service, arm.name, arm)
+        # Invert only the rotation, keep translation unchanged
+        A_0_pose_world_frame = _invert_pose_rotation_only(A_0_pose_world_frame_raw)
         T_A_0_world_frame = _pose_to_matrix(A_0_pose_world_frame)
 
         camera_matrix, dist_coeffs = await get_camera_intrinsics(camera)
         image = await get_camera_image(camera)
 
-        # Detect marker based on type
+        success, rvec, tvec, _, marker_info = get_marker_pose_in_camera_frame(
+            image, camera_matrix, dist_coeffs, marker_type=marker_type,
+            chessboard_size=(11, 8), square_size=30.0,
+            aruco_id=aruco_id, aruco_size=aruco_size, aruco_dict=aruco_dict, pnp_method=pnp_method, use_sb_detection=use_sb_detection
+        )
+        if not success:
+            print(f"Failed to detect {marker_type} in reference image")
+            return
+        
         if marker_type == 'aruco':
-            aruco_dict_const = get_aruco_dict_constant(aruco_dict)
-            success, rvec, tvec, corners, detected_id = get_aruco_pose_in_camera_frame(
-                image, camera_matrix, dist_coeffs, 
-                marker_id=aruco_id, marker_size=aruco_size, aruco_dict=aruco_dict_const
-            )
-            if not success:
-                print(f"Failed to detect ArUco marker (ID: {aruco_id}) in reference image")
-                return
-            print(f"Detected ArUco marker ID: {detected_id}")
-        else:  # chessboard
-            success, rvec, tvec, corners = get_chessboard_pose_in_camera_frame(
-                image, camera_matrix, dist_coeffs, chessboard_size=(11, 8), square_size=30.0
-            )
-            if not success:
-                print("Failed to detect chessboard in reference image")
-                return
+            print(f"Detected ArUco marker ID: {marker_info}")
         
         # Convert rvec, tvec to 4x4 transformation matrix (chessboard in camera frame)
         # Don't transpose - solvePnP output is already in OpenCV convention
         T_B_0_camera_frame = rvec_tvec_to_matrix(rvec, tvec)
-        T_B_0_camera_frame_pose = _matrix_to_pose(T_B_0_camera_frame)
-        T_B_0_world_frame_pose_in_frame = await machine.transform_pose(
-            PoseInFrame(reference_frame=camera_name, pose=T_B_0_camera_frame_pose), 
-            "world"
-        )
-        T_B_0_world_frame_pose = T_B_0_world_frame_pose_in_frame.pose
-        T_B_0_world_frame = _pose_to_matrix(T_B_0_world_frame_pose)
-        print(f"\n=== REFERENCE CHESSBOARD ===")
-        print(f"In camera frame:")
-        print(f"  Position: [{T_B_0_camera_frame_pose.x:.2f}, {T_B_0_camera_frame_pose.y:.2f}, {T_B_0_camera_frame_pose.z:.2f}] mm")
-        print(f"  Orientation: ({T_B_0_camera_frame_pose.o_x:.4f}, {T_B_0_camera_frame_pose.o_y:.4f}, {T_B_0_camera_frame_pose.o_z:.4f}, θ={T_B_0_camera_frame_pose.theta:.2f}°)")
-        print(f"In world frame:")
-        print(f"  Position: [{T_B_0_world_frame_pose.x:.2f}, {T_B_0_world_frame_pose.y:.2f}, {T_B_0_world_frame_pose.z:.2f}] mm")
-        print(f"  Orientation: ({T_B_0_world_frame_pose.o_x:.4f}, {T_B_0_world_frame_pose.o_y:.4f}, {T_B_0_world_frame_pose.o_z:.4f}, θ={T_B_0_world_frame_pose.theta:.2f}°)")
         
         # Create directory for saving data
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -836,7 +1046,16 @@ async def main(
             "square_size": 30.0,  # mm
             "hand_eye_transform": T_hand_eye.tolist() if T_hand_eye is not None else None,
             "timestamp": timestamp,
-            "A_0_pose": {
+            "A_0_pose_raw": {
+                "x": A_0_pose_world_frame_raw.x,
+                "y": A_0_pose_world_frame_raw.y,
+                "z": A_0_pose_world_frame_raw.z,
+                "o_x": A_0_pose_world_frame_raw.o_x,
+                "o_y": A_0_pose_world_frame_raw.o_y,
+                "o_z": A_0_pose_world_frame_raw.o_z,
+                "theta": A_0_pose_world_frame_raw.theta
+            },
+            "A_0_pose_inverted": {
                 "x": A_0_pose_world_frame.x,
                 "y": A_0_pose_world_frame.y,
                 "z": A_0_pose_world_frame.z,
@@ -845,178 +1064,121 @@ async def main(
                 "o_z": A_0_pose_world_frame.o_z,
                 "theta": A_0_pose_world_frame.theta
             },
-            "T_B_0_camera_frame": T_B_0_camera_frame.tolist()
+            "T_B_0_camera_frame": T_B_0_camera_frame.tolist(),
+            "note": "Arm poses have rotation inverted (translation unchanged) before processing"
         }
         with open(os.path.join(data_dir, "calibration_config.json"), "w") as f:
             json.dump(calibration_data, f, indent=2)
         
-        # Save reference image with visualization
-        ref_debug_img = image.copy()
-        if marker_type == 'aruco':
-            # Draw marker outline
-            pts = corners.reshape(4, 2).astype(np.int32)
-            cv2.polylines(ref_debug_img, [pts], True, (0, 255, 0), 2)
-            center = np.mean(pts, axis=0).astype(np.int32)
-            cv2.putText(ref_debug_img, f"ID: {detected_id}", tuple(center), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        else:
-            cv2.drawChessboardCorners(ref_debug_img, (11, 8), corners, success)
-        
-        # Draw coordinate axes
-        cv2.drawFrameAxes(ref_debug_img, camera_matrix, dist_coeffs, rvec, tvec, 50)
-        
-        # Draw rotation vector
-        rotation_angle = np.linalg.norm(rvec)
-        if rotation_angle > 0.01:
-            rotation_axis = rvec.flatten() / rotation_angle
-            marker_center_3d = tvec.reshape(3, 1)
-            marker_center_2d, _ = cv2.projectPoints(
-                marker_center_3d.T, np.zeros(3), np.zeros(3), 
-                camera_matrix, dist_coeffs
-            )
-            start_pt = tuple(marker_center_2d[0, 0].astype(np.int32))
-            arrow_length = min(100, rotation_angle * 180 / np.pi * 0.5)
-            end_point_3d = marker_center_3d + rotation_axis.reshape(3, 1) * arrow_length
-            end_pt_2d, _ = cv2.projectPoints(
-                end_point_3d.T, np.zeros(3), np.zeros(3),
-                camera_matrix, dist_coeffs
-            )
-            end_pt = tuple(end_pt_2d[0, 0].astype(np.int32))
-            cv2.arrowedLine(ref_debug_img, start_pt, end_pt, (255, 0, 255), 3, tipLength=0.3)
-            rotation_text = f"Rot: {rotation_angle*180/np.pi:.1f}deg"
-            axis_text = f"Axis: [{rotation_axis[0]:.2f}, {rotation_axis[1]:.2f}, {rotation_axis[2]:.2f}]"
-            cv2.putText(ref_debug_img, rotation_text, (10, 30), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
-            cv2.putText(ref_debug_img, axis_text, (10, 60), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
-        
-        cv2.imwrite(os.path.join(data_dir, "image_reference.jpg"), ref_debug_img)
+        # Save reference image
+        # Save reference image with debug visualization
+        debug_image = draw_marker_debug(image, rvec, tvec, camera_matrix, dist_coeffs, 
+                                      marker_type=marker_type, aruco_size=aruco_size, validation_info=marker_info)
+        cv2.imwrite(os.path.join(data_dir, "image_reference.jpg"), debug_image)
         print(f"Saved reference image and config")
         
         # List to store all rotation data
         rotation_data = []
+
+        # Test the hand-eye transformation with provided poses
+        if poses is None:
+            print("No poses provided, using default poses")
+            initial_pose = await _get_current_arm_pose(motion_service, arm.name, arm)
+            print(f"Initial pose theta: {initial_pose.theta:.1f}°")
+            
+            poses = []
+            for i in range(4):
+                new_pose = Pose(
+                    x=initial_pose.x,
+                    y=initial_pose.y,
+                    z=initial_pose.z,
+                    o_x=initial_pose.o_x,
+                    o_y=initial_pose.o_y,
+                    o_z=initial_pose.o_z,
+                    theta=i * 90  # Normalize to 0°, 90°, 180°, 270°
+                )
+                poses.append(new_pose)
+            print(f"Created poses at: 0°, 90°, 180°, 270°")
         
-        # Test the hand-eye transformation with 4 rotations
-        for i in range(4):
-            rotation_angle = (i + 1) * 90  # 5°, 10°, 15°, 20°
-            print(f"\n=== ROTATION {i+1}/4: {rotation_angle}° ===")
-            
-            # Calculate target pose (rotate around Z-axis)
-            target_pose = copy.deepcopy(A_0_pose_world_frame)
-            target_pose.theta = A_0_pose_world_frame.theta + rotation_angle
-            
-            print(f"Moving to target pose: theta={target_pose.theta:.2f}°")
-            
+
+        await arm.do_command({"set_vel": DEFAULT_VELOCITY_SLOW})
+        print(f"\n=== TESTING {len(poses)} POSES ===")
+        for i, pose_spec in enumerate(poses):
+            print(f"\n=== POSE {i+1}/{len(poses)} ===")
+
+            # Create target pose from specification
+            if isinstance(pose_spec, dict):
+                # Pose from file (dictionary)
+                target_pose = Pose(
+                    x=pose_spec['x'],
+                    y=pose_spec['y'],
+                    z=pose_spec['z'],
+                    o_x=pose_spec['o_x'],
+                    o_y=pose_spec['o_y'],
+                    o_z=pose_spec['o_z'],
+                    theta=pose_spec['theta']
+                )
+            else:
+                # Pose object (default poses)
+                target_pose = pose_spec
+            print(f"  Position: ({target_pose.x:.1f}, {target_pose.y:.1f}, {target_pose.z:.1f})")
+            print(f"  Orientation: ({target_pose.o_x:.3f}, {target_pose.o_y:.3f}, {target_pose.o_z:.3f}) @ {target_pose.theta:.1f}°")
+
             # Move to target pose
             target_pose_in_frame = PoseInFrame(reference_frame=DEFAULT_WORLD_FRAME, pose=target_pose)
-            if(rotation_angle == 360):
-                await motion_service.move(component_name=arm.name, destination=PoseInFrame(reference_frame=DEFAULT_WORLD_FRAME, pose=A_0_pose_world_frame))
-            else:
-                await motion_service.move(component_name=arm.name, destination=target_pose_in_frame)
-            await asyncio.sleep(2.0)
+            await motion_service.move(component_name=arm.name, destination=target_pose_in_frame)
+            await asyncio.sleep(DEFAULT_SETTLE_TIME)  # Increased settling time to reduce motion blur
             
             image = await get_camera_image(camera)
+            success, rvec, tvec, _, marker_info = get_marker_pose_in_camera_frame(
+                image, camera_matrix, dist_coeffs, marker_type=marker_type,
+                chessboard_size=(11, 8), square_size=30.0,
+                aruco_id=aruco_id, aruco_size=aruco_size, aruco_dict=aruco_dict, pnp_method=pnp_method, use_sb_detection=use_sb_detection
+            )
+            if not success:
+                print(f"  Failed to detect {marker_type}, skipping pose {i+1}")
+                continue
             
-            # Detect marker based on type
             if marker_type == 'aruco':
-                aruco_dict_const = get_aruco_dict_constant(aruco_dict)
-                success, rvec, tvec, corners, detected_id = get_aruco_pose_in_camera_frame(
-                    image, camera_matrix, dist_coeffs,
-                    marker_id=aruco_id, marker_size=aruco_size, aruco_dict=aruco_dict_const
-                )
-                if not success:
-                    print(f"Failed to detect ArUco marker in rotation {i+1}")
-                    continue
-            else:  # chessboard
-                success, rvec, tvec, corners = get_chessboard_pose_in_camera_frame(
-                    image, camera_matrix, dist_coeffs, chessboard_size=(11, 8), square_size=30.0
-                )
-                if not success:
-                    print(f"Failed to detect chessboard in rotation {i+1}")
-                    continue
-            
-            # Debug: Save image with detected corners
-            debug_img = image.copy()
-            if marker_type == 'aruco':
-                # For ArUco, just draw the axes (marker outline is less important)
-                # Draw a simple polygon around the marker
-                pts = corners.reshape(4, 2).astype(np.int32)
-                cv2.polylines(debug_img, [pts], True, (0, 255, 0), 2)
-                # Add marker ID text
-                center = np.mean(pts, axis=0).astype(np.int32)
-                cv2.putText(debug_img, f"ID: {detected_id}", tuple(center), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            else:
-                # Draw chessboard corners
-                cv2.drawChessboardCorners(debug_img, (11, 8), corners, success)
-            
-            # Draw coordinate axes (X=red, Y=green, Z=blue)
-            cv2.drawFrameAxes(debug_img, camera_matrix, dist_coeffs, rvec, tvec, 50)
-            
-            # Draw rotation vector (axis-angle representation) as a magenta arrow
-            rotation_angle = np.linalg.norm(rvec)
-            if rotation_angle > 0.01:  # Only draw if there's significant rotation
-                # Normalize to get rotation axis
-                rotation_axis = rvec.flatten() / rotation_angle
-                
-                # Project marker center to image
-                marker_center_3d = tvec.reshape(3, 1)
-                marker_center_2d, _ = cv2.projectPoints(
-                    marker_center_3d.T, np.zeros(3), np.zeros(3), 
-                    camera_matrix, dist_coeffs
-                )
-                start_pt = tuple(marker_center_2d[0, 0].astype(np.int32))
-                
-                # Draw arrow in direction of rotation axis
-                # Scale by rotation angle (in degrees) for visualization
-                arrow_length = min(100, rotation_angle * 180 / np.pi * 0.5)  # Scale for visibility
-                end_point_3d = marker_center_3d + rotation_axis.reshape(3, 1) * arrow_length
-                end_pt_2d, _ = cv2.projectPoints(
-                    end_point_3d.T, np.zeros(3), np.zeros(3),
-                    camera_matrix, dist_coeffs
-                )
-                end_pt = tuple(end_pt_2d[0, 0].astype(np.int32))
-                
-                # Draw magenta arrow for rotation vector
-                cv2.arrowedLine(debug_img, start_pt, end_pt, (255, 0, 255), 3, tipLength=0.3)
-                
-                # Add rotation info text
-                rotation_text = f"Rot: {rotation_angle*180/np.pi:.1f}deg"
-                axis_text = f"Axis: [{rotation_axis[0]:.2f}, {rotation_axis[1]:.2f}, {rotation_axis[2]:.2f}]"
-                cv2.putText(debug_img, rotation_text, (10, 30), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
-                cv2.putText(debug_img, axis_text, (10, 60), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
-            
-            cv2.imwrite(f"debug_rotation_{i+1}.jpg", debug_img)
-            print(f"Saved debug image: debug_rotation_{i+1}.jpg")
-            
+                print(f"  Detected ArUco marker ID: {marker_info}")
+
             # Get current poses
-            A_i_pose_world_frame = await _get_current_arm_pose(motion_service, arm.name, arm)
+            A_i_pose_world_frame_raw = await _get_current_arm_pose(motion_service, arm.name, arm)
+            # Invert only the rotation, keep translation unchanged
+            A_i_pose_world_frame = _invert_pose_rotation_only(A_i_pose_world_frame_raw)
             T_A_i_world_frame = _pose_to_matrix(A_i_pose_world_frame)
 
             # Convert chessboard pose (don't transpose - solvePnP is OpenCV convention)
             T_B_i_camera_frame = rvec_tvec_to_matrix(rvec, tvec)
-            T_B_i_world_frame_pose = _matrix_to_pose(T_B_i_camera_frame)
-            T_B_i_world_frame_pose_in_frame = await machine.transform_pose(
-                PoseInFrame(reference_frame=camera_name, pose=T_B_i_world_frame_pose), 
-                "world"
-            )
-            T_B_i_world_frame_pose_result = T_B_i_world_frame_pose_in_frame.pose
-            T_B_i_world_frame = _pose_to_matrix(T_B_i_world_frame_pose_result)
-            print(f"\n=== CHESSBOARD IN WORLD FRAME ===")
-            print(f"In camera frame:")
-            print(f"  Position: [{T_B_i_camera_frame[0,3]:.2f}, {T_B_i_camera_frame[1,3]:.2f}, {T_B_i_camera_frame[2,3]:.2f}] mm")
-            print(f"  Orientation: ({T_B_i_camera_frame[0,0]:.4f}, {T_B_i_camera_frame[0,1]:.4f}, {T_B_i_camera_frame[0,2]:.4f}, θ={T_B_i_camera_frame[0,3]:.2f}°)")
-            print(f"In world frame:")
-            print(f"  Position: [{T_B_i_world_frame[0,3]:.2f}, {T_B_i_world_frame[1,3]:.2f}, {T_B_i_world_frame[2,3]:.2f}] mm")
-            print(f"  Orientation: ({T_B_i_world_frame[0,0]:.4f}, {T_B_i_world_frame[0,1]:.4f}, {T_B_i_world_frame[0,2]:.4f}, θ={T_B_i_world_frame[0,3]:.2f}°)")
             
-            # Save rotation data
-            rotation_info = {
-                "rotation_index": i,
-                "rotation_angle": rotation_angle,
-                "A_i_pose": {
+            # Save pose data
+            # Convert pose_spec to dictionary if it's a Pose object
+            if isinstance(pose_spec, Pose):
+                pose_spec_dict = {
+                    "x": pose_spec.x,
+                    "y": pose_spec.y,
+                    "z": pose_spec.z,
+                    "o_x": pose_spec.o_x,
+                    "o_y": pose_spec.o_y,
+                    "o_z": pose_spec.o_z,
+                    "theta": pose_spec.theta
+                }
+            else:
+                pose_spec_dict = pose_spec
+            
+            pose_info = {
+                "pose_index": i,
+                "pose_spec": pose_spec_dict,
+                "A_i_pose_raw": {
+                    "x": A_i_pose_world_frame_raw.x,
+                    "y": A_i_pose_world_frame_raw.y,
+                    "z": A_i_pose_world_frame_raw.z,
+                    "o_x": A_i_pose_world_frame_raw.o_x,
+                    "o_y": A_i_pose_world_frame_raw.o_y,
+                    "o_z": A_i_pose_world_frame_raw.o_z,
+                    "theta": A_i_pose_world_frame_raw.theta
+                },
+                "A_i_pose_inverted": {
                     "x": A_i_pose_world_frame.x,
                     "y": A_i_pose_world_frame.y,
                     "z": A_i_pose_world_frame.z,
@@ -1029,100 +1191,56 @@ async def main(
                 "tvec": tvec.tolist(),
                 "T_B_i_camera_frame": T_B_i_camera_frame.tolist()
             }
-            rotation_data.append(rotation_info)
-            
-            # Save image for this rotation
-            cv2.imwrite(os.path.join(data_dir, f"image_rotation_{i+1}.jpg"), image)
-            
-            # Save rotation data incrementally (in case of crash)
-            with open(os.path.join(data_dir, "rotation_data.json"), "w") as f:
+            rotation_data.append(pose_info)
+
+            # Save image for this pose
+            # Save pose image with debug visualization
+            debug_image = draw_marker_debug(image, rvec, tvec, camera_matrix, dist_coeffs, 
+                                          marker_type=marker_type, aruco_size=aruco_size, validation_info=marker_info)
+            cv2.imwrite(os.path.join(data_dir, f"image_pose_{i+1}.jpg"), debug_image)
+
+            # Save pose data incrementally (in case of crash)
+            with open(os.path.join(data_dir, "pose_data.json"), "w") as f:
                 json.dump(rotation_data, f, indent=2)
-            print(f"Saved rotation {i+1} data")
+            print(f"  Saved pose {i+1} data")
             
-            # A = Robot motion in WORLD frame
+            # Compute relative transformations
             T_delta_A_world_frame = np.linalg.inv(T_A_i_world_frame) @ T_A_0_world_frame
-            
-            # B = Camera motion in CAMERA frame (motion of target as observed by camera)
             T_delta_B_camera_frame = T_B_i_camera_frame @ np.linalg.inv(T_B_0_camera_frame)
 
-            T_delta_B_camera_frame_pose = _matrix_to_pose(T_delta_B_camera_frame)
-            T_delta_B_world_frame_pose_in_frame = await machine.transform_pose(
-                PoseInFrame(reference_frame=camera_name, pose=T_delta_B_camera_frame_pose), 
-                "world"
-            )
-            T_delta_B_world_frame_pose_result = T_delta_B_world_frame_pose_in_frame.pose
-            T_delta_B_world_frame = _pose_to_matrix(T_delta_B_world_frame_pose_result)
-            T_delta_B_world_frame_2 = np.linalg.inv(T_B_0_world_frame) @ T_B_i_world_frame
-            print(f"\n=== DELTA BETWEEN CHESSBOARD IN WORLD FRAME ===")
-            print(f"In camera frame:")
-            print(f"  Position: [{T_delta_B_camera_frame[0,3]:.2f}, {T_delta_B_camera_frame[1,3]:.2f}, {T_delta_B_camera_frame[2,3]:.2f}] mm")
-            print(f"  Orientation: ({T_delta_B_camera_frame[0,0]:.4f}, {T_delta_B_camera_frame[0,1]:.4f}, {T_delta_B_camera_frame[0,2]:.4f}, θ={T_delta_B_camera_frame[0,3]:.2f}°)")
-            print(f"In world frame:")
-            print(f"  Position: [{T_delta_B_world_frame[0,3]:.2f}, {T_delta_B_world_frame[1,3]:.2f}, {T_delta_B_world_frame[2,3]:.2f}] mm")
-            print(f"  Orientation: ({T_delta_B_world_frame[0,0]:.4f}, {T_delta_B_world_frame[0,1]:.4f}, {T_delta_B_world_frame[0,2]:.4f}, θ={T_delta_B_world_frame[0,3]:.2f}°)")
-            print(f"In world frame 2:")
-            print(f"  Position: [{T_delta_B_world_frame_2[0,3]:.2f}, {T_delta_B_world_frame_2[1,3]:.2f}, {T_delta_B_world_frame_2[2,3]:.2f}] mm")
-            print(f"  Orientation: ({T_delta_B_world_frame_2[0,0]:.4f}, {T_delta_B_world_frame_2[0,1]:.4f}, {T_delta_B_world_frame_2[0,2]:.4f}, θ={T_delta_B_world_frame_2[0,3]:.2f}°)")
-            # Debug: Print detailed transformation info
-            print(f"\n  DEBUG - Transformations:")
-            print(f"  Robot pose 0: ({A_0_pose_world_frame.x:.1f}, {A_0_pose_world_frame.y:.1f}, {A_0_pose_world_frame.z:.1f}) θ={A_0_pose_world_frame.theta:.1f}°")
-            print(f"  Robot pose i: ({A_i_pose_world_frame.x:.1f}, {A_i_pose_world_frame.y:.1f}, {A_i_pose_world_frame.z:.1f}) θ={A_i_pose_world_frame.theta:.1f}°")
-            print(f"  Robot delta translation: [{T_delta_A_world_frame[0,3]:.2f}, {T_delta_A_world_frame[1,3]:.2f}, {T_delta_A_world_frame[2,3]:.2f}]")
-            print(f"  Camera delta translation: [{T_delta_B_camera_frame[0,3]:.2f}, {T_delta_B_camera_frame[1,3]:.2f}, {T_delta_B_camera_frame[2,3]:.2f}]")
-            
-            # Compute verification errors using modular function
-            errors = compute_hand_eye_verification_errors(
+            # ADD THIS: Detailed debug analysis
+            best_method = analyze_hand_eye_error(
                 T_hand_eye, 
                 T_delta_A_world_frame, 
+                T_delta_B_camera_frame,
+                A_0_pose_world_frame_raw,
+                A_i_pose_world_frame_raw,
+                i+1
+            )
+
+            # Compute verification errors (keep your existing code)
+            errors = compute_hand_eye_verification_errors(
+                T_hand_eye,
+                T_delta_A_world_frame,
                 T_delta_B_camera_frame
             )
-            
-            # Visualize the transformation difference
-            visualize_transformation_difference(
-                T_delta_A_world_frame,
-                errors['T_A_predicted'],
-                i + 1,
-                data_dir
-            )
-            
-            # Debug: Print rotation matrices
-            print(f"\n  DEBUG - Predicted vs Actual robot motion:")
-            print(f"  R_A_actual:")
-            for row in errors['R_A_actual']:
-                print(f"    [{row[0]:7.4f}, {row[1]:7.4f}, {row[2]:7.4f}]")
-            print(f"  R_A_predicted:")
-            for row in errors['R_A_predicted']:
-                print(f"    [{row[0]:7.4f}, {row[1]:7.4f}, {row[2]:7.4f}]")
-            
-            # Print axis-angle representation
-            if errors['axis_actual'] is not None:
-                axis = errors['axis_actual']
-                print(f"  Actual: {errors['angle_actual']:.2f}° around axis [{axis[0]:.3f}, {axis[1]:.3f}, {axis[2]:.3f}]")
-            if errors['axis_predicted'] is not None:
-                axis = errors['axis_predicted']
-                print(f"  Predicted: {errors['angle_predicted']:.2f}° around axis [{axis[0]:.3f}, {axis[1]:.3f}, {axis[2]:.3f}]")
 
-            # Print errors
-            print(f"\n  ERRORS (Paper's method - Eq. 48):")
+            print(f"\n  📊 CURRENT METHOD ERRORS:")
             print(f"  Rotation error: {errors['rotation_error']:.3f}°")
             print(f"  Translation error: {errors['translation_error']:.3f} mm")
-            if errors['error_axis'] is not None:
-                axis = errors['error_axis']
-                print(f"  Error rotation: {errors['rotation_error']:.2f}° around axis [{axis[0]:.3f}, {axis[1]:.3f}, {axis[2]:.3f}]")
-            
-            # Wait between measurements
+
             await asyncio.sleep(1.0)
         
         print(f"\n✅ ALL DATA SAVED TO: {data_dir}")
         print(f"   - calibration_config.json (camera params, hand-eye, reference pose)")
-        print(f"   - image_reference.jpg + image_rotation_1-4.jpg")
-        print(f"   - rotation_data.json (all arm poses and chessboard detections)")
+        print(f"   - image_reference.jpg + image_pose_1-{len(poses)}.jpg")
+        print(f"   - pose_data.json (all arm poses and chessboard detections)")
         
         # Return to reference pose
         print(f"\n=== RETURNING TO REFERENCE POSE ===")
-        A_0_pose_in_frame = PoseInFrame(reference_frame=DEFAULT_WORLD_FRAME, pose=A_0_pose_world_frame)
+        A_0_pose_in_frame = PoseInFrame(reference_frame=DEFAULT_WORLD_FRAME, pose=A_0_pose_world_frame_raw)
         await motion_service.move(component_name=arm.name, destination=A_0_pose_in_frame)
-        await asyncio.sleep(2.0)
+        await asyncio.sleep(5.0)  # Increased settling time
         
         print("=" * 60)
         
@@ -1140,7 +1258,24 @@ async def main(
             await machine.close()
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Clean hand-eye calibration test')
+    parser = argparse.ArgumentParser(
+        description='Test hand-eye calibration by moving robot and verifying transformations',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Example:
+  python pose_test_script.py --camera-name sensing-camera --arm-name myarm \\
+    --pose-tracker-name mytracker --poses poses.json
+
+Pose JSON format (list of pose objects):
+  [
+    {"x": 100, "y": 200, "z": 300, "o_x": 0, "o_y": 0, "o_z": 1, "theta": 45},
+    {"x": 150, "y": 100, "z": 250, "o_x": 0, "o_y": 0, "o_z": 1, "theta": 90},
+    {"x": 120, "y": 180, "z": 280, "o_x": 0, "o_y": 0, "o_z": 1, "theta": 135}
+  ]
+
+All pose objects must have: x, y, z, o_x, o_y, o_z, theta
+        """
+    )
     parser.add_argument(
         '--camera-name',
         type=str,
@@ -1160,11 +1295,17 @@ if __name__ == '__main__':
         help='Name of the pose tracker resource'
     )
     parser.add_argument(
+        '--poses',
+        type=str,
+        required=False,
+        help='Path to JSON file containing list of pose objects'
+    )
+    parser.add_argument(
         '--marker-type',
         type=str,
         choices=['chessboard', 'aruco'],
         default='chessboard',
-        help='Type of fiducial marker to use (default: chessboard)'
+        help='Type of marker to use for pose estimation (default: chessboard)'
     )
     parser.add_argument(
         '--aruco-id',
@@ -1181,22 +1322,50 @@ if __name__ == '__main__':
     parser.add_argument(
         '--aruco-dict',
         type=str,
-        choices=['4X4_50', '4X4_100', '4X4_250', '4X4_1000',
-                 '5X5_50', '5X5_100', '5X5_250', '5X5_1000',
-                 '6X6_50', '6X6_100', '6X6_250', '6X6_1000',
-                 '7X7_50', '7X7_100', '7X7_250', '7X7_1000'],
         default='6X6_250',
+        choices=['4X4_50', '4X4_100', '4X4_250', '4X4_1000',
+                '5X5_50', '5X5_100', '5X5_250', '5X5_1000',
+                '6X6_50', '6X6_100', '6X6_250', '6X6_1000',
+                '7X7_50', '7X7_100', '7X7_250', '7X7_1000'],
         help='ArUco dictionary to use (default: 6X6_250)'
     )
+    parser.add_argument(
+        '--pnp-method',
+        type=str,
+        default='IPPE_SQUARE',
+        choices=['IPPE_SQUARE', 'IPPE', 'ITERATIVE', 'SQPNP'],
+        help='PnP method to use for ArUco detection (default: IPPE_SQUARE)'
+    )
+    parser.add_argument(
+        '--use-sb-detection',
+        action='store_true',
+        help='Use findChessboardCornersSB (subpixel detection) instead of findChessboardCorners for chessboard'
+    )
+
     args = parser.parse_args()
+
+    # Parse poses from JSON file
+    try:
+        poses = parse_poses_from_json(args.poses)
+        if poses is None:
+            print("No poses provided, using default poses")
+            poses = None
+        else:
+            print(f"Loaded {len(poses)} poses to test")
+    except Exception as e:
+        print(f"Error parsing poses: {e}")
+        exit(1)
+
     asyncio.run(main(
         arm_name=args.arm_name,
         pose_tracker_name=args.pose_tracker_name,
         motion_service_name="motion",
-        body_names=["corner_45",],
         camera_name=args.camera_name,
+        poses=poses,
         marker_type=args.marker_type,
         aruco_id=args.aruco_id,
         aruco_size=args.aruco_size,
         aruco_dict=args.aruco_dict,
+        pnp_method=args.pnp_method,
+        use_sb_detection=args.use_sb_detection,
     ))
