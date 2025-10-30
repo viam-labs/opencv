@@ -1573,8 +1573,8 @@ async def main(
             "T_B_0_camera_frame": T_B_0_camera_frame.tolist(),
             "note": "Arm poses have rotation inverted (translation unchanged) before processing"
         }
-        with open(os.path.join(data_dir, "calibration_config.json"), "w") as f:
-            json.dump(calibration_data, f, indent=2)
+        with open(os.path.join(data_dir, "calibration_config.json"), "w", encoding='utf-8') as f:
+            json.dump(calibration_data, f, indent=2, ensure_ascii=False)
         
         # Save reference image
         # Save reference image with debug visualization
@@ -1595,12 +1595,21 @@ async def main(
                         data = json.load(f)
                     # Handle both old format (list) and new format (dict with 'poses' key)
                     if isinstance(data, list):
-                        rotation_data = data
+                        existing_poses = data
                     elif isinstance(data, dict) and 'poses' in data:
-                        rotation_data = data['poses']
+                        existing_poses = data['poses']
                     else:
                         print(f"Warning: Unexpected data format in {pose_data_path}, starting fresh")
-                        rotation_data = []
+                        existing_poses = []
+                    
+                    # Remove poses that will be re-measured (from resume_from_pose onwards)
+                    # Keep only poses with pose_index < (resume_from_pose - 1) since pose_index is 0-based
+                    rotation_data = [pose for pose in existing_poses 
+                                   if pose.get('pose_index', 0) < (resume_from_pose - 1)]
+                    
+                    removed_count = len(existing_poses) - len(rotation_data)
+                    if removed_count > 0:
+                        print(f"Removed {removed_count} poses that will be re-measured (poses {resume_from_pose} onwards)")
                     print(f"Loaded existing data for {len(rotation_data)} poses from {pose_data_path}")
                 except Exception as e:
                     print(f"Warning: Could not load existing pose data: {e}")
@@ -1825,8 +1834,8 @@ async def main(
                 cv2.imwrite(os.path.join(data_dir, f"image_pose_{actual_pose_number}.jpg"), debug_image)
 
             # Save pose data incrementally (in case of crash)
-            with open(os.path.join(data_dir, "pose_data.json"), "w") as f:
-                json.dump(rotation_data, f, indent=2)
+            with open(os.path.join(data_dir, "pose_data.json"), "w", encoding='utf-8') as f:
+                json.dump(rotation_data, f, indent=2, ensure_ascii=False)
             print(f"  Saved pose {actual_pose_number} data")
             
             print(f"\n  📊 HAND-EYE VERIFICATION ERRORS:")
@@ -1837,9 +1846,13 @@ async def main(
         
         # Generate comprehensive statistics and add to pose data
         print(f"\n=== GENERATING COMPREHENSIVE STATISTICS ===")
-        statistics = generate_comprehensive_statistics(rotation_data)
         
-        # Add statistics to the pose data
+        # For statistics, we use all poses (rotation_data already contains the cleaned data)
+        # rotation_data now contains: poses from before resume_from_pose + new poses from current run
+        all_poses_for_statistics = rotation_data.copy()
+        statistics = generate_comprehensive_statistics(all_poses_for_statistics)
+        
+        # Add statistics to the pose data (includes all poses: previous + current run)
         pose_data_with_stats = {
             "poses": rotation_data,
             "comprehensive_statistics": statistics
@@ -1847,16 +1860,18 @@ async def main(
         
         # Save updated pose data with statistics
         pose_data_file = os.path.join(data_dir, "pose_data.json")
-        with open(pose_data_file, "w") as f:
-            json.dump(pose_data_with_stats, f, indent=2)
+        with open(pose_data_file, "w", encoding='utf-8') as f:
+            json.dump(pose_data_with_stats, f, indent=2, ensure_ascii=False)
         print(f"Updated pose data with statistics saved to: {pose_data_file}")
         
         # Create comprehensive statistics plots
         print(f"\n=== CREATING COMPREHENSIVE STATISTICS PLOTS ===")
-        create_comprehensive_statistics_plot(rotation_data, data_dir)
+        create_comprehensive_statistics_plot(all_poses_for_statistics, data_dir)
         
         # Print summary statistics
         print(f"\n📊 SUMMARY STATISTICS:")
+        if resume_from_pose > 1:
+            print(f"Note: Statistics include all poses from previous runs and current run")
         print(f"Total poses tested: {statistics['total_poses']}")
         print(f"Successful poses: {statistics['successful_poses']}")
         print(f"Success rate: {statistics['success_rate']:.1%}")
