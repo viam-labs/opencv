@@ -6,6 +6,9 @@ import os
 import numpy as np
 import cv2
 import json
+import logging
+import sys
+import matplotlib.pyplot as plt
 from datetime import datetime
 from dotenv import load_dotenv
 from viam.robot.client import RobotClient
@@ -41,6 +44,47 @@ DEFAULT_VELOCITY_SLOW = 10
 DEFAULT_SETTLE_TIME = 5.0
 
 import cv2  # Make sure cv2 is imported
+
+def setup_logging(data_dir: str):
+    """Setup logging to both console and file"""
+    # Create log file path
+    log_file = os.path.join(data_dir, "pose_test_log.txt")
+    
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    
+    # Create a custom logger that captures print statements
+    class PrintLogger:
+        def __init__(self, log_file):
+            self.log_file = log_file
+            self.original_stdout = sys.stdout
+            self.original_stderr = sys.stderr
+            
+        def write(self, message):
+            if message.strip():  # Only log non-empty messages
+                with open(self.log_file, 'a') as f:
+                    # Add newline if message doesn't end with one (only for log file)
+                    log_message = message
+                    if not log_message.endswith('\n'):
+                        log_message = log_message + '\n'
+                    f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - {log_message}")
+            # Write original message to terminal (preserve original formatting)
+            self.original_stdout.write(message)
+            
+        def flush(self):
+            self.original_stdout.flush()
+    
+    # Redirect stdout to capture print statements
+    sys.stdout = PrintLogger(log_file)
+    
+    return log_file
 
 def rotation_error(R1, R2):
     """Compute rotation error in degrees between two rotation matrices."""
@@ -984,6 +1028,438 @@ def compute_hand_eye_verification_errors(T_hand_eye, T_delta_A_world_frame, T_de
         'translation_error': translation_error
     }
 
+async def perform_pose_measurement(camera, camera_matrix, dist_coeffs, marker_type, 
+                                 aruco_id, aruco_size, aruco_dict, pnp_method, 
+                                 use_sb_detection, data_dir, measurement_num, 
+                                 T_hand_eye, T_A_0_world_frame, T_B_0_camera_frame, 
+                                 A_0_pose_world_frame_raw, motion_service, arm_name, arm):
+    """
+    Perform a single pose measurement and return all relevant data.
+    
+    Returns:
+        dict with all measurement data including errors, sharpness, etc.
+    """
+    # Get camera image
+    image = await get_camera_image(camera)
+    
+    # Get marker pose
+    success, rvec, tvec, corners, marker_info = get_marker_pose_in_camera_frame(
+        image, camera_matrix, dist_coeffs, marker_type=marker_type,
+        chessboard_size=(11, 8), square_size=30.0,
+        aruco_id=aruco_id, aruco_size=aruco_size, aruco_dict=aruco_dict, 
+        pnp_method=pnp_method, use_sb_detection=use_sb_detection, data_dir=data_dir
+    )
+    
+    if not success:
+        return None
+    
+    # Get current arm pose for hand-eye verification
+    A_i_pose_world_frame_raw = await _get_current_arm_pose(motion_service, arm_name, arm)
+    # Invert only the rotation, keep translation unchanged
+    A_i_pose_world_frame = _invert_pose_rotation_only(A_i_pose_world_frame_raw)
+    T_A_i_world_frame = _pose_to_matrix(A_i_pose_world_frame)
+    
+    # Convert chessboard pose (don't transpose - solvePnP is OpenCV convention)
+    T_B_i_camera_frame = rvec_tvec_to_matrix(rvec, tvec)
+    
+    # Compute hand-eye verification errors for this measurement
+    T_delta_A_world_frame = np.linalg.inv(T_A_i_world_frame) @ T_A_0_world_frame
+    T_delta_B_camera_frame = T_B_i_camera_frame @ np.linalg.inv(T_B_0_camera_frame)
+    
+    hand_eye_errors = compute_hand_eye_verification_errors(
+        T_hand_eye,
+        T_delta_A_world_frame,
+        T_delta_B_camera_frame
+    )
+    
+    # Extract measurement data
+    measurement_data = {
+        'measurement_num': measurement_num,
+        'success': success,
+        'rvec': rvec.tolist() if rvec is not None else None,
+        'tvec': tvec.tolist() if tvec is not None else None,
+        'corners_count': len(corners) if corners is not None else 0,
+        'filtered_corners_count': len(corners) if corners is not None else 0,  # Will be updated by validation
+        'hand_eye_errors': hand_eye_errors
+    }
+    
+    # Add validation info if available
+    if marker_info:
+        measurement_data.update({
+            'mean_reprojection_error': float(marker_info.get('mean_reprojection_error', 0.0)),
+            'max_reprojection_error': float(marker_info.get('max_reprojection_error', 0.0)),
+            'sharpness': float(marker_info.get('sharpness', float('inf'))) if marker_info.get('sharpness') != float('inf') else float('inf')
+            # Note: Individual corner errors (one per detected corner) are not stored to reduce file size.
+            # Only aggregated statistics (mean, max) are saved.
+        })
+    
+    return measurement_data
+
+def calculate_measurement_statistics(measurements):
+    """
+    Calculate statistics from multiple measurements of the same pose.
+    
+    Args:
+        measurements: List of measurement dictionaries
+        
+    Returns:
+        dict with averaged statistics
+    """
+    if not measurements or len(measurements) == 0:
+        return None
+    
+    # Filter out failed measurements
+    valid_measurements = [m for m in measurements if m and m.get('success', False)]
+    
+    if len(valid_measurements) == 0:
+        return None
+    
+    # Calculate averages for numerical values
+    stats = {
+        'num_measurements': len(valid_measurements),
+        'success_rate': len(valid_measurements) / len(measurements),
+    }
+    
+    # Average reprojection errors
+    mean_errors = [m.get('mean_reprojection_error', 0) for m in valid_measurements]
+    max_errors = [m.get('max_reprojection_error', 0) for m in valid_measurements]
+    sharpness_values = [m.get('sharpness', float('inf')) for m in valid_measurements if m.get('sharpness') != float('inf')]
+    
+    # Hand-eye errors
+    rotation_errors = [m.get('hand_eye_errors', {}).get('rotation_error', 0) for m in valid_measurements]
+    translation_errors = [m.get('hand_eye_errors', {}).get('translation_error', 0) for m in valid_measurements]
+    
+    if mean_errors:
+        stats.update({
+            'mean_reprojection_error_avg': float(np.mean(mean_errors)),
+            'mean_reprojection_error_std': float(np.std(mean_errors)),
+            'mean_reprojection_error_min': float(np.min(mean_errors)),
+            'mean_reprojection_error_max': float(np.max(mean_errors)),
+        })
+    
+    if max_errors:
+        stats.update({
+            'max_reprojection_error_avg': float(np.mean(max_errors)),
+            'max_reprojection_error_std': float(np.std(max_errors)),
+            'max_reprojection_error_min': float(np.min(max_errors)),
+            'max_reprojection_error_max': float(np.max(max_errors)),
+        })
+    
+    if sharpness_values:
+        stats.update({
+            'sharpness_avg': float(np.mean(sharpness_values)),
+            'sharpness_std': float(np.std(sharpness_values)),
+            'sharpness_min': float(np.min(sharpness_values)),
+            'sharpness_max': float(np.max(sharpness_values)),
+        })
+    
+    # Average corner counts
+    corner_counts = [m.get('corners_count', 0) for m in valid_measurements]
+    if corner_counts:
+        stats.update({
+            'corners_count_avg': float(np.mean(corner_counts)),
+            'corners_count_std': float(np.std(corner_counts)),
+            'corners_count_min': float(np.min(corner_counts)),
+            'corners_count_max': float(np.max(corner_counts)),
+        })
+    
+    # Hand-eye error statistics
+    if rotation_errors:
+        stats.update({
+            'rotation_error_avg': float(np.mean(rotation_errors)),
+            'rotation_error_std': float(np.std(rotation_errors)),
+            'rotation_error_min': float(np.min(rotation_errors)),
+            'rotation_error_max': float(np.max(rotation_errors)),
+        })
+    
+    if translation_errors:
+        stats.update({
+            'translation_error_avg': float(np.mean(translation_errors)),
+            'translation_error_std': float(np.std(translation_errors)),
+            'translation_error_min': float(np.min(translation_errors)),
+            'translation_error_max': float(np.max(translation_errors)),
+        })
+    
+    return stats
+
+def generate_comprehensive_statistics(rotation_data):
+    """
+    Generate comprehensive statistics from all pose data.
+    
+    Args:
+        rotation_data: List of pose data dictionaries
+        
+    Returns:
+        dict with comprehensive statistics
+    """
+    if not rotation_data:
+        return {
+            'total_poses': 0,
+            'successful_poses': 0,
+            'success_rate': 0.0,
+            'hand_eye': {},
+            'reprojection': {},
+            'detection': {}
+        }
+    
+    # Basic counts
+    total_poses = len(rotation_data)
+    successful_poses = len([p for p in rotation_data if p.get('hand_eye_errors')])
+    success_rate = successful_poses / total_poses if total_poses > 0 else 0.0
+    
+    # Collect all data for statistics
+    rotation_errors = []
+    translation_errors = []
+    mean_reprojection_errors = []
+    max_reprojection_errors = []
+    sharpness_values = []
+    corner_counts = []
+    
+    for pose_data in rotation_data:
+        # Hand-eye errors
+        if 'hand_eye_errors' in pose_data:
+            hand_eye = pose_data['hand_eye_errors']
+            rotation_errors.append(hand_eye.get('rotation_error', 0))
+            translation_errors.append(hand_eye.get('translation_error', 0))
+        
+        # Measurement statistics
+        if 'measurement_statistics' in pose_data:
+            stats = pose_data['measurement_statistics']
+            if 'mean_reprojection_error_avg' in stats:
+                mean_reprojection_errors.append(stats['mean_reprojection_error_avg'])
+            if 'max_reprojection_error_avg' in stats:
+                max_reprojection_errors.append(stats['max_reprojection_error_avg'])
+            if 'sharpness_avg' in stats:
+                sharpness_values.append(stats['sharpness_avg'])
+            if 'corners_count_avg' in stats:
+                corner_counts.append(stats['corners_count_avg'])
+    
+    def calculate_stats(values):
+        """Calculate mean, std, min, max for a list of values"""
+        if not values:
+            return {'mean': 0, 'std': 0, 'min': 0, 'max': 0}
+        return {
+            'mean': float(np.mean(values)),
+            'std': float(np.std(values)),
+            'min': float(np.min(values)),
+            'max': float(np.max(values))
+        }
+    
+    statistics = {
+        'total_poses': total_poses,
+        'successful_poses': successful_poses,
+        'success_rate': success_rate,
+        'hand_eye': {
+            'rotation_error': calculate_stats(rotation_errors),
+            'translation_error': calculate_stats(translation_errors)
+        },
+        'reprojection': {
+            'mean_error': calculate_stats(mean_reprojection_errors),
+            'max_error': calculate_stats(max_reprojection_errors)
+        },
+        'detection': {
+            'sharpness': calculate_stats(sharpness_values),
+            'corners': calculate_stats(corner_counts)
+        }
+    }
+    
+    return statistics
+
+def create_comprehensive_statistics_plot(rotation_data, data_dir):
+    """
+    Create comprehensive statistics plots for all pose data.
+    
+    Args:
+        rotation_data: List of pose data dictionaries
+        data_dir: Directory to save the plot
+    """
+    if not rotation_data:
+        print("No data available for plotting")
+        return
+    
+    # Collect all measurement data for plotting
+    all_rotation_errors = []
+    all_translation_errors = []
+    all_mean_reprojection_errors = []
+    all_max_reprojection_errors = []
+    all_sharpness_values = []
+    all_corner_counts = []
+    pose_indices = []
+    
+    for i, pose_data in enumerate(rotation_data):
+        if 'measurements' in pose_data:
+            pose_indices.append(pose_data.get('pose_index', i))
+            
+            # Collect individual measurement data
+            for measurement in pose_data['measurements']:
+                if measurement and measurement.get('success', False):
+                    if 'hand_eye_errors' in measurement:
+                        all_rotation_errors.append(measurement['hand_eye_errors']['rotation_error'])
+                        all_translation_errors.append(measurement['hand_eye_errors']['translation_error'])
+                    if 'mean_reprojection_error' in measurement:
+                        all_mean_reprojection_errors.append(measurement['mean_reprojection_error'])
+                    if 'max_reprojection_error' in measurement:
+                        all_max_reprojection_errors.append(measurement['max_reprojection_error'])
+                    if 'sharpness' in measurement:
+                        all_sharpness_values.append(measurement['sharpness'])
+                    if 'corners_count' in measurement:
+                        all_corner_counts.append(measurement['corners_count'])
+    
+    if not all_rotation_errors:
+        print("No valid measurement data found for plotting")
+        return
+    
+    # Create comprehensive statistics plot
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    fig.suptitle('Comprehensive Pose Test Statistics', fontsize=16, fontweight='bold')
+    
+    # Plot 1: Hand-Eye Rotation Errors
+    axes[0, 0].hist(all_rotation_errors, bins=20, alpha=0.7, color='skyblue', edgecolor='black')
+    axes[0, 0].axvline(np.mean(all_rotation_errors), color='red', linestyle='--', linewidth=2, 
+                      label=f'Mean: {np.mean(all_rotation_errors):.3f}°')
+    axes[0, 0].set_xlabel('Rotation Error (degrees)')
+    axes[0, 0].set_ylabel('Frequency')
+    axes[0, 0].set_title('Hand-Eye Rotation Errors')
+    axes[0, 0].legend()
+    axes[0, 0].grid(True, alpha=0.3)
+    
+    # Plot 2: Hand-Eye Translation Errors
+    axes[0, 1].hist(all_translation_errors, bins=20, alpha=0.7, color='lightgreen', edgecolor='black')
+    axes[0, 1].axvline(np.mean(all_translation_errors), color='red', linestyle='--', linewidth=2,
+                      label=f'Mean: {np.mean(all_translation_errors):.3f}mm')
+    axes[0, 1].set_xlabel('Translation Error (mm)')
+    axes[0, 1].set_ylabel('Frequency')
+    axes[0, 1].set_title('Hand-Eye Translation Errors')
+    axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3)
+    
+    # Plot 3: Mean Reprojection Errors
+    axes[0, 2].hist(all_mean_reprojection_errors, bins=20, alpha=0.7, color='orange', edgecolor='black')
+    axes[0, 2].axvline(np.mean(all_mean_reprojection_errors), color='red', linestyle='--', linewidth=2,
+                      label=f'Mean: {np.mean(all_mean_reprojection_errors):.3f}px')
+    axes[0, 2].set_xlabel('Mean Reprojection Error (pixels)')
+    axes[0, 2].set_ylabel('Frequency')
+    axes[0, 2].set_title('Mean Reprojection Errors')
+    axes[0, 2].legend()
+    axes[0, 2].grid(True, alpha=0.3)
+    
+    # Plot 4: Max Reprojection Errors
+    axes[1, 0].hist(all_max_reprojection_errors, bins=20, alpha=0.7, color='pink', edgecolor='black')
+    axes[1, 0].axvline(np.mean(all_max_reprojection_errors), color='red', linestyle='--', linewidth=2,
+                      label=f'Mean: {np.mean(all_max_reprojection_errors):.3f}px')
+    axes[1, 0].set_xlabel('Max Reprojection Error (pixels)')
+    axes[1, 0].set_ylabel('Frequency')
+    axes[1, 0].set_title('Max Reprojection Errors')
+    axes[1, 0].legend()
+    axes[1, 0].grid(True, alpha=0.3)
+    
+    # Plot 5: Sharpness Values
+    axes[1, 1].hist(all_sharpness_values, bins=20, alpha=0.7, color='purple', edgecolor='black')
+    axes[1, 1].axvline(np.mean(all_sharpness_values), color='red', linestyle='--', linewidth=2,
+                      label=f'Mean: {np.mean(all_sharpness_values):.2f}px')
+    axes[1, 1].set_xlabel('Sharpness (pixels)')
+    axes[1, 1].set_ylabel('Frequency')
+    axes[1, 1].set_title('Chessboard Sharpness')
+    axes[1, 1].legend()
+    axes[1, 1].grid(True, alpha=0.3)
+    
+    # Plot 6: Corner Counts
+    axes[1, 2].hist(all_corner_counts, bins=20, alpha=0.7, color='brown', edgecolor='black')
+    axes[1, 2].axvline(np.mean(all_corner_counts), color='red', linestyle='--', linewidth=2,
+                      label=f'Mean: {np.mean(all_corner_counts):.1f}')
+    axes[1, 2].set_xlabel('Corner Count')
+    axes[1, 2].set_ylabel('Frequency')
+    axes[1, 2].set_title('Detected Corners')
+    axes[1, 2].legend()
+    axes[1, 2].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    # Save the plot
+    plot_file = os.path.join(data_dir, "comprehensive_statistics.png")
+    plt.savefig(plot_file, dpi=300, bbox_inches='tight')
+    print(f"Comprehensive statistics plot saved to: {plot_file}")
+    
+    # Also create a summary statistics table plot
+    create_summary_table_plot(rotation_data, data_dir)
+    
+    plt.close()
+
+def create_summary_table_plot(rotation_data, data_dir):
+    """
+    Create a summary statistics table plot.
+    
+    Args:
+        rotation_data: List of pose data dictionaries
+        data_dir: Directory to save the plot
+    """
+    if not rotation_data:
+        return
+    
+    # Calculate summary statistics
+    stats = generate_comprehensive_statistics(rotation_data)
+    
+    # Create table data
+    table_data = [
+        ['Metric', 'Mean', 'Std Dev', 'Min', 'Max'],
+        ['Rotation Error (°)', f"{stats['hand_eye']['rotation_error']['mean']:.3f}", 
+         f"{stats['hand_eye']['rotation_error']['std']:.3f}",
+         f"{stats['hand_eye']['rotation_error']['min']:.3f}",
+         f"{stats['hand_eye']['rotation_error']['max']:.3f}"],
+        ['Translation Error (mm)', f"{stats['hand_eye']['translation_error']['mean']:.3f}",
+         f"{stats['hand_eye']['translation_error']['std']:.3f}",
+         f"{stats['hand_eye']['translation_error']['min']:.3f}",
+         f"{stats['hand_eye']['translation_error']['max']:.3f}"],
+        ['Mean Reprojection (px)', f"{stats['reprojection']['mean_error']['mean']:.3f}",
+         f"{stats['reprojection']['mean_error']['std']:.3f}",
+         f"{stats['reprojection']['mean_error']['min']:.3f}",
+         f"{stats['reprojection']['mean_error']['max']:.3f}"],
+        ['Max Reprojection (px)', f"{stats['reprojection']['max_error']['mean']:.3f}",
+         f"{stats['reprojection']['max_error']['std']:.3f}",
+         f"{stats['reprojection']['max_error']['min']:.3f}",
+         f"{stats['reprojection']['max_error']['max']:.3f}"],
+        ['Sharpness (px)', f"{stats['detection']['sharpness']['mean']:.2f}",
+         f"{stats['detection']['sharpness']['std']:.2f}",
+         f"{stats['detection']['sharpness']['min']:.2f}",
+         f"{stats['detection']['sharpness']['max']:.2f}"],
+        ['Corner Count', f"{stats['detection']['corners']['mean']:.1f}",
+         f"{stats['detection']['corners']['std']:.1f}",
+         f"{stats['detection']['corners']['min']:.1f}",
+         f"{stats['detection']['corners']['max']:.1f}"]
+    ]
+    
+    # Create table plot
+    fig, ax = plt.subplots(figsize=(12, 8))
+    ax.axis('tight')
+    ax.axis('off')
+    
+    table = ax.table(cellText=table_data[1:], colLabels=table_data[0], 
+                    cellLoc='center', loc='center')
+    table.auto_set_font_size(False)
+    table.set_fontsize(12)
+    table.scale(1.2, 2)
+    
+    # Style the table
+    for i in range(len(table_data[0])):
+        table[(0, i)].set_facecolor('#40466e')
+        table[(0, i)].set_text_props(weight='bold', color='white')
+    
+    for i in range(1, len(table_data)):
+        for j in range(len(table_data[0])):
+            if i % 2 == 0:
+                table[(i, j)].set_facecolor('#f1f1f2')
+            else:
+                table[(i, j)].set_facecolor('white')
+    
+    plt.title('Comprehensive Statistics Summary', fontsize=16, fontweight='bold', pad=20)
+    
+    # Save the table plot
+    table_file = os.path.join(data_dir, "statistics_summary_table.png")
+    plt.savefig(table_file, dpi=300, bbox_inches='tight')
+    print(f"Statistics summary table saved to: {table_file}")
+    
+    plt.close()
+
 async def main(
     arm_name: str,
     pose_tracker_name: str,
@@ -996,6 +1472,8 @@ async def main(
     aruco_dict: str = '6X6_250',
     pnp_method: str = 'IPPE_SQUARE',
     use_sb_detection: bool = True,
+    resume_from_pose: int = 1,
+    data_dir: str = None,
 ):
     app_client: Optional[AppClient] = None
     machine: Optional[RobotClient] = None
@@ -1028,11 +1506,25 @@ async def main(
 
         camera_matrix, dist_coeffs = await get_camera_intrinsics(camera)
         
-        # Create directory for saving data (needed for histogram saving)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        data_dir = f"calibration_data_{timestamp}"
-        os.makedirs(data_dir, exist_ok=True)
-        print(f"\n=== SAVING DATA TO: {data_dir} ===")
+        # Create or use existing directory for saving data
+        if data_dir is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            data_dir = f"calibration_data_{timestamp}"
+            os.makedirs(data_dir, exist_ok=True)
+            print(f"\n=== CREATING NEW DATA DIRECTORY: {data_dir} ===")
+        else:
+            # Use existing directory, create if it doesn't exist
+            os.makedirs(data_dir, exist_ok=True)
+            print(f"\n=== USING EXISTING DATA DIRECTORY: {data_dir} ===")
+            # Extract timestamp from existing directory name for consistency
+            if data_dir.startswith("calibration_data_"):
+                timestamp = data_dir.replace("calibration_data_", "")
+            else:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Setup logging
+        log_file = setup_logging(data_dir)
+        print(f"Logging to: {log_file}")
         
         image = await get_camera_image(camera)
 
@@ -1093,6 +1585,28 @@ async def main(
         
         # List to store all rotation data
         rotation_data = []
+        
+        # If resuming, try to load existing pose data
+        if resume_from_pose > 1 and data_dir is not None:
+            pose_data_path = os.path.join(data_dir, "pose_data.json")
+            if os.path.exists(pose_data_path):
+                try:
+                    with open(pose_data_path, 'r') as f:
+                        data = json.load(f)
+                    # Handle both old format (list) and new format (dict with 'poses' key)
+                    if isinstance(data, list):
+                        rotation_data = data
+                    elif isinstance(data, dict) and 'poses' in data:
+                        rotation_data = data['poses']
+                    else:
+                        print(f"Warning: Unexpected data format in {pose_data_path}, starting fresh")
+                        rotation_data = []
+                    print(f"Loaded existing data for {len(rotation_data)} poses from {pose_data_path}")
+                except Exception as e:
+                    print(f"Warning: Could not load existing pose data: {e}")
+                    rotation_data = []
+            else:
+                print(f"Warning: No existing pose data found at {pose_data_path}, starting fresh")
 
         # Test the hand-eye transformation with provided poses
         if poses is None:
@@ -1116,9 +1630,22 @@ async def main(
         
 
         await arm.do_command({"set_vel": DEFAULT_VELOCITY_SLOW})
-        print(f"\n=== TESTING {len(poses)} POSES ===")
-        for i, pose_spec in enumerate(poses):
-            print(f"\n=== POSE {i+1}/{len(poses)} ===")
+        
+        # Validate resume_from_pose parameter
+        if resume_from_pose < 1 or resume_from_pose > len(poses):
+            print(f"ERROR: resume_from_pose ({resume_from_pose}) must be between 1 and {len(poses)}")
+            return
+        
+        # Calculate the actual start index (0-based)
+        start_index = resume_from_pose - 1
+        poses_to_test = poses[start_index:]
+        
+        print(f"\n=== TESTING {len(poses_to_test)} POSES (resuming from pose {resume_from_pose}) ===")
+        print(f"Each pose will be measured 3 times for statistical analysis")
+        
+        for i, pose_spec in enumerate(poses_to_test):
+            actual_pose_number = start_index + i + 1
+            print(f"\n=== POSE {actual_pose_number}/{len(poses)} ===")
 
             # Create target pose from specification
             if isinstance(pose_spec, dict):
@@ -1143,26 +1670,58 @@ async def main(
             await motion_service.move(component_name=arm.name, destination=target_pose_in_frame)
             await asyncio.sleep(DEFAULT_SETTLE_TIME)  # Increased settling time to reduce motion blur
             
-            image = await get_camera_image(camera)
-            success, rvec, tvec, _, marker_info = get_marker_pose_in_camera_frame(
-                image, camera_matrix, dist_coeffs, marker_type=marker_type,
-                chessboard_size=(11, 8), square_size=30.0,
-                aruco_id=aruco_id, aruco_size=aruco_size, aruco_dict=aruco_dict, pnp_method=pnp_method, use_sb_detection=use_sb_detection, data_dir=data_dir
-            )
-            if not success:
-                print(f"  Failed to detect {marker_type}, skipping pose {i+1}")
+            # Perform 3 measurements for this pose
+            measurements = []
+            for measurement_num in range(1, 4):
+                print(f"  Measurement {measurement_num}/3...")
+                measurement = await perform_pose_measurement(
+                    camera, camera_matrix, dist_coeffs, marker_type,
+                    aruco_id, aruco_size, aruco_dict, pnp_method,
+                    use_sb_detection, data_dir, measurement_num,
+                    T_hand_eye, T_A_0_world_frame, T_B_0_camera_frame,
+                    A_0_pose_world_frame_raw, motion_service, arm_name, arm
+                )
+                measurements.append(measurement)
+                
+                if measurement is None:
+                    print(f"    Failed to detect {marker_type} in measurement {measurement_num}")
+                else:
+                    hand_eye_errors = measurement.get('hand_eye_errors', {})
+                    print(f"    Success: reprojection error={measurement.get('mean_reprojection_error', 0):.3f}px, sharpness={measurement.get('sharpness', 0):.2f}px, rotation error={hand_eye_errors.get('rotation_error', 0):.3f}°, translation error={hand_eye_errors.get('translation_error', 0):.3f}mm")
+                
+                # Small delay between measurements
+                if measurement_num < 3:
+                    await asyncio.sleep(1.0)
+            
+            # Calculate statistics from measurements
+            measurement_stats = calculate_measurement_statistics(measurements)
+            
+            if measurement_stats is None or measurement_stats.get('success_rate', 0) == 0:
+                print(f"  All measurements failed for pose {actual_pose_number}, skipping")
                 continue
             
-            if marker_type == 'aruco':
-                print(f"  Detected ArUco marker ID: {marker_info}")
+            print(f"  Measurement statistics:")
+            print(f"    Success rate: {measurement_stats['success_rate']:.1%}")
+            print(f"    Avg reprojection error: {measurement_stats.get('mean_reprojection_error_avg', 0):.3f}±{measurement_stats.get('mean_reprojection_error_std', 0):.3f}px")
+            print(f"    Avg sharpness: {measurement_stats.get('sharpness_avg', 0):.2f}±{measurement_stats.get('sharpness_std', 0):.2f}px")
+            print(f"    Avg corners: {measurement_stats.get('corners_count_avg', 0):.1f}±{measurement_stats.get('corners_count_std', 0):.1f}")
+            print(f"    Avg rotation error: {measurement_stats.get('rotation_error_avg', 0):.3f}±{measurement_stats.get('rotation_error_std', 0):.3f}°")
+            print(f"    Avg translation error: {measurement_stats.get('translation_error_avg', 0):.3f}±{measurement_stats.get('translation_error_std', 0):.3f}mm")
 
-            # Get current poses
+            # Get current arm pose for pose data
             A_i_pose_world_frame_raw = await _get_current_arm_pose(motion_service, arm.name, arm)
             # Invert only the rotation, keep translation unchanged
             A_i_pose_world_frame = _invert_pose_rotation_only(A_i_pose_world_frame_raw)
-            T_A_i_world_frame = _pose_to_matrix(A_i_pose_world_frame)
 
+            # Use the first successful measurement for pose data
+            successful_measurement = next((m for m in measurements if m and m.get('success', False)), None)
+            if successful_measurement is None:
+                print(f"  No successful measurements for pose data, skipping pose {actual_pose_number}")
+                continue
+                
             # Convert chessboard pose (don't transpose - solvePnP is OpenCV convention)
+            rvec = np.array(successful_measurement['rvec'])
+            tvec = np.array(successful_measurement['tvec'])
             T_B_i_camera_frame = rvec_tvec_to_matrix(rvec, tvec)
             
             # Save pose data
@@ -1180,8 +1739,38 @@ async def main(
             else:
                 pose_spec_dict = pose_spec
             
+            # Use the average hand-eye errors from all successful measurements
+            successful_measurements = [m for m in measurements if m and m.get('success', False)]
+            if successful_measurements:
+                avg_rotation_error = np.mean([m.get('hand_eye_errors', {}).get('rotation_error', 0) for m in successful_measurements])
+                avg_translation_error = np.mean([m.get('hand_eye_errors', {}).get('translation_error', 0) for m in successful_measurements])
+                hand_eye_errors = {
+                    'rotation_error': float(avg_rotation_error),
+                    'translation_error': float(avg_translation_error)
+                }
+            else:
+                hand_eye_errors = {'rotation_error': 0, 'translation_error': 0}
+            
+            # Create detailed measurement results with individual values and averages
+            measurement_results = []
+            for measurement in measurements:
+                if measurement and measurement.get('success', False):
+                    measurement_result = {
+                        "measurement_num": measurement['measurement_num'],
+                        "success": measurement['success'],
+                        "rvec": measurement['rvec'],
+                        "tvec": measurement['tvec'],
+                        "corners_count": measurement['corners_count'],
+                        "filtered_corners_count": measurement['filtered_corners_count'],
+                        "hand_eye_errors": measurement['hand_eye_errors'],
+                        "mean_reprojection_error": measurement['mean_reprojection_error'],
+                        "max_reprojection_error": measurement['max_reprojection_error'],
+                        "sharpness": measurement['sharpness']
+                    }
+                    measurement_results.append(measurement_result)
+            
             pose_info = {
-                "pose_index": i,
+                "pose_index": actual_pose_number - 1,  # Store 0-based index for consistency
                 "pose_spec": pose_spec_dict,
                 "A_i_pose_raw": {
                     "x": A_i_pose_world_frame_raw.x,
@@ -1203,52 +1792,103 @@ async def main(
                 },
                 "rvec": rvec.tolist(),
                 "tvec": tvec.tolist(),
-                "T_B_i_camera_frame": T_B_i_camera_frame.tolist()
+                "T_B_i_camera_frame": T_B_i_camera_frame.tolist(),
+                "hand_eye_errors": hand_eye_errors,
+                "measurements": measurement_results,
+                "measurement_statistics": measurement_stats,
+                "summary": {
+                    "num_measurements": len(measurement_results),
+                    "success_rate": len(measurement_results) / 3.0,
+                    "hand_eye_errors": {
+                        "rotation_error": f"{hand_eye_errors['rotation_error']:.3f}°",
+                        "translation_error": f"{hand_eye_errors['translation_error']:.3f}mm"
+                    },
+                    "reprojection_errors": {
+                        "mean_error": f"{measurement_stats.get('mean_reprojection_error_avg', 0):.3f}±{measurement_stats.get('mean_reprojection_error_std', 0):.3f}px",
+                        "max_error": f"{measurement_stats.get('max_reprojection_error_avg', 0):.3f}±{measurement_stats.get('max_reprojection_error_std', 0):.3f}px"
+                    },
+                    "detection_quality": {
+                        "sharpness": f"{measurement_stats.get('sharpness_avg', 0):.2f}±{measurement_stats.get('sharpness_std', 0):.2f}px",
+                        "corners": f"{measurement_stats.get('corners_count_avg', 0):.1f}±{measurement_stats.get('corners_count_std', 0):.1f}"
+                    }
+                }
             }
             rotation_data.append(pose_info)
 
-            # Save image for this pose
-            # Save pose image with debug visualization
-            debug_image = draw_marker_debug(image, rvec, tvec, camera_matrix, dist_coeffs, 
-                                          marker_type=marker_type, aruco_size=aruco_size, validation_info=marker_info)
-            cv2.imwrite(os.path.join(data_dir, f"image_pose_{i+1}.jpg"), debug_image)
+            # Save image for this pose (use the first successful measurement's image)
+            if successful_measurement:
+                # Get a fresh image for visualization
+                image = await get_camera_image(camera)
+                debug_image = draw_marker_debug(image, rvec, tvec, camera_matrix, dist_coeffs, 
+                                              marker_type=marker_type, aruco_size=aruco_size, 
+                                              validation_info=successful_measurement)
+                cv2.imwrite(os.path.join(data_dir, f"image_pose_{actual_pose_number}.jpg"), debug_image)
 
             # Save pose data incrementally (in case of crash)
             with open(os.path.join(data_dir, "pose_data.json"), "w") as f:
                 json.dump(rotation_data, f, indent=2)
-            print(f"  Saved pose {i+1} data")
+            print(f"  Saved pose {actual_pose_number} data")
             
-            # Compute relative transformations
-            T_delta_A_world_frame = np.linalg.inv(T_A_i_world_frame) @ T_A_0_world_frame
-            T_delta_B_camera_frame = T_B_i_camera_frame @ np.linalg.inv(T_B_0_camera_frame)
-
-            # ADD THIS: Detailed debug analysis
-            # best_method = analyze_hand_eye_error(
-            #     T_hand_eye, 
-            #     T_delta_A_world_frame, 
-            #     T_delta_B_camera_frame,
-            #     A_0_pose_world_frame_raw,
-            #     A_i_pose_world_frame_raw,
-            #     i+1
-            # )
-
-            # Compute verification errors (keep your existing code)
-            errors = compute_hand_eye_verification_errors(
-                T_hand_eye,
-                T_delta_A_world_frame,
-                T_delta_B_camera_frame
-            )
-
-            print(f"\n  📊 CURRENT METHOD ERRORS:")
-            print(f"  Rotation error: {errors['rotation_error']:.3f}°")
-            print(f"  Translation error: {errors['translation_error']:.3f} mm")
+            print(f"\n  📊 HAND-EYE VERIFICATION ERRORS:")
+            print(f"  Rotation error: {hand_eye_errors['rotation_error']:.3f}°")
+            print(f"  Translation error: {hand_eye_errors['translation_error']:.3f} mm")
 
             await asyncio.sleep(1.0)
         
+        # Generate comprehensive statistics and add to pose data
+        print(f"\n=== GENERATING COMPREHENSIVE STATISTICS ===")
+        statistics = generate_comprehensive_statistics(rotation_data)
+        
+        # Add statistics to the pose data
+        pose_data_with_stats = {
+            "poses": rotation_data,
+            "comprehensive_statistics": statistics
+        }
+        
+        # Save updated pose data with statistics
+        pose_data_file = os.path.join(data_dir, "pose_data.json")
+        with open(pose_data_file, "w") as f:
+            json.dump(pose_data_with_stats, f, indent=2)
+        print(f"Updated pose data with statistics saved to: {pose_data_file}")
+        
+        # Create comprehensive statistics plots
+        print(f"\n=== CREATING COMPREHENSIVE STATISTICS PLOTS ===")
+        create_comprehensive_statistics_plot(rotation_data, data_dir)
+        
+        # Print summary statistics
+        print(f"\n📊 SUMMARY STATISTICS:")
+        print(f"Total poses tested: {statistics['total_poses']}")
+        print(f"Successful poses: {statistics['successful_poses']}")
+        print(f"Success rate: {statistics['success_rate']:.1%}")
+        
+        print(f"\n🎯 HAND-EYE VERIFICATION ERRORS:")
+        print(f"Rotation error: {statistics['hand_eye']['rotation_error']['mean']:.3f}° ± {statistics['hand_eye']['rotation_error']['std']:.3f}°")
+        print(f"  Range: {statistics['hand_eye']['rotation_error']['min']:.3f}° - {statistics['hand_eye']['rotation_error']['max']:.3f}°")
+        print(f"Translation error: {statistics['hand_eye']['translation_error']['mean']:.3f}mm ± {statistics['hand_eye']['translation_error']['std']:.3f}mm")
+        print(f"  Range: {statistics['hand_eye']['translation_error']['min']:.3f}mm - {statistics['hand_eye']['translation_error']['max']:.3f}mm")
+        
+        print(f"\n📐 REPROJECTION ERRORS:")
+        print(f"Mean reprojection error: {statistics['reprojection']['mean_error']['mean']:.3f}px ± {statistics['reprojection']['mean_error']['std']:.3f}px")
+        print(f"  Range: {statistics['reprojection']['mean_error']['min']:.3f}px - {statistics['reprojection']['mean_error']['max']:.3f}px")
+        print(f"Max reprojection error: {statistics['reprojection']['max_error']['mean']:.3f}px ± {statistics['reprojection']['max_error']['std']:.3f}px")
+        print(f"  Range: {statistics['reprojection']['max_error']['min']:.3f}px - {statistics['reprojection']['max_error']['max']:.3f}px")
+        
+        print(f"\n🔍 CHESSBOARD DETECTION QUALITY:")
+        print(f"Sharpness: {statistics['detection']['sharpness']['mean']:.2f}px ± {statistics['detection']['sharpness']['std']:.2f}px")
+        print(f"  Range: {statistics['detection']['sharpness']['min']:.2f}px - {statistics['detection']['sharpness']['max']:.2f}px")
+        print(f"Corners detected: {statistics['detection']['corners']['mean']:.1f} ± {statistics['detection']['corners']['std']:.1f}")
+        print(f"  Range: {statistics['detection']['corners']['min']:.0f} - {statistics['detection']['corners']['max']:.0f}")
+        
         print(f"\n✅ ALL DATA SAVED TO: {data_dir}")
         print(f"   - calibration_config.json (camera params, hand-eye, reference pose)")
-        print(f"   - image_reference.jpg + image_pose_1-{len(poses)}.jpg")
-        print(f"   - pose_data.json (all arm poses and chessboard detections)")
+        print(f"   - pose_data.json (all arm poses, measurements, and comprehensive statistics)")
+        print(f"   - pose_test_log.txt (complete log file)")
+        print(f"   - comprehensive_statistics.png (comprehensive statistics plots)")
+        print(f"   - statistics_summary_table.png (statistics summary table)")
+        if resume_from_pose == 1:
+            print(f"   - image_reference.jpg + image_pose_1-{len(poses)}.jpg")
+        else:
+            print(f"   - image_reference.jpg + image_pose_{resume_from_pose}-{len(poses)}.jpg")
         
         # Return to reference pose
         print(f"\n=== RETURNING TO REFERENCE POSE ===")
@@ -1276,9 +1916,15 @@ if __name__ == '__main__':
         description='Test hand-eye calibration by moving robot and verifying transformations',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Example:
+Examples:
+  # Start new test
   python pose_test_script.py --camera-name sensing-camera --arm-name myarm \\
     --pose-tracker-name mytracker --poses poses.json
+
+  # Resume from pose 27, continuing to save in existing directory
+  python pose_test_script.py --camera-name sensing-camera --arm-name myarm \\
+    --pose-tracker-name mytracker --poses poses.json --resume-from-pose 27 \\
+    --data-dir calibration_data_20251029_180338
 
 Pose JSON format (list of pose objects):
   [
@@ -1355,6 +2001,18 @@ All pose objects must have: x, y, z, o_x, o_y, o_z, theta
         action='store_true',
         help='Use findChessboardCornersSB (subpixel detection) instead of findChessboardCorners for chessboard'
     )
+    parser.add_argument(
+        '--resume-from-pose',
+        type=int,
+        default=1,
+        help='Resume testing from this pose number (1-based indexing, default: 1)'
+    )
+    parser.add_argument(
+        '--data-dir',
+        type=str,
+        default=None,
+        help='Directory to save/continue saving data. Use this when resuming to continue saving to the same directory. If not provided, creates new timestamped directory.'
+    )
 
     args = parser.parse_args()
 
@@ -1382,4 +2040,6 @@ All pose objects must have: x, y, z, o_x, o_y, o_z, theta
         aruco_dict=args.aruco_dict,
         pnp_method=args.pnp_method,
         use_sb_detection=args.use_sb_detection,
+        resume_from_pose=args.resume_from_pose,
+        data_dir=args.data_dir,
     ))
