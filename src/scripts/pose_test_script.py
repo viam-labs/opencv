@@ -1866,42 +1866,56 @@ async def main(
             print("ERROR: Could not retrieve hand-eye transformation")
             return
 
-        # Get initial poses
-        if reference_pose is not None:
-            print(f"\n=== MOVING TO REFERENCE POSE ===")
-            print(f"Reference pose: x={reference_pose['x']:.1f}, y={reference_pose['y']:.1f}, z={reference_pose['z']:.1f}")
-            print(f"Orientation: o_x={reference_pose['o_x']:.3f}, o_y={reference_pose['o_y']:.3f}, o_z={reference_pose['o_z']:.3f}, theta={reference_pose['theta']:.1f}°")
-            
-            # Convert reference pose dict to Viam Pose
-            reference_pose_viam = Pose(
-                x=reference_pose['x'],
-                y=reference_pose['y'], 
-                z=reference_pose['z'],
-                o_x=reference_pose['o_x'],
-                o_y=reference_pose['o_y'],
-                o_z=reference_pose['o_z'],
-                theta=reference_pose['theta']
-            )
-            
-            # Move to reference pose
-            reference_pose_in_frame = PoseInFrame(reference_frame=DEFAULT_WORLD_FRAME, pose=reference_pose_viam)
-            await motion_service.move(component_name=arm.name, destination=reference_pose_in_frame)
-            await asyncio.sleep(2.0)  # Settle time
-            
-            print(f"✅ Moved to reference pose")
-            # print(f"⏸️  PAUSING FOR EVALUATION - Press Enter to continue...")
-            # input()  # Pause for user evaluation
-            
-            # Get the actual pose after movement
-            A_0_pose_world_frame_raw = await _get_current_arm_pose(motion_service, arm.name, arm)
-        else:
-            print(f"\n=== USING CURRENT ARM POSITION AS REFERENCE ===")
-            A_0_pose_world_frame_raw = await _get_current_arm_pose(motion_service, arm.name, arm)
-            print(f"Current pose: x={A_0_pose_world_frame_raw.x:.1f}, y={A_0_pose_world_frame_raw.y:.1f}, z={A_0_pose_world_frame_raw.z:.1f}")
+        # Check if we're resuming (to skip reference pose movement)
+        calibration_config_path_check = os.path.join(data_dir, "calibration_config.json") if data_dir else None
+        is_resuming_check = resume_from_pose > 1
+        has_existing_config_check = calibration_config_path_check and os.path.exists(calibration_config_path_check)
         
-        # Invert only the rotation, keep translation unchanged
-        A_0_pose_world_frame = _invert_pose_rotation_only(A_0_pose_world_frame_raw)
-        T_A_0_world_frame = _pose_to_matrix(A_0_pose_world_frame)
+        # Get initial poses (skip if resuming and config exists)
+        if not (is_resuming_check and has_existing_config_check):
+            if reference_pose is not None:
+                print(f"\n=== MOVING TO REFERENCE POSE ===")
+                print(f"Reference pose: x={reference_pose['x']:.1f}, y={reference_pose['y']:.1f}, z={reference_pose['z']:.1f}")
+                print(f"Orientation: o_x={reference_pose['o_x']:.3f}, o_y={reference_pose['o_y']:.3f}, o_z={reference_pose['o_z']:.3f}, theta={reference_pose['theta']:.1f}°")
+                
+                # Convert reference pose dict to Viam Pose
+                reference_pose_viam = Pose(
+                    x=reference_pose['x'],
+                    y=reference_pose['y'], 
+                    z=reference_pose['z'],
+                    o_x=reference_pose['o_x'],
+                    o_y=reference_pose['o_y'],
+                    o_z=reference_pose['o_z'],
+                    theta=reference_pose['theta']
+                )
+                
+                # Move to reference pose
+                reference_pose_in_frame = PoseInFrame(reference_frame=DEFAULT_WORLD_FRAME, pose=reference_pose_viam)
+                await motion_service.move(component_name=arm.name, destination=reference_pose_in_frame)
+                await asyncio.sleep(2.0)  # Settle time
+                
+                print(f"✅ Moved to reference pose")
+                # print(f"⏸️  PAUSING FOR EVALUATION - Press Enter to continue...")
+                # input()  # Pause for user evaluation
+                
+                # Get the actual pose after movement
+                A_0_pose_world_frame_raw = await _get_current_arm_pose(motion_service, arm.name, arm)
+            else:
+                print(f"\n=== USING CURRENT ARM POSITION AS REFERENCE ===")
+                A_0_pose_world_frame_raw = await _get_current_arm_pose(motion_service, arm.name, arm)
+                print(f"Current pose: x={A_0_pose_world_frame_raw.x:.1f}, y={A_0_pose_world_frame_raw.y:.1f}, z={A_0_pose_world_frame_raw.z:.1f}")
+        else:
+            # When resuming, we'll load A_0_pose_world_frame_raw from config later
+            # For now, just set it to None as a placeholder
+            A_0_pose_world_frame_raw = None
+            # Also set these as placeholders, will be loaded from config
+            A_0_pose_world_frame = None
+            T_A_0_world_frame = None
+        
+        # Invert only the rotation, keep translation unchanged (only if not resuming)
+        if A_0_pose_world_frame_raw is not None:
+            A_0_pose_world_frame = _invert_pose_rotation_only(A_0_pose_world_frame_raw)
+            T_A_0_world_frame = _pose_to_matrix(A_0_pose_world_frame)
 
         camera_matrix, dist_coeffs = await get_camera_intrinsics(camera)
         
@@ -1934,73 +1948,128 @@ async def main(
         start_time = datetime.now()
         print(f"Test started at: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
         
-        image = await get_camera_image(camera)
+        # Check if we're resuming and if calibration config exists
+        calibration_config_path = os.path.join(data_dir, "calibration_config.json")
+        is_resuming = resume_from_pose > 1
+        has_existing_config = os.path.exists(calibration_config_path)
+        
+        if is_resuming and has_existing_config:
+            # Load existing reference pose data
+            print(f"\n=== LOADING EXISTING REFERENCE POSE FROM CONFIG ===")
+            try:
+                with open(calibration_config_path, 'r') as f:
+                    existing_config = json.load(f)
+                
+                # Load A_0_pose_raw and reconstruct the Pose object
+                A_0_raw_dict = existing_config.get('A_0_pose_raw', {})
+                A_0_pose_world_frame_raw = Pose(
+                    x=A_0_raw_dict['x'],
+                    y=A_0_raw_dict['y'],
+                    z=A_0_raw_dict['z'],
+                    o_x=A_0_raw_dict['o_x'],
+                    o_y=A_0_raw_dict['o_y'],
+                    o_z=A_0_raw_dict['o_z'],
+                    theta=A_0_raw_dict['theta']
+                )
+                
+                # Load A_0_pose_inverted
+                A_0_inv_dict = existing_config.get('A_0_pose_inverted', {})
+                A_0_pose_world_frame = Pose(
+                    x=A_0_inv_dict['x'],
+                    y=A_0_inv_dict['y'],
+                    z=A_0_inv_dict['z'],
+                    o_x=A_0_inv_dict['o_x'],
+                    o_y=A_0_inv_dict['o_y'],
+                    o_z=A_0_inv_dict['o_z'],
+                    theta=A_0_inv_dict['theta']
+                )
+                
+                # Reconstruct T_A_0_world_frame and T_B_0_camera_frame
+                T_A_0_world_frame = _pose_to_matrix(A_0_pose_world_frame)
+                T_B_0_camera_frame = np.array(existing_config.get('T_B_0_camera_frame', []))
+                
+                reference_camera_temperature = existing_config.get('reference_camera_temperature', {})
+                
+                print(f"✅ Loaded existing reference pose:")
+                print(f"  Position: ({A_0_pose_world_frame_raw.x:.1f}, {A_0_pose_world_frame_raw.y:.1f}, {A_0_pose_world_frame_raw.z:.1f})")
+                print(f"  Orientation: ({A_0_pose_world_frame_raw.o_x:.3f}, {A_0_pose_world_frame_raw.o_y:.3f}, {A_0_pose_world_frame_raw.o_z:.3f}) @ {A_0_pose_world_frame_raw.theta:.1f}°")
+                print(f"  Reference temperature: RGB={reference_camera_temperature.get('rgb_temp_c', 'N/A'):.1f}°C, "
+                      f"Main Board={reference_camera_temperature.get('main_board_temp_c', 'N/A'):.1f}°C")
+                
+            except Exception as e:
+                print(f"⚠️  Warning: Could not load existing config: {e}")
+                print(f"   Will capture new reference pose instead...")
+                has_existing_config = False  # Fall through to capture new reference
+        
+        if not (is_resuming and has_existing_config):
+            # Capture new reference pose (either not resuming or config doesn't exist)
+            image = await get_camera_image(camera)
 
-        # Capture camera temperature for reference pose
-        try:
-            temp_response = await camera.do_command({"get_camera_temperature": {}})
-            reference_camera_temperature = temp_response.get("get_camera_temperature", {})
-            print(f"Reference pose camera temperature: RGB={reference_camera_temperature.get('rgb_temp_c', 'N/A'):.1f}°C, "
-                  f"Main Board={reference_camera_temperature.get('main_board_temp_c', 'N/A'):.1f}°C")
-        except Exception as e:
-            print(f"Warning: Could not get camera temperature for reference pose: {e}")
-            reference_camera_temperature = {}
+            # Capture camera temperature for reference pose
+            try:
+                temp_response = await camera.do_command({"get_camera_temperature": {}})
+                reference_camera_temperature = temp_response.get("get_camera_temperature", {})
+                print(f"Reference pose camera temperature: RGB={reference_camera_temperature.get('rgb_temp_c', 'N/A'):.1f}°C, "
+                      f"Main Board={reference_camera_temperature.get('main_board_temp_c', 'N/A'):.1f}°C")
+            except Exception as e:
+                print(f"Warning: Could not get camera temperature for reference pose: {e}")
+                reference_camera_temperature = {}
 
-        success, rvec, tvec, _, marker_info = get_marker_pose_in_camera_frame(
-            image, camera_matrix, dist_coeffs, marker_type=marker_type,
-            chessboard_size=(11, 8), square_size=30.0,
-            aruco_id=aruco_id, aruco_size=aruco_size, aruco_dict=aruco_dict, pnp_method=pnp_method, use_sb_detection=use_sb_detection, data_dir=data_dir
-        )
-        if not success:
-            print(f"Failed to detect {marker_type} in reference image")
-            return
-        
-        if marker_type == 'aruco':
-            print(f"Detected ArUco marker ID: {marker_info}")
-        
-        # Convert rvec, tvec to 4x4 transformation matrix (chessboard in camera frame)
-        # Don't transpose - solvePnP output is already in OpenCV convention
-        T_B_0_camera_frame = rvec_tvec_to_matrix(rvec, tvec)
-        
-        # Save camera calibration and chessboard config
-        calibration_data = {
-            "camera_matrix": camera_matrix.tolist(),
-            "dist_coeffs": dist_coeffs.tolist(),
-            "chessboard_size": [11, 8],  # (width, height)
-            "square_size": 30.0,  # mm
-            "hand_eye_transform": T_hand_eye.tolist() if T_hand_eye is not None else None,
-            "timestamp": timestamp,
-            "A_0_pose_raw": {
-                "x": A_0_pose_world_frame_raw.x,
-                "y": A_0_pose_world_frame_raw.y,
-                "z": A_0_pose_world_frame_raw.z,
-                "o_x": A_0_pose_world_frame_raw.o_x,
-                "o_y": A_0_pose_world_frame_raw.o_y,
-                "o_z": A_0_pose_world_frame_raw.o_z,
-                "theta": A_0_pose_world_frame_raw.theta
-            },
-            "A_0_pose_inverted": {
-                "x": A_0_pose_world_frame.x,
-                "y": A_0_pose_world_frame.y,
-                "z": A_0_pose_world_frame.z,
-                "o_x": A_0_pose_world_frame.o_x,
-                "o_y": A_0_pose_world_frame.o_y,
-                "o_z": A_0_pose_world_frame.o_z,
-                "theta": A_0_pose_world_frame.theta
-            },
-            "T_B_0_camera_frame": T_B_0_camera_frame.tolist(),
-            "reference_camera_temperature": reference_camera_temperature,
-            "note": "Arm poses have rotation inverted (translation unchanged) before processing"
-        }
-        with open(os.path.join(data_dir, "calibration_config.json"), "w", encoding='utf-8') as f:
-            json.dump(calibration_data, f, indent=2, ensure_ascii=False)
-        
-        # Save reference image
-        # Save reference image with debug visualization
-        debug_image = draw_marker_debug(image, rvec, tvec, camera_matrix, dist_coeffs, 
-                                      marker_type=marker_type, aruco_size=aruco_size, validation_info=marker_info)
-        cv2.imwrite(os.path.join(data_dir, "image_reference.jpg"), debug_image)
-        print(f"Saved reference image and config")
+            success, rvec, tvec, _, marker_info = get_marker_pose_in_camera_frame(
+                image, camera_matrix, dist_coeffs, marker_type=marker_type,
+                chessboard_size=(11, 8), square_size=30.0,
+                aruco_id=aruco_id, aruco_size=aruco_size, aruco_dict=aruco_dict, pnp_method=pnp_method, use_sb_detection=use_sb_detection, data_dir=data_dir
+            )
+            if not success:
+                print(f"Failed to detect {marker_type} in reference image")
+                return
+            
+            if marker_type == 'aruco':
+                print(f"Detected ArUco marker ID: {marker_info}")
+            
+            # Convert rvec, tvec to 4x4 transformation matrix (chessboard in camera frame)
+            # Don't transpose - solvePnP output is already in OpenCV convention
+            T_B_0_camera_frame = rvec_tvec_to_matrix(rvec, tvec)
+            
+            # Save camera calibration and chessboard config (only when capturing new reference)
+            calibration_data = {
+                "camera_matrix": camera_matrix.tolist(),
+                "dist_coeffs": dist_coeffs.tolist(),
+                "chessboard_size": [11, 8],  # (width, height)
+                "square_size": 30.0,  # mm
+                "hand_eye_transform": T_hand_eye.tolist() if T_hand_eye is not None else None,
+                "timestamp": timestamp,
+                "A_0_pose_raw": {
+                    "x": A_0_pose_world_frame_raw.x,
+                    "y": A_0_pose_world_frame_raw.y,
+                    "z": A_0_pose_world_frame_raw.z,
+                    "o_x": A_0_pose_world_frame_raw.o_x,
+                    "o_y": A_0_pose_world_frame_raw.o_y,
+                    "o_z": A_0_pose_world_frame_raw.o_z,
+                    "theta": A_0_pose_world_frame_raw.theta
+                },
+                "A_0_pose_inverted": {
+                    "x": A_0_pose_world_frame.x,
+                    "y": A_0_pose_world_frame.y,
+                    "z": A_0_pose_world_frame.z,
+                    "o_x": A_0_pose_world_frame.o_x,
+                    "o_y": A_0_pose_world_frame.o_y,
+                    "o_z": A_0_pose_world_frame.o_z,
+                    "theta": A_0_pose_world_frame.theta
+                },
+                "T_B_0_camera_frame": T_B_0_camera_frame.tolist(),
+                "reference_camera_temperature": reference_camera_temperature,
+                "note": "Arm poses have rotation inverted (translation unchanged) before processing"
+            }
+            with open(os.path.join(data_dir, "calibration_config.json"), "w", encoding='utf-8') as f:
+                json.dump(calibration_data, f, indent=2, ensure_ascii=False)
+            
+            # Save reference image
+            # Save reference image with debug visualization
+            debug_image = draw_marker_debug(image, rvec, tvec, camera_matrix, dist_coeffs, 
+                                          marker_type=marker_type, aruco_size=aruco_size, validation_info=marker_info)
+            cv2.imwrite(os.path.join(data_dir, "image_reference.jpg"), debug_image)
+            print(f"Saved reference image and config")
         
         # List to store all rotation data
         rotation_data = []
