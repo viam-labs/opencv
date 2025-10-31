@@ -553,7 +553,10 @@ def validate_chessboard_detection(image, corners, rvec, tvec, camera_matrix, dis
         histogram_filename = f"reprojection_error_histogram_{timestamp}.png"
         
         if data_dir:
-            histogram_path = os.path.join(data_dir, histogram_filename)
+            # Create subdirectory for reprojection error histograms
+            histograms_dir = os.path.join(data_dir, "reprojection_error_histograms")
+            os.makedirs(histograms_dir, exist_ok=True)
+            histogram_path = os.path.join(histograms_dir, histogram_filename)
         else:
             histogram_path = histogram_filename
             
@@ -2334,7 +2337,10 @@ async def main(
                 debug_image = draw_marker_debug(image, rvec, tvec, camera_matrix, dist_coeffs, 
                                               marker_type=marker_type, aruco_size=aruco_size, 
                                               validation_info=successful_measurement)
-                cv2.imwrite(os.path.join(data_dir, f"image_pose_{actual_pose_number}.jpg"), debug_image)
+                # Create subdirectory for pose images
+                pose_images_dir = os.path.join(data_dir, "pose_images")
+                os.makedirs(pose_images_dir, exist_ok=True)
+                cv2.imwrite(os.path.join(pose_images_dir, f"image_pose_{actual_pose_number}.jpg"), debug_image)
 
             # Save pose data incrementally (in case of crash)
             with open(os.path.join(data_dir, "pose_data.json"), "w", encoding='utf-8') as f:
@@ -2459,9 +2465,12 @@ async def main(
         print(f"   - pose_error_analysis.png (pose-by-pose error analysis with temperature overlay)")
         print(f"   - statistics_summary_table.png (statistics summary table)")
         if resume_from_pose == 1:
-            print(f"   - image_reference.jpg + image_pose_1-{len(poses)}.jpg")
+            print(f"   - image_reference.jpg")
+            print(f"   - pose_images/ (contains image_pose_1-{len(poses)}.jpg)")
         else:
-            print(f"   - image_reference.jpg + image_pose_{resume_from_pose}-{len(poses)}.jpg")
+            print(f"   - image_reference.jpg")
+            print(f"   - pose_images/ (contains image_pose_{resume_from_pose}-{len(poses)}.jpg)")
+        print(f"   - reprojection_error_histograms/ (contains all reprojection error histograms)")
         
         # Return to reference pose
         print(f"\n=== RETURNING TO REFERENCE POSE ===")
