@@ -1111,7 +1111,8 @@ async def perform_pose_measurement(camera, camera_matrix, dist_coeffs, marker_ty
                                  aruco_id, aruco_size, aruco_dict, pnp_method, 
                                  use_sb_detection, data_dir, measurement_num, 
                                  T_hand_eye, T_A_0_world_frame, T_B_0_camera_frame, 
-                                 A_0_pose_world_frame_raw, motion_service, arm_name, arm):
+                                 A_0_pose_world_frame_raw, motion_service, arm_name, arm,
+                                 chessboard_cols=11, chessboard_rows=8, chessboard_square_size=30.0):
     """
     Perform a single pose measurement and return all relevant data.
     
@@ -1124,7 +1125,7 @@ async def perform_pose_measurement(camera, camera_matrix, dist_coeffs, marker_ty
     # Get marker pose
     success, rvec, tvec, corners, marker_info = get_marker_pose_in_camera_frame(
         image, camera_matrix, dist_coeffs, marker_type=marker_type,
-        chessboard_size=(11, 8), square_size=30.0,
+        chessboard_size=(chessboard_cols, chessboard_rows), square_size=chessboard_square_size,
         aruco_id=aruco_id, aruco_size=aruco_size, aruco_dict=aruco_dict, 
         pnp_method=pnp_method, use_sb_detection=use_sb_detection, data_dir=data_dir
     )
@@ -1900,6 +1901,9 @@ async def main(
     data_dir: str = None,
     tag: str = None,
     hand_eye_transform_file: str = None,
+    chessboard_cols: int = 11,
+    chessboard_rows: int = 8,
+    chessboard_square_size: float = 30.0,
 ):
     app_client: Optional[AppClient] = None
     machine: Optional[RobotClient] = None
@@ -2089,7 +2093,7 @@ async def main(
 
             success, rvec, tvec, _, marker_info = get_marker_pose_in_camera_frame(
                 image, camera_matrix, dist_coeffs, marker_type=marker_type,
-                chessboard_size=(11, 8), square_size=30.0,
+                chessboard_size=(chessboard_cols, chessboard_rows), square_size=chessboard_square_size,
                 aruco_id=aruco_id, aruco_size=aruco_size, aruco_dict=aruco_dict, pnp_method=pnp_method, use_sb_detection=use_sb_detection, data_dir=data_dir
             )
             if not success:
@@ -2139,7 +2143,8 @@ async def main(
             # Save reference image
             # Save reference image with debug visualization
             debug_image = draw_marker_debug(image, rvec, tvec, camera_matrix, dist_coeffs, 
-                                          marker_type=marker_type, aruco_size=aruco_size, validation_info=marker_info)
+                                          marker_type=marker_type, chessboard_size=(chessboard_cols, chessboard_rows), 
+                                          square_size=chessboard_square_size, aruco_size=aruco_size, validation_info=marker_info)
             cv2.imwrite(os.path.join(data_dir, "image_reference.jpg"), debug_image)
             print(f"Saved reference image and config")
         
@@ -2259,7 +2264,8 @@ async def main(
                     aruco_id, aruco_size, aruco_dict, pnp_method,
                     use_sb_detection, data_dir, measurement_num,
                     T_hand_eye, T_A_0_world_frame, T_B_0_camera_frame,
-                    A_0_pose_world_frame_raw, motion_service, arm_name, arm
+                    A_0_pose_world_frame_raw, motion_service, arm_name, arm,
+                    chessboard_cols, chessboard_rows, chessboard_square_size
                 )
                 
                 # Add temperature data to measurement
@@ -2404,7 +2410,8 @@ async def main(
                 # Get a fresh image for visualization
                 image = await get_camera_image(camera)
                 debug_image = draw_marker_debug(image, rvec, tvec, camera_matrix, dist_coeffs, 
-                                              marker_type=marker_type, aruco_size=aruco_size, 
+                                              marker_type=marker_type, chessboard_size=(chessboard_cols, chessboard_rows), 
+                                              square_size=chessboard_square_size, aruco_size=aruco_size, 
                                               validation_info=successful_measurement)
                 # Create subdirectory for pose images
                 pose_images_dir = os.path.join(data_dir, "pose_images")
@@ -2588,6 +2595,11 @@ Examples:
     --pose-tracker-name mytracker --poses poses.json \\
     --hand-eye-transform hand_eye_transform.json
 
+  # Use custom chessboard configuration
+  python pose_test_script.py --camera-name sensing-camera --arm-name myarm \\
+    --pose-tracker-name mytracker --poses poses.json \\
+    --chessboard-cols 9 --chessboard-rows 6 --chessboard-square-size 25.0
+
 Hand-eye transform JSON format (two options):
   1. Direct 4x4 matrix:
      [[1.0, 0.0, 0.0, 80.0],
@@ -2703,6 +2715,24 @@ All pose objects must have: x, y, z, o_x, o_y, o_z, theta
         default=None,
         help='Path to JSON file containing hand-eye transformation matrix. If provided, this will be used instead of extracting from the machine configuration. The JSON can be either a 4x4 matrix (list of lists) or a frame config format with translation and orientation.'
     )
+    parser.add_argument(
+        '--chessboard-cols',
+        type=int,
+        default=11,
+        help='Number of columns (inner corners) in the chessboard pattern (default: 11)'
+    )
+    parser.add_argument(
+        '--chessboard-rows',
+        type=int,
+        default=8,
+        help='Number of rows (inner corners) in the chessboard pattern (default: 8)'
+    )
+    parser.add_argument(
+        '--chessboard-square-size',
+        type=float,
+        default=30.0,
+        help='Size of each chessboard square in millimeters (default: 30.0)'
+    )
 
     args = parser.parse_args()
 
@@ -2739,4 +2769,7 @@ All pose objects must have: x, y, z, o_x, o_y, o_z, theta
         data_dir=args.data_dir,
         tag=args.tag,
         hand_eye_transform_file=args.hand_eye_transform,
+        chessboard_cols=args.chessboard_cols,
+        chessboard_rows=args.chessboard_rows,
+        chessboard_square_size=args.chessboard_square_size,
     ))
