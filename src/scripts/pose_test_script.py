@@ -1891,6 +1891,9 @@ async def main(
                     o_z=reference_pose['o_z'],
                     theta=reference_pose['theta']
                 )
+
+                # Pause before moving to reference pose
+                input("Press Enter to move to the reference/base position...")
                 
                 # Move to reference pose
                 reference_pose_in_frame = PoseInFrame(reference_frame=DEFAULT_WORLD_FRAME, pose=reference_pose_viam)
