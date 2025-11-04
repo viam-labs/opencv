@@ -118,12 +118,22 @@ class HandEyeCalibration(Generic, EasyResource):
             if not isinstance(body_name, str):
                 raise Exception(f"'{BODY_NAME_ATTR}' must be a string, got {type(body_name)}")
 
+        use_internal_pose_tracker = attrs.get(USE_INTERNAL_POSE_TRACKER_ATTR, False)
+        if use_internal_pose_tracker:
+            camera_name = attrs.get(CAMERA_NAME_ATTR)
+            if camera_name is None:
+                raise Exception(f"When {USE_INTERNAL_POSE_TRACKER_ATTR} is True, {CAMERA_NAME_ATTR} is required.")
+
         motion = attrs.get(MOTION_ATTR)
         optional_deps = []
         if motion is not None:
             optional_deps.append(str(motion))
 
-        return [str(arm), str(pose_tracker)], optional_deps
+        required_deps = [str(arm), str(pose_tracker)]
+        if use_internal_pose_tracker:
+            required_deps.append(str(camera_name))
+
+        return required_deps, optional_deps
 
     def reconfigure(
         self, config: ComponentConfig, dependencies: Mapping[ResourceName, ResourceBase]
@@ -171,11 +181,15 @@ class HandEyeCalibration(Generic, EasyResource):
         self.sleep_seconds = attrs.get(SLEEP_ATTR, DEFAULT_SLEEP_SECONDS)
         self.body_names = [attrs.get(BODY_NAME_ATTR)] if attrs.get(BODY_NAME_ATTR) is not None else []
         self.use_internal_pose_tracker = attrs.get(USE_INTERNAL_POSE_TRACKER_ATTR, False)
-        if(self.use_internal_pose_tracker):
+        if self.use_internal_pose_tracker:
             camera_name = attrs.get(CAMERA_NAME_ATTR)
+            if camera_name is None:
+                raise Exception(f"When {USE_INTERNAL_POSE_TRACKER_ATTR} is True, {CAMERA_NAME_ATTR} is required.")
             self.pattern_size = attrs.get(PATTERN_SIZE_ATTR, [11, 8])
             self.square_size = attrs.get(SQUARE_SIZE_MM_ATTR, 20.0)
             self.camera = dependencies.get(Camera.get_resource_name(camera_name))
+            if self.camera is None:
+                raise Exception(f"Camera dependency '{camera_name}' not found in dependencies.")
 
         return super().reconfigure(config, dependencies)
 
@@ -194,9 +208,19 @@ class HandEyeCalibration(Generic, EasyResource):
 
     async def get_camera_intrinsics(self) -> tuple:
         """Get camera intrinsic parameters"""
-        camera_params = await self.camera.do_command({"get_camera_params": None})
-        intrinsics = camera_params["Color"]["intrinsics"]
-        dist_params = camera_params["Color"]["distortion"]
+        try:
+            camera_params = await self.camera.do_command({"get_camera_params": None})
+        except Exception as e:
+            camera_name = getattr(self.camera, 'name', 'unknown')
+            raise Exception(f"Failed to get camera parameters from camera '{camera_name}'. "
+                          f"The camera must support the 'get_camera_params' command. Error: {e}")
+        
+        try:
+            intrinsics = camera_params["Color"]["intrinsics"]
+            dist_params = camera_params["Color"]["distortion"]
+        except KeyError as e:
+            raise Exception(f"Camera parameters missing expected key: {e}. "
+                          f"Expected 'Color' section with 'intrinsics' and 'distortion' keys.")
         
         K = np.array([
             [intrinsics["fx"], 0, intrinsics["cx"]],
@@ -305,10 +329,12 @@ class HandEyeCalibration(Generic, EasyResource):
         rvec, tvec = cv2.solvePnPRefineLM(objp, corners, camera_matrix, dist_coeffs, rvec, tvec)
 
         R, _ = cv2.Rodrigues(rvec)
-        t = tvec.reshape(3, 1)
+        tvec_reshaped = tvec.reshape(3, 1)
 
-        R_cam2target = R.T
-        t_cam2target = -R.T @ t
+        # solvePnP returns: R (object->camera), tvec (position of object origin in camera frame)
+        # We need: R_cam2target, t_cam2target (position of target origin in camera frame)
+        R_cam2target = R.T  # Inverse rotation: camera->target
+        t_cam2target = tvec_reshaped  # tvec is already the position of target origin in camera frame
 
         return R_cam2target, t_cam2target
     
