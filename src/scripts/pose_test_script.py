@@ -939,6 +939,63 @@ def get_marker_pose_in_camera_frame(image, camera_matrix, dist_coeffs, marker_ty
         raise ValueError(f"Unknown marker type: {marker_type}")
 
 
+def load_hand_eye_transform_from_json(json_path: str) -> np.ndarray:
+    """
+    Load hand-eye transformation matrix from a JSON file.
+    
+    The JSON file can contain either:
+    1. A direct 4x4 transformation matrix as a list of lists:
+       [[1.0, 0.0, 0.0, 80.0],
+        [0.0, 1.0, 0.0, -20.2],
+        [0.0, 0.0, 1.0, 48.7],
+        [0.0, 0.0, 0.0, 1.0]]
+    
+    2. A frame configuration format (same as Viam frame config):
+       {
+         "translation": {"x": 80.0, "y": -20.2, "z": 48.7},
+         "orientation": {
+           "value": {"x": 0.0, "y": 0.0, "z": 1.0, "theta": 0.0},
+           "type": "ov_degrees"
+         }
+       }
+    
+    Args:
+        json_path: Path to the JSON file
+        
+    Returns:
+        4x4 numpy array representing the transformation matrix
+    """
+    import json
+    
+    with open(json_path, 'r') as f:
+        data = json.load(f)
+    
+    # Check if it's a direct 4x4 matrix
+    if isinstance(data, list) and len(data) == 4:
+        if all(isinstance(row, list) and len(row) == 4 for row in data):
+            T = np.array(data, dtype=np.float64)
+            print(f"Loaded hand-eye transformation from JSON (4x4 matrix format)")
+            print(f"\nHand-Eye Transformation Matrix:")
+            for i in range(4):
+                print(f"  [{T[i,0]:8.4f} {T[i,1]:8.4f} {T[i,2]:8.4f} {T[i,3]:8.4f}]")
+            return T
+    
+    # Check if it's a frame configuration format
+    if isinstance(data, dict):
+        if 'translation' in data or 'orientation' in data:
+            T = frame_config_to_transformation_matrix(data)
+            print(f"Loaded hand-eye transformation from JSON (frame config format)")
+            print (f"Frame config: {json.dumps(data, indent=2)}")
+            print(f"\nHand-Eye Transformation Matrix:")
+            for i in range(4):
+                print(f"  [{T[i,0]:8.4f} {T[i,1]:8.4f} {T[i,2]:8.4f} {T[i,3]:8.4f}]")
+            return T
+
+    
+    
+    raise ValueError(f"Invalid JSON format in {json_path}. Expected either a 4x4 matrix (list of lists) or a frame configuration dict with 'translation' and 'orientation' keys.")
+
+
 async def get_hand_eye_from_machine(app_client: AppClient, camera_name: str):
     """Get the hand-eye transformation from the machine's frame configuration"""
     print(f"\n=== EXTRACTING HAND-EYE TRANSFORMATION ===")
@@ -1842,6 +1899,7 @@ async def main(
     resume_from_pose: int = 1,
     data_dir: str = None,
     tag: str = None,
+    hand_eye_transform_file: str = None,
 ):
     app_client: Optional[AppClient] = None
     machine: Optional[RobotClient] = None
@@ -1861,11 +1919,21 @@ async def main(
 
         print(f"Connected to robot")
 
-        # Get the hand-eye transformation from camera configuration
-        T_hand_eye = await get_hand_eye_from_machine(app_client, camera_name)
-        if T_hand_eye is None:
-            print("ERROR: Could not retrieve hand-eye transformation")
-            return
+        # Get the hand-eye transformation from camera configuration or manual JSON file
+        if hand_eye_transform_file:
+            print(f"\n=== LOADING HAND-EYE TRANSFORMATION FROM FILE ===")
+            print(f"Loading from: {hand_eye_transform_file}")
+            try:
+                T_hand_eye = load_hand_eye_transform_from_json(hand_eye_transform_file)
+            except Exception as e:
+                print(f"ERROR: Failed to load hand-eye transformation from file: {e}")
+                return
+        else:
+            print(f"\n=== EXTRACTING HAND-EYE TRANSFORMATION FROM MACHINE ===")
+            T_hand_eye = await get_hand_eye_from_machine(app_client, camera_name)
+            if T_hand_eye is None:
+                print("ERROR: Could not retrieve hand-eye transformation")
+                return
 
         # Check if we're resuming (to skip reference pose movement)
         calibration_config_path_check = os.path.join(data_dir, "calibration_config.json") if data_dir else None
@@ -2515,6 +2583,27 @@ Examples:
     --pose-tracker-name mytracker --poses poses.json --resume-from-pose 27 \\
     --data-dir calibration_data_20251029_180338
 
+  # Use manual hand-eye transformation from JSON file
+  python pose_test_script.py --camera-name sensing-camera --arm-name myarm \\
+    --pose-tracker-name mytracker --poses poses.json \\
+    --hand-eye-transform hand_eye_transform.json
+
+Hand-eye transform JSON format (two options):
+  1. Direct 4x4 matrix:
+     [[1.0, 0.0, 0.0, 80.0],
+      [0.0, 1.0, 0.0, -20.2],
+      [0.0, 0.0, 1.0, 48.7],
+      [0.0, 0.0, 0.0, 1.0]]
+  
+  2. Frame configuration format:
+     {
+       "translation": {"x": 80.0, "y": -20.2, "z": 48.7},
+       "orientation": {
+         "value": {"x": 0.0, "y": 0.0, "z": 1.0, "theta": 0.0},
+         "type": "ov_degrees"
+       }
+     }
+
 Pose JSON format (list of pose objects):
   [
     {"x": 100, "y": 200, "z": 300, "o_x": 0, "o_y": 0, "o_z": 1, "theta": 45},
@@ -2608,6 +2697,12 @@ All pose objects must have: x, y, z, o_x, o_y, o_z, theta
         default=None,
         help='Tag to add to directory name and plot titles (e.g., "test1", "calibration_v2")'
     )
+    parser.add_argument(
+        '--hand-eye-transform',
+        type=str,
+        default=None,
+        help='Path to JSON file containing hand-eye transformation matrix. If provided, this will be used instead of extracting from the machine configuration. The JSON can be either a 4x4 matrix (list of lists) or a frame config format with translation and orientation.'
+    )
 
     args = parser.parse_args()
 
@@ -2643,4 +2738,5 @@ All pose objects must have: x, y, z, o_x, o_y, o_z, theta
         resume_from_pose=args.resume_from_pose,
         data_dir=args.data_dir,
         tag=args.tag,
+        hand_eye_transform_file=args.hand_eye_transform,
     ))

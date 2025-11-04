@@ -1,0 +1,28 @@
+{
+    "geometry": {
+      "translation": {
+        "x": -5,
+        "y": 10,
+        "z": 0
+      },
+      "type": "box",
+      "x": 160,
+      "y": 65,
+      "z": 65
+    },
+    "orientation": {
+      "type": "ov_degrees",
+      "value": {
+        "th": 90,
+        "x": 0,
+        "y": 0,
+        "z": 1
+      }
+    },
+    "parent": "ur20-modular",
+    "translation": {
+      "x": 80,
+      "y": -20.2,
+      "z": 48.7
+    }
+  }
