@@ -15,6 +15,8 @@ from viam.resource.types import Model, ModelFamily
 from viam.services.generic import *
 from viam.services.motion import Motion
 from viam.utils import struct_to_dict, ValueTypes
+from viam.media.video import CameraMimeType
+from viam.media.utils.pil import viam_to_pil_image
 
 from utils.utils import call_go_ov2mat, call_go_mat2ov
 
@@ -30,6 +32,7 @@ METHODS = [
 # required attributes
 ARM_ATTR = "arm_name"
 BODY_NAME_ATTR = "body_name"
+USE_INTERNAL_POSE_TRACKER_ATTR = "use_internal_pose_tracker"
 CALIB_ATTR = "calibration_type"
 CAM_ATTR = "camera_name"
 JOINT_POSITIONS_ATTR = "joint_positions"
@@ -37,6 +40,8 @@ METHOD_ATTR = "method"
 MOTION_ATTR = "motion"
 POSE_TRACKER_ATTR = "pose_tracker"
 SLEEP_ATTR = "sleep_seconds"
+PATTERN_SIZE_ATTR = "pattern_size"
+SQUARE_SIZE_MM_ATTR = "square_size_mm"
 
 # Default config attribute values
 DEFAULT_SLEEP_SECONDS = 2.0
@@ -143,8 +148,140 @@ class HandEyeCalibration(Generic, EasyResource):
         self.method = attrs.get(METHOD_ATTR, DEFAULT_METHOD)
         self.sleep_seconds = attrs.get(SLEEP_ATTR, DEFAULT_SLEEP_SECONDS)
         self.body_names = [attrs.get(BODY_NAME_ATTR)] if attrs.get(BODY_NAME_ATTR) is not None else []
+        self.use_internal_pose_tracker = attrs.get(USE_INTERNAL_POSE_TRACKER_ATTR, False)
+        self.pattern_size = attrs.get(PATTERN_SIZE_ATTR, [11, 8])
+        self.square_size = attrs.get(SQUARE_SIZE_MM_ATTR, 20.0)
 
         return super().reconfigure(config, dependencies)
+
+    async def get_camera_image(self) -> np.ndarray:
+        cam_images = await self.camera.get_images()
+        pil_image = None
+        for cam_image in cam_images[0]:
+            # Accept any standard image format that viam_to_pil_image can handle
+            if cam_image.mime_type in [CameraMimeType.JPEG, CameraMimeType.PNG, CameraMimeType.VIAM_RGBA]:
+                pil_image = viam_to_pil_image(cam_image)
+                break
+        if pil_image is None:
+            raise Exception("Could not get latest image from camera")        
+        image = np.array(pil_image)
+        return image
+
+    async def get_camera_intrinsics(self) -> tuple:
+        """Get camera intrinsic parameters"""
+        camera_params = await self.camera.do_command({"get_camera_params": None})
+        intrinsics = camera_params["Color"]["intrinsics"]
+        dist_params = camera_params["Color"]["distortion"]
+        
+        K = np.array([
+            [intrinsics["fx"], 0, intrinsics["cx"]],
+            [0, intrinsics["fy"], intrinsics["cy"]],
+            [0, 0, 1]
+        ], dtype=np.float32)
+
+        dist = np.array([dist_params["k1"], dist_params["k2"], dist_params["p1"], dist_params["p2"], dist_params["k3"]], dtype=np.float32)
+        
+        if K is None or dist is None:
+            raise Exception("Could not get camera intrinsic parameters")
+        
+        return K, dist
+
+    async def get_calibration_values_from_chessboard(self):
+        chessboard_size = self.pattern_size
+        square_size = self.square_size
+        image = await self.get_camera_image()
+        camera_matrix, dist_coeffs = await self.get_camera_intrinsics()
+        # Convert to grayscale if needed
+        if len(image.shape) == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = image
+    
+        # Prepare 3D object points (chessboard corners in world coordinates)
+        objp = np.zeros((chessboard_size[0] * chessboard_size[1], 3), np.float32)
+        objp[:,:2] = np.mgrid[0:chessboard_size[0], 0:chessboard_size[1]].T.reshape(-1,2)
+        objp *= square_size
+    
+        # Find chessboard corners using selected method
+        corners = None
+        ret, corners = cv2.findChessboardCorners(gray, chessboard_size, None)
+        if ret:
+            # Filter outliers before solvePnP with IMPROVED thresholds
+            print(f"Original corners: {len(corners)} points")
+            
+            # Method 1: Use iterative outlier filtering with tighter threshold
+            try:
+                # First, try to get an initial pose estimate with all points
+                success_init, rvec_init, tvec_init = cv2.solvePnP(objp, corners, camera_matrix, dist_coeffs, flags=pnp_method)
+                
+                if success_init:
+                    # Project points back and calculate errors
+                    projected_points, _ = cv2.projectPoints(objp, rvec_init, tvec_init, camera_matrix, dist_coeffs)
+                    projected_points = projected_points.reshape(-1, 2)
+                    corners_2d = corners.reshape(-1, 2)
+                    
+                    # Calculate reprojection errors
+                    errors = np.linalg.norm(corners_2d - projected_points, axis=1)
+                    
+                    # IMPROVED: Use statistical outlier detection
+                    # Filter using median absolute deviation (more robust than std)
+                    median_error = np.median(errors)
+                    mad = np.median(np.abs(errors - median_error))
+                    
+                    # Modified z-score using MAD
+                    modified_z_scores = 0.6745 * (errors - median_error) / (mad + 1e-10)
+                    
+                    # Keep points with modified z-score < 3.5 (equivalent to ~3 sigma)
+                    # OR use absolute threshold of 2 pixels (whichever is stricter)
+                    threshold_statistical = median_error + 3.5 * mad
+                    threshold_absolute = 2.0
+                    threshold = min(threshold_statistical, threshold_absolute)
+                    
+                    good_indices = errors < threshold
+                    
+                    n_filtered = len(corners) - np.sum(good_indices)
+                    if n_filtered > 0:
+                        print(f"Filtering {n_filtered} outliers (threshold: {threshold:.2f}px)")
+                        print(f"  Error range: {np.min(errors):.3f} to {np.max(errors):.3f}px")
+                        print(f"  Median: {median_error:.3f}px, MAD: {mad:.3f}px")
+                    
+                    if np.sum(good_indices) >= 20:  # Need at least 20 points for reliable PnP
+                        filtered_corners = corners[good_indices]
+                        filtered_objp = objp[good_indices]
+                        print(f"Filtered corners: {len(filtered_corners)}/{len(corners)} points (error < {threshold:.2f}px)")
+                        
+                        # Use filtered points for final solvePnP
+                        success, rvec, tvec = cv2.solvePnP(filtered_objp, filtered_corners, camera_matrix, dist_coeffs, flags=pnp_method)
+                        corners = filtered_corners  # Update corners for validation
+                        objp = filtered_objp  # Update objp for validation
+                    else:
+                        print(f"Not enough good points ({np.sum(good_indices)}), using all points")
+                        success, rvec, tvec = cv2.solvePnP(objp, corners, camera_matrix, dist_coeffs, flags=pnp_method)
+                else:
+                    print("Initial solvePnP failed, using all points")
+                    success, rvec, tvec = cv2.solvePnP(objp, corners, camera_matrix, dist_coeffs, flags=pnp_method)
+                    
+            except Exception as e:
+                print(f"Outlier filtering failed: {e}, using all points")
+                success, rvec, tvec = cv2.solvePnP(objp, corners, camera_matrix, dist_coeffs, flags=pnp_method)
+
+            if not success:
+                print("Failed to solve PnP")
+                return False, None, None, None, None
+
+        # Enhanced refinement with VVS
+        rvec, tvec = cv2.solvePnPRefineVVS(objp, corners, camera_matrix, dist_coeffs, rvec, tvec)
+        
+        # Additional refinement with LM method
+        rvec, tvec = cv2.solvePnPRefineLM(objp, corners, camera_matrix, dist_coeffs, rvec, tvec)
+
+        R, _ = cv2.Rodrigues(rvec)
+        t = tvec.reshape(3, 1)
+
+        R_cam2target = R.T
+        t_cam2target = -R.T @ t
+
+        return R_cam2target, t_cam2target
     
     async def get_calibration_values(self):
         arm_pose = await self.arm.get_end_position()
@@ -226,7 +363,15 @@ class HandEyeCalibration(Generic, EasyResource):
                             # Sleep for the configured amount of time to allow the arm and camera to settle
                             await asyncio.sleep(self.sleep_seconds)
 
-                            R_base2gripper, t_base2gripper, R_cam2target, t_cam2target = await self.get_calibration_values()
+                            R_base2gripper = None
+                            t_base2gripper = None
+                            R_cam2target = None
+                            t_cam2target = None
+
+                            if(self.use_internal_pose_tracker):
+                                R_base2gripper, t_base2gripper, R_cam2target, t_cam2target = await self.get_calibration_values_from_chessboard()
+                            else:
+                                R_base2gripper, t_base2gripper, R_cam2target, t_cam2target = await self.get_calibration_values()
                             if R_base2gripper is None or t_base2gripper is None or R_cam2target is None or t_cam2target is None:
                                 self.logger.warning(f"Could not find calibration values for pose {i+1}/{len(self.joint_positions)}")
                                 continue
