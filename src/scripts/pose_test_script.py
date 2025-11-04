@@ -357,10 +357,7 @@ async def connect():
     viam_client = await ViamClient.create_from_dial_options(dial_options)
     if not viam_client:
         raise Exception("Failed to create ViamClient")
-    app_client = viam_client.app_client
-    if not app_client:
-        raise Exception("Failed to create AppClient")
-    return app_client, robot
+    return viam_client, robot
 
 async def _get_current_arm_pose(motion: MotionClient, arm_name: str, arm: Arm) -> Pose:
     pose_in_frame = await arm.get_end_position()
@@ -1854,7 +1851,8 @@ async def main(
     camera: Optional[Camera] = None
     
     try:
-        app_client, machine = await connect()
+        viam_client, machine = await connect()
+        app_client = viam_client.app_client
         arm = Arm.from_robot(machine, arm_name)
         await arm.do_command({"set_vel": 25})
         camera = Camera.from_robot(machine, camera_name)
@@ -2487,6 +2485,8 @@ async def main(
         print("Caught exception in script main: ")
         raise e
     finally:
+        if viam_client:
+            viam_client.close()
         if pt:
             await pt.close()
         if arm:
