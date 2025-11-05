@@ -9,6 +9,7 @@ import json
 import logging
 import sys
 import shlex
+import shutil
 import matplotlib.pyplot as plt
 from datetime import datetime
 from dotenv import load_dotenv
@@ -2027,6 +2028,7 @@ async def main(
     chessboard_cols: int = 11,
     chessboard_rows: int = 8,
     chessboard_square_size: float = 30.0,
+    poses_file_path: str = None,
 ):
     app_client: Optional[AppClient] = None
     machine: Optional[RobotClient] = None
@@ -2147,13 +2149,23 @@ async def main(
             # Use existing directory, create if it doesn't exist
             os.makedirs(data_dir, exist_ok=True)
             print(f"\n=== USING EXISTING DATA DIRECTORY: {data_dir} ===")
-            # Extract timestamp from existing directory name for consistency
-            if data_dir.startswith("calibration_data_"):
-                timestamp = data_dir.replace("calibration_data_", "")
-                if "_" in timestamp:
-                    timestamp = timestamp.split("_")[0]  # Remove tag if present
-            else:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Extract timestamp from existing directory name for consistency
+        if data_dir.startswith("calibration_data_"):
+            timestamp = data_dir.replace("calibration_data_", "")
+            if "_" in timestamp:
+                timestamp = timestamp.split("_")[0]  # Remove tag if present
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Copy poses JSON file to data directory if provided
+        if poses_file_path and os.path.exists(poses_file_path):
+            poses_file_dest = os.path.join(data_dir, os.path.basename(poses_file_path))
+            try:
+                shutil.copy2(poses_file_path, poses_file_dest)
+                print(f"Copied poses file to: {poses_file_dest}")
+            except Exception as e:
+                print(f"Warning: Could not copy poses file: {e}")
         
         # Reconstruct command from sys.argv for logging
         # sys.argv[0] is the script name, sys.argv[1:] are the arguments
@@ -2838,7 +2850,7 @@ All pose objects must have: x, y, z, o_x, o_y, o_z, theta
     parser.add_argument(
         '--poses',
         type=str,
-        required=False,
+        required=True,
         help='Path to JSON file containing list of pose objects'
     )
     parser.add_argument(
@@ -2963,4 +2975,5 @@ All pose objects must have: x, y, z, o_x, o_y, o_z, theta
         chessboard_cols=args.chessboard_cols,
         chessboard_rows=args.chessboard_rows,
         chessboard_square_size=args.chessboard_square_size,
+        poses_file_path=args.poses,
     ))
