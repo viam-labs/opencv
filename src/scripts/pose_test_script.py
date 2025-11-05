@@ -465,7 +465,7 @@ async def _get_current_arm_pose(motion: MotionClient, arm_name: str, arm: Arm) -
         component_name=arm_name,
         destination_frame="world"
     )
-    return pose_in_frame.pose, pose_in_frame_motion_service.pose
+    return pose_in_frame, pose_in_frame_motion_service.pose
 
 def frame_config_to_transformation_matrix(frame_config):
     """
@@ -2439,11 +2439,20 @@ async def main(
                     chessboard_cols, chessboard_rows, chessboard_square_size
                 )
                 
-                # Add temperature data to measurement
-                measurement['camera_temperature'] = camera_temperature
-                measurements.append(measurement)
+                # Add temperature data to measurement if it succeeded
+                if measurement is not None:
+                    measurement['camera_temperature'] = camera_temperature
+                    measurements.append(measurement)
+                else:
+                    # Create a failed measurement entry with temperature data
+                    failed_measurement = {
+                        'measurement_num': measurement_num,
+                        'success': False,
+                        'camera_temperature': camera_temperature
+                    }
+                    measurements.append(failed_measurement)
                 
-                if measurement is None:
+                if measurement is None or not measurement.get('success', False):
                     print(f"    Failed to detect {marker_type} in measurement {measurement_num}")
                 else:
                     hand_eye_errors = measurement.get('hand_eye_errors', {})
