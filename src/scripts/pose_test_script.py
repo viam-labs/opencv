@@ -23,7 +23,7 @@ from viam.media.video import CameraMimeType
 from viam.components.camera import Camera
 from viam.rpc.dial import DialOptions
 from viam.app.viam_client import ViamClient
-from typing import Optional
+from typing import Optional, Tuple
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
@@ -105,6 +105,85 @@ def rotation_error(R1, R2):
     R_error = R1.T @ R2
     angle_rad = np.arccos(np.clip((np.trace(R_error) - 1) / 2, -1.0, 1.0))
     return np.degrees(angle_rad)
+
+def compare_poses(pose1: Pose, pose2: Pose, label: str = "Pose comparison") -> dict:
+    """
+    Compare two poses and return detailed differences.
+    
+    Args:
+        pose1: First pose (from arm.get_end_position())
+        pose2: Second pose (from motion.get_pose())
+        label: Label for the comparison (for logging)
+    
+    Returns:
+        Dictionary with comparison metrics
+    """
+    # Convert poses to matrices for comparison
+    T1 = _pose_to_matrix(pose1)
+    T2 = _pose_to_matrix(pose2)
+    
+    R1 = T1[:3, :3]
+    R2 = T2[:3, :3]
+    t1 = T1[:3, 3]
+    t2 = T2[:3, 3]
+    
+    # Calculate differences
+    translation_diff = t2 - t1
+    translation_error = np.linalg.norm(translation_diff)
+    
+    # Rotation error
+    rot_error_deg = rotation_error(R1, R2)
+    
+    # Position differences
+    position_diff = {
+        'x': pose2.x - pose1.x,
+        'y': pose2.y - pose1.y,
+        'z': pose2.z - pose1.z
+    }
+    
+    # Orientation differences
+    orientation_diff = {
+        'o_x': pose2.o_x - pose1.o_x,
+        'o_y': pose2.o_y - pose1.o_y,
+        'o_z': pose2.o_z - pose1.o_z,
+        'theta': pose2.theta - pose1.theta
+    }
+    
+    comparison = {
+        'translation_error_mm': float(translation_error),
+        'rotation_error_deg': float(rot_error_deg),
+        'position_diff_mm': position_diff,
+        'orientation_diff': orientation_diff,
+        'pose1': {
+            'x': pose1.x, 'y': pose1.y, 'z': pose1.z,
+            'o_x': pose1.o_x, 'o_y': pose1.o_y, 'o_z': pose1.o_z, 'theta': pose1.theta
+        },
+        'pose2': {
+            'x': pose2.x, 'y': pose2.y, 'z': pose2.z,
+            'o_x': pose2.o_x, 'o_y': pose2.o_y, 'o_z': pose2.o_z, 'theta': pose2.theta
+        }
+    }
+    
+    # Log the comparison
+    print(f"\n{'='*60}")
+    print(f"{label}")
+    print(f"{'='*60}")
+    print(f"Translation error: {translation_error:.3f} mm")
+    print(f"Rotation error: {rot_error_deg:.3f}°")
+    print(f"\nPosition differences (pose2 - pose1):")
+    print(f"  X: {position_diff['x']:+.3f} mm")
+    print(f"  Y: {position_diff['y']:+.3f} mm")
+    print(f"  Z: {position_diff['z']:+.3f} mm")
+    print(f"\nOrientation differences (pose2 - pose1):")
+    print(f"  o_x: {orientation_diff['o_x']:+.6f}")
+    print(f"  o_y: {orientation_diff['o_y']:+.6f}")
+    print(f"  o_z: {orientation_diff['o_z']:+.6f}")
+    print(f"  theta: {orientation_diff['theta']:+.3f}°")
+    print(f"\nPose 1: ({pose1.x:7.2f}, {pose1.y:7.2f}, {pose1.z:7.2f}) mm")
+    print(f"Pose 2: ({pose2.x:7.2f}, {pose2.y:7.2f}, {pose2.z:7.2f}) mm")
+    print(f"{'='*60}\n")
+    
+    return comparison
 
 def analyze_hand_eye_error(T_hand_eye, T_delta_A_world_frame, T_delta_B_camera_frame, 
                           A_0_pose, A_i_pose, pose_num):
@@ -373,9 +452,19 @@ async def connect():
         raise Exception("Failed to create ViamClient")
     return viam_client, robot
 
-async def _get_current_arm_pose(motion: MotionClient, arm_name: str, arm: Arm) -> Pose:
+async def _get_current_arm_pose(motion: MotionClient, arm_name: str, arm: Arm) -> Tuple[Pose, Pose]:
+    """
+    Get current arm pose from both arm.get_end_position() and motion.get_pose().
+    
+    Returns:
+        Tuple of (pose_from_arm, pose_from_motion_service)
+    """
     pose_in_frame = await arm.get_end_position()
-    return pose_in_frame
+    pose_in_frame_motion_service = await motion.get_pose(
+        component_name=arm_name,
+        destination_frame="world"
+    )
+    return pose_in_frame.pose, pose_in_frame_motion_service.pose
 
 def frame_config_to_transformation_matrix(frame_config):
     """
@@ -1148,10 +1237,20 @@ async def perform_pose_measurement(camera, camera_matrix, dist_coeffs, marker_ty
         return None
     
     # Get current arm pose for hand-eye verification
-    A_i_pose_world_frame_raw = await _get_current_arm_pose(motion_service, arm_name, arm)
+    A_i_pose_world_frame_raw, A_i_pose_world_frame_raw_from_motion_service = await _get_current_arm_pose(motion_service, arm_name, arm)
+    
+    # Compare poses from arm vs motion service
+    pose_comparison = compare_poses(
+        A_i_pose_world_frame_raw, 
+        A_i_pose_world_frame_raw_from_motion_service,
+        label=f"Pose Comparison - Measurement {measurement_num}"
+    )
+    
     # Invert only the rotation, keep translation unchanged
     A_i_pose_world_frame = _invert_pose_rotation_only(A_i_pose_world_frame_raw)
+    A_i_pose_world_frame_from_motion_service = _invert_pose_rotation_only(A_i_pose_world_frame_raw_from_motion_service)
     T_A_i_world_frame = _pose_to_matrix(A_i_pose_world_frame)
+    T_A_i_world_frame_from_motion_service = _pose_to_matrix(A_i_pose_world_frame_from_motion_service)
     
     # Convert chessboard pose (don't transpose - solvePnP is OpenCV convention)
     T_B_i_camera_frame = rvec_tvec_to_matrix(rvec, tvec)
@@ -1312,6 +1411,7 @@ def generate_comprehensive_statistics(rotation_data):
     # New: Collect pose accuracy errors (commanded vs actual)
     pose_position_errors = []
     pose_orientation_errors = []
+    pose_orientation_errors_from_motion_service = []
     
     # Collect temperature data
     rgb_temps = []
@@ -1344,8 +1444,9 @@ def generate_comprehensive_statistics(rotation_data):
         # Pose accuracy errors (commanded vs actual)
         pose_spec = pose_data.get('pose_spec', {})
         A_i_pose_raw = pose_data.get('A_i_pose_raw', {})
-        
-        if pose_spec and A_i_pose_raw:
+        A_i_pose_from_motion_service_raw = pose_data.get('A_i_pose_from_motion_service_raw', {})
+
+        if pose_spec and A_i_pose_raw and A_i_pose_from_motion_service_raw:
             # Position error (Euclidean distance)
             pos_error = np.sqrt(
                 (pose_spec.get('x', 0) - A_i_pose_raw.get('x', 0))**2 +
@@ -1365,14 +1466,22 @@ def generate_comprehensive_statistics(rotation_data):
                     A_i_pose_raw.get('o_x', 0), A_i_pose_raw.get('o_y', 0),
                     A_i_pose_raw.get('o_z', 0), A_i_pose_raw.get('theta', 0)
                 )
-                
-                if R_spec is not None and R_actual is not None:
+                R_actual_from_motion_service = call_go_ov2mat(
+                    A_i_pose_from_motion_service_raw.get('o_x', 0), A_i_pose_from_motion_service_raw.get('o_y', 0),
+                    A_i_pose_from_motion_service_raw.get('o_z', 0), A_i_pose_from_motion_service_raw.get('theta', 0)
+                )
+                if R_spec is not None and R_actual is not None and R_actual_from_motion_service is not None:
                     # Compute relative rotation matrix
                     R_rel = R_actual @ R_spec.T
                     # Extract rotation angle from rotation matrix
                     trace = np.trace(R_rel)
                     angle_error = np.arccos(np.clip((trace - 1) / 2, -1, 1))
                     pose_orientation_errors.append(np.degrees(angle_error))
+
+                    R_rel_from_motion_service = R_actual_from_motion_service @ R_actual.T
+                    trace_from_motion_service = np.trace(R_rel_from_motion_service)
+                    angle_error_from_motion_service = np.arccos(np.clip((trace_from_motion_service - 1) / 2, -1, 1))
+                    pose_orientation_errors_from_motion_service.append(np.degrees(angle_error_from_motion_service))
             except:
                 pass  # Skip if orientation conversion fails
         
@@ -1989,11 +2098,16 @@ async def main(
                 # input()  # Pause for user evaluation
                 
                 # Get the actual pose after movement
-                A_0_pose_world_frame_raw = await _get_current_arm_pose(motion_service, arm.name, arm)
+                A_0_pose_world_frame_raw, A_0_pose_world_frame_raw_from_motion_service = await _get_current_arm_pose(motion_service, arm.name, arm)
+                
+                # Compare poses from arm vs motion service
+                pose_comparison = compare_poses(
+                    A_0_pose_world_frame_raw,
+                    A_0_pose_world_frame_raw_from_motion_service,
+                    label="Pose Comparison - Reference Pose"
+                )
             else:
-                print(f"\n=== USING CURRENT ARM POSITION AS REFERENCE ===")
-                A_0_pose_world_frame_raw = await _get_current_arm_pose(motion_service, arm.name, arm)
-                print(f"Current pose: x={A_0_pose_world_frame_raw.x:.1f}, y={A_0_pose_world_frame_raw.y:.1f}, z={A_0_pose_world_frame_raw.z:.1f}")
+                raise Exception("No reference pose provided. A reference pose is required for hand-eye calibration testing.")
         else:
             # When resuming, we'll load A_0_pose_world_frame_raw from config later
             # For now, just set it to None as a placeholder
@@ -2001,11 +2115,22 @@ async def main(
             # Also set these as placeholders, will be loaded from config
             A_0_pose_world_frame = None
             T_A_0_world_frame = None
+            T_A_0_world_frame_from_motion_service = None
         
         # Invert only the rotation, keep translation unchanged (only if not resuming)
         if A_0_pose_world_frame_raw is not None:
             A_0_pose_world_frame = _invert_pose_rotation_only(A_0_pose_world_frame_raw)
             T_A_0_world_frame = _pose_to_matrix(A_0_pose_world_frame)
+            A_0_pose_world_frame_from_motion_service = _invert_pose_rotation_only(A_0_pose_world_frame_raw_from_motion_service)
+            T_A_0_world_frame_from_motion_service = _pose_to_matrix(A_0_pose_world_frame_from_motion_service)
+            
+            # Compare the inverted poses as well
+            print(f"\n=== COMPARING INVERTED REFERENCE POSES ===")
+            inverted_comparison = compare_poses(
+                A_0_pose_world_frame,
+                A_0_pose_world_frame_from_motion_service,
+                label="Inverted Pose Comparison - Reference Pose"
+            )
 
         camera_matrix, dist_coeffs = await get_camera_intrinsics(camera)
         
@@ -2086,6 +2211,23 @@ async def main(
                 
                 # Reconstruct T_A_0_world_frame and T_B_0_camera_frame
                 T_A_0_world_frame = _pose_to_matrix(A_0_pose_world_frame)
+                
+                # When resuming, optionally re-fetch both poses for comparison
+                # For actual processing, use the saved arm pose
+                print(f"\n=== RE-FETCHING POSES FOR COMPARISON (RESUME) ===")
+                A_0_pose_world_frame_raw_recheck, A_0_pose_world_frame_raw_from_motion_service_recheck = await _get_current_arm_pose(motion_service, arm.name, arm)
+                
+                # Compare current poses (though robot may have moved)
+                resume_comparison = compare_poses(
+                    A_0_pose_world_frame_raw_recheck,
+                    A_0_pose_world_frame_raw_from_motion_service_recheck,
+                    label="Pose Comparison - Resume (Current Position)"
+                )
+                
+                # Use the saved pose for processing, but note the motion service version for reference
+                A_0_pose_world_frame_from_motion_service = _invert_pose_rotation_only(A_0_pose_world_frame_raw_from_motion_service_recheck)
+                T_A_0_world_frame_from_motion_service = _pose_to_matrix(A_0_pose_world_frame_from_motion_service)
+                
                 T_B_0_camera_frame = np.array(existing_config.get('T_B_0_camera_frame', []))
                 
                 reference_camera_temperature = existing_config.get('reference_camera_temperature', {})
@@ -2208,24 +2350,7 @@ async def main(
 
         # Test the hand-eye transformation with provided poses
         if poses is None:
-            print("No poses provided, using default poses")
-            initial_pose = await _get_current_arm_pose(motion_service, arm.name, arm)
-            print(f"Initial pose theta: {initial_pose.theta:.1f}°")
-            
-            poses = []
-            for i in range(4):
-                new_pose = Pose(
-                    x=initial_pose.x,
-                    y=initial_pose.y,
-                    z=initial_pose.z,
-                    o_x=initial_pose.o_x,
-                    o_y=initial_pose.o_y,
-                    o_z=initial_pose.o_z,
-                    theta=i * 90  # Normalize to 0°, 90°, 180°, 270°
-                )
-                poses.append(new_pose)
-            print(f"Created poses at: 0°, 90°, 180°, 270°")
-        
+            raise Exception("No poses provided")
 
         await arm.do_command({"set_vel": DEFAULT_VELOCITY_SLOW})
         
@@ -2267,6 +2392,16 @@ async def main(
             target_pose_in_frame = PoseInFrame(reference_frame=DEFAULT_WORLD_FRAME, pose=target_pose)
             await motion_service.move(component_name=arm.name, destination=target_pose_in_frame)
             await asyncio.sleep(DEFAULT_SETTLE_TIME)  # Increased settling time to reduce motion blur
+            
+            # Get actual arm pose after movement and compare with commanded pose
+            A_i_pose_world_frame_raw_after_move, A_i_pose_world_frame_raw_from_motion_service_after_move = await _get_current_arm_pose(motion_service, arm.name, arm)
+            
+            # Compare commanded pose vs actual arm pose
+            commanded_vs_arm_comparison = compare_poses(
+                target_pose,
+                A_i_pose_world_frame_raw_after_move,
+                label=f"Commanded vs Actual Pose - Pose {actual_pose_number}"
+            )
             
             # Perform 3 measurements for this pose
             measurements = []
@@ -2321,10 +2456,20 @@ async def main(
             print(f"    Avg rotation error: {measurement_stats.get('rotation_error_avg', 0):.3f}±{measurement_stats.get('rotation_error_std', 0):.3f}°")
             print(f"    Avg translation error: {measurement_stats.get('translation_error_avg', 0):.3f}±{measurement_stats.get('translation_error_std', 0):.3f}mm")
 
-            # Get current arm pose for pose data
-            A_i_pose_world_frame_raw = await _get_current_arm_pose(motion_service, arm.name, arm)
+            # Get current arm pose for pose data (reuse from after movement)
+            A_i_pose_world_frame_raw = A_i_pose_world_frame_raw_after_move
+            A_i_pose_world_frame_raw_from_motion_service = A_i_pose_world_frame_raw_from_motion_service_after_move
+            
+            # Compare poses from arm vs motion service
+            arm_vs_motion_comparison = compare_poses(
+                A_i_pose_world_frame_raw,
+                A_i_pose_world_frame_raw_from_motion_service,
+                label=f"Arm vs Motion Service - Pose {actual_pose_number}"
+            )
+            
             # Invert only the rotation, keep translation unchanged
             A_i_pose_world_frame = _invert_pose_rotation_only(A_i_pose_world_frame_raw)
+            A_i_pose_world_frame_from_motion_service = _invert_pose_rotation_only(A_i_pose_world_frame_raw_from_motion_service)
 
             # Use the first successful measurement for pose data
             successful_measurement = next((m for m in measurements if m and m.get('success', False)), None)
@@ -2404,12 +2549,34 @@ async def main(
                     "o_z": A_i_pose_world_frame.o_z,
                     "theta": A_i_pose_world_frame.theta
                 },
+                "A_i_pose_from_motion_service_raw": {
+                    "x": A_i_pose_world_frame_raw_from_motion_service.x,
+                    "y": A_i_pose_world_frame_raw_from_motion_service.y,
+                    "z": A_i_pose_world_frame_raw_from_motion_service.z,
+                    "o_x": A_i_pose_world_frame_raw_from_motion_service.o_x,
+                    "o_y": A_i_pose_world_frame_raw_from_motion_service.o_y,
+                    "o_z": A_i_pose_world_frame_raw_from_motion_service.o_z,
+                    "theta": A_i_pose_world_frame_raw_from_motion_service.theta
+                },
+                "A_i_pose_inverted_from_motion_service": {
+                    "x": A_i_pose_world_frame_from_motion_service.x,
+                    "y": A_i_pose_world_frame_from_motion_service.y,
+                    "z": A_i_pose_world_frame_from_motion_service.z,
+                    "o_x": A_i_pose_world_frame_from_motion_service.o_x,
+                    "o_y": A_i_pose_world_frame_from_motion_service.o_y,
+                    "o_z": A_i_pose_world_frame_from_motion_service.o_z,
+                    "theta": A_i_pose_world_frame_from_motion_service.theta
+                },
                 "rvec": rvec.tolist(),
                 "tvec": tvec.tolist(),
                 "T_B_i_camera_frame": T_B_i_camera_frame.tolist(),
                 "hand_eye_errors": hand_eye_errors,
                 "measurements": measurement_results,
                 "measurement_statistics": measurement_stats,
+                "pose_comparisons": {
+                    "commanded_vs_arm_after_move": commanded_vs_arm_comparison,
+                    "arm_after_move_vs_motion_service": arm_vs_motion_comparison
+                },
                 "summary": {
                     "num_measurements": len(measurement_results),
                     "success_rate": len(measurement_results) / 3.0,
