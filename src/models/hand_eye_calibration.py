@@ -223,7 +223,7 @@ class HandEyeCalibration(Generic, EasyResource):
 
         if self.motion is not None and is_pose:
             # Motion planning approach with pose
-            pif = PoseInFrame(reference_frame="world", pose=position_data)
+            pif = PoseInFrame(reference_frame=self.arm.name, pose=position_data)
 
             success = await self.motion.move(
                 component_name=self.arm.name,
