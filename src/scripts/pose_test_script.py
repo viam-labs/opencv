@@ -2036,6 +2036,7 @@ async def main(
     arm: Optional[Arm] = None
     motion_service: Optional[MotionClient] = None
     camera: Optional[Camera] = None
+    viam_client = None
     
     try:
         viam_client, machine = await connect()
