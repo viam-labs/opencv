@@ -222,8 +222,8 @@ class HandEyeCalibration(Generic, EasyResource):
         is_pose = isinstance(position_data, Pose)
 
         if self.motion is not None and is_pose:
-            # Motion planning approach with pose
-            pif = PoseInFrame(reference_frame=self.arm.name, pose=position_data)
+            # hack to get the arm to move relative to the base of the arm, not the end TCP
+            pif = PoseInFrame(reference_frame=self.arm.name + "_origin", pose=position_data)
 
             success = await self.motion.move(
                 component_name=self.arm.name,
