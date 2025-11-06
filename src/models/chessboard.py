@@ -133,11 +133,7 @@ class Chessboard(PoseTracker, EasyResource):
     async def get_camera_intrinsics(self) -> tuple:
         """Get camera intrinsic parameters"""
         if self.camera_intrinsics is None:
-            try:
-                camera_params = await self.camera.do_command({"get_camera_params": None})
-            except Exception:
-                self.logger.warning("Could not get mapped camera intrinsics parameters. Assuming mapped values.")
-                camera_params = await self.camera.get_properties()
+            camera_params = await self.camera.do_command({"get_camera_params": None})
             intrinsics = camera_params["Color"]["intrinsics"]
             dist_params = camera_params["Color"]["distortion"]
         else:
