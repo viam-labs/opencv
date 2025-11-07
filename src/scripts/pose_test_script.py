@@ -1382,11 +1382,15 @@ def generate_comprehensive_statistics(rotation_data):
     """
     Generate comprehensive statistics from all pose data.
     
+    Note: Uses ALL individual measurements (not per-pose averages).
+    If a pose has 3 measurements, all 3 are included in statistics.
+    This shows measurement variability and gives more data points.
+    
     Args:
         rotation_data: List of pose data dictionaries
         
     Returns:
-        dict with comprehensive statistics
+        dict with comprehensive statistics (aggregated across all individual measurements)
     """
     if not rotation_data:
         return {
@@ -1429,23 +1433,29 @@ def generate_comprehensive_statistics(rotation_data):
     cpu_temps = []
     
     for pose_data in rotation_data:
-        # Hand-eye errors
-        if 'hand_eye_errors' in pose_data:
-            hand_eye = pose_data['hand_eye_errors']
-            rotation_errors.append(hand_eye.get('rotation_error', 0))
-            translation_errors.append(hand_eye.get('translation_error', 0))
-        
-        # Measurement statistics
-        if 'measurement_statistics' in pose_data:
-            stats = pose_data['measurement_statistics']
-            if 'mean_reprojection_error_avg' in stats:
-                mean_reprojection_errors.append(stats['mean_reprojection_error_avg'])
-            if 'max_reprojection_error_avg' in stats:
-                max_reprojection_errors.append(stats['max_reprojection_error_avg'])
-            if 'sharpness_avg' in stats:
-                sharpness_values.append(stats['sharpness_avg'])
-            if 'corners_count_avg' in stats:
-                corner_counts.append(stats['corners_count_avg'])
+        # Collect data from all individual measurements (not per-pose averages)
+        if 'measurements' in pose_data:
+            for measurement in pose_data['measurements']:
+                if measurement and measurement.get('success', False):
+                    # Hand-eye errors from individual measurements
+                    if 'hand_eye_errors' in measurement:
+                        hand_eye = measurement['hand_eye_errors']
+                        rotation_errors.append(hand_eye.get('rotation_error', 0))
+                        translation_errors.append(hand_eye.get('translation_error', 0))
+                    
+                    # Reprojection errors from individual measurements
+                    if 'mean_reprojection_error' in measurement:
+                        mean_reprojection_errors.append(measurement['mean_reprojection_error'])
+                    if 'max_reprojection_error' in measurement:
+                        max_reprojection_errors.append(measurement['max_reprojection_error'])
+                    
+                    # Sharpness from individual measurements
+                    if 'sharpness' in measurement and measurement['sharpness'] != float('inf'):
+                        sharpness_values.append(measurement['sharpness'])
+                    
+                    # Corner counts from individual measurements
+                    if 'corners_count' in measurement:
+                        corner_counts.append(measurement['corners_count'])
         
         # Extract pose comparison data from compare_poses results
         pose_comparisons = pose_data.get('pose_comparisons', {})
@@ -2771,11 +2781,12 @@ async def main(
         print(f"\n📊 SUMMARY STATISTICS:")
         if resume_from_pose > 1:
             print(f"Note: Statistics include all poses from previous runs and current run")
+        print(f"Note: Statistics use ALL individual measurements (3 per pose), showing measurement variability")
         print(f"Total poses tested: {statistics['total_poses']}")
         print(f"Successful poses: {statistics['successful_poses']}")
         print(f"Success rate: {statistics['success_rate']:.1%}")
         
-        print(f"\n🎯 HAND-EYE VERIFICATION ERRORS:")
+        print(f"\n🎯 HAND-EYE VERIFICATION ERRORS (from all individual measurements):")
         print(f"Rotation error: {statistics['hand_eye']['rotation_error']['mean']:.3f}° ± {statistics['hand_eye']['rotation_error']['std']:.3f}°")
         print(f"  Range: {statistics['hand_eye']['rotation_error']['min']:.3f}° - {statistics['hand_eye']['rotation_error']['max']:.3f}°")
         print(f"Translation error: {statistics['hand_eye']['translation_error']['mean']:.3f}mm ± {statistics['hand_eye']['translation_error']['std']:.3f}mm")
