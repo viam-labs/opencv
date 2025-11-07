@@ -436,6 +436,10 @@ def _invert_pose_rotation_only(pose: Pose) -> Pose:
 
 async def connect(env_file: str):
     load_dotenv(env_file, override=True)
+    print(f"Loaded environment from: {env_file}")
+    print(f"VIAM_MACHINE_API_KEY: {os.getenv('VIAM_MACHINE_API_KEY')}")
+    print(f"VIAM_MACHINE_API_KEY_ID: {os.getenv('VIAM_MACHINE_API_KEY_ID')}")
+    print(f"VIAM_MACHINE_ADDRESS: {os.getenv('VIAM_MACHINE_ADDRESS')}")
     opts = RobotClient.Options.with_api_key( 
         api_key=os.getenv('VIAM_MACHINE_API_KEY'),
         api_key_id=os.getenv('VIAM_MACHINE_API_KEY_ID'),
@@ -2387,7 +2391,12 @@ async def main(
             debug_image = draw_marker_debug(image, rvec, tvec, camera_matrix, dist_coeffs, 
                                           marker_type=marker_type, chessboard_size=(chessboard_cols, chessboard_rows), 
                                           square_size=chessboard_square_size, aruco_size=aruco_size, validation_info=marker_info)
+            # Save to root directory
             cv2.imwrite(os.path.join(data_dir, "image_reference.jpg"), debug_image)
+            # Also save to pose_images directory
+            pose_images_dir = os.path.join(data_dir, "pose_images")
+            os.makedirs(pose_images_dir, exist_ok=True)
+            cv2.imwrite(os.path.join(pose_images_dir, "image_reference.jpg"), debug_image)
             print(f"✅ Reference pose saved")
         
         # List to store all rotation data
