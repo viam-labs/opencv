@@ -105,7 +105,7 @@ def rotation_error(R1, R2):
     angle_rad = np.arccos(np.clip((np.trace(R_error) - 1) / 2, -1.0, 1.0))
     return np.degrees(angle_rad)
 
-def compare_poses(pose1: Pose, pose2: Pose, label: str = "Pose comparison") -> dict:
+def compare_poses(pose1: Pose, pose2: Pose, label: str = "Pose comparison", verbose: bool = False) -> dict:
     """
     Compare two poses and return detailed differences.
     
@@ -164,23 +164,24 @@ def compare_poses(pose1: Pose, pose2: Pose, label: str = "Pose comparison") -> d
     }
     
     # Log the comparison
-    print(f"\n{'='*60}")
-    print(f"{label}")
-    print(f"{'='*60}")
-    print(f"Translation error: {translation_error:.3f} mm")
-    print(f"Rotation error: {rot_error_deg:.3f}°")
-    print(f"\nPosition differences (pose2 - pose1):")
-    print(f"  X: {position_diff['x']:+.3f} mm")
-    print(f"  Y: {position_diff['y']:+.3f} mm")
-    print(f"  Z: {position_diff['z']:+.3f} mm")
-    print(f"\nOrientation differences (pose2 - pose1):")
-    print(f"  o_x: {orientation_diff['o_x']:+.6f}")
-    print(f"  o_y: {orientation_diff['o_y']:+.6f}")
-    print(f"  o_z: {orientation_diff['o_z']:+.6f}")
-    print(f"  theta: {orientation_diff['theta']:+.3f}°")
-    print(f"\nPose 1: ({pose1.x:7.2f}, {pose1.y:7.2f}, {pose1.z:7.2f}) mm")
-    print(f"Pose 2: ({pose2.x:7.2f}, {pose2.y:7.2f}, {pose2.z:7.2f}) mm")
-    print(f"{'='*60}\n")
+    if verbose:
+        print(f"\n{'='*60}")
+        print(f"{label}")
+        print(f"{'='*60}")
+        print(f"Translation error: {translation_error:.3f} mm")
+        print(f"Rotation error: {rot_error_deg:.3f}°")
+        print(f"\nPosition differences (pose2 - pose1):")
+        print(f"  X: {position_diff['x']:+.3f} mm")
+        print(f"  Y: {position_diff['y']:+.3f} mm")
+        print(f"  Z: {position_diff['z']:+.3f} mm")
+        print(f"\nOrientation differences (pose2 - pose1):")
+        print(f"  o_x: {orientation_diff['o_x']:+.6f}")
+        print(f"  o_y: {orientation_diff['o_y']:+.6f}")
+        print(f"  o_z: {orientation_diff['o_z']:+.6f}")
+        print(f"  theta: {orientation_diff['theta']:+.3f}°")
+        print(f"\nPose 1: ({pose1.x:7.2f}, {pose1.y:7.2f}, {pose1.z:7.2f}) mm")
+        print(f"Pose 2: ({pose2.x:7.2f}, {pose2.y:7.2f}, {pose2.z:7.2f}) mm")
+        print(f"{'='*60}\n")
     
     return comparison
 
@@ -538,7 +539,7 @@ def frame_config_to_transformation_matrix(frame_config):
 
 
 def validate_chessboard_detection(image, corners, rvec, tvec, camera_matrix, dist_coeffs, 
-                                   chessboard_size, square_size=30.0, objp=None, data_dir=None):
+                                   chessboard_size, square_size=30.0, objp=None, data_dir=None, verbose=False):
     """
     Validate chessboard detection quality by computing reprojection error and sharpness.
     
@@ -598,18 +599,19 @@ def validate_chessboard_detection(image, corners, rvec, tvec, camera_matrix, dis
     mean_error_filtered_95th = np.mean(filtered_errors_95th) if len(filtered_errors_95th) > 0 else 0
     mean_error_filtered_abs = np.mean(filtered_errors_abs) if len(filtered_errors_abs) > 0 else 0
     
-    print(f"Reprojection error (OpenCV method): {mean_error:.3f} pixels")
-    print(f"Reprojection error (mean): {mean_error2:.3f} pixels")
-    print(f"Reprojection error (3σ filtered): {mean_error_filtered_3std:.3f} pixels ({len(filtered_errors_3std)}/{len(errors)} points)")
-    print(f"Reprojection error (95th percentile): {mean_error_filtered_95th:.3f} pixels ({len(filtered_errors_95th)}/{len(errors)} points)")
-    print(f"Reprojection error (<2px): {mean_error_filtered_abs:.3f} pixels ({len(filtered_errors_abs)}/{len(errors)} points)")
-    print(f"Max individual error: {max_error2:.3f} pixels")
-    
-    # Count outliers with different thresholds
+    # Count outliers with different thresholds (needed for histogram even if not verbose)
     outliers_1px = np.sum(errors > 1.0)
     outliers_2px = np.sum(errors > 2.0)
     outliers_5px = np.sum(errors > 5.0)
-    print(f"Outliers: {outliers_1px} >1px, {outliers_2px} >2px, {outliers_5px} >5px")
+    
+    if verbose:
+        print(f"Reprojection error (OpenCV method): {mean_error:.3f} pixels")
+        print(f"Reprojection error (mean): {mean_error2:.3f} pixels")
+        print(f"Reprojection error (3σ filtered): {mean_error_filtered_3std:.3f} pixels ({len(filtered_errors_3std)}/{len(errors)} points)")
+        print(f"Reprojection error (95th percentile): {mean_error_filtered_95th:.3f} pixels ({len(filtered_errors_95th)}/{len(errors)} points)")
+        print(f"Reprojection error (<2px): {mean_error_filtered_abs:.3f} pixels ({len(filtered_errors_abs)}/{len(errors)} points)")
+        print(f"Max individual error: {max_error2:.3f} pixels")
+        print(f"Outliers: {outliers_1px} >1px, {outliers_2px} >2px, {outliers_5px} >5px")
     
     # Create histogram of reprojection errors
     try:
@@ -664,7 +666,8 @@ def validate_chessboard_detection(image, corners, rvec, tvec, camera_matrix, dis
             histogram_path = histogram_filename
             
         plt.savefig(histogram_path, dpi=150, bbox_inches='tight')
-        print(f"Saved reprojection error histogram: {histogram_path}")
+        if verbose:
+            print(f"Saved reprojection error histogram: {histogram_path}")
         
         plt.close()  # Close to free memory
         
@@ -678,7 +681,7 @@ def validate_chessboard_detection(image, corners, rvec, tvec, camera_matrix, dis
 
 def get_chessboard_pose_in_camera_frame(image, camera_matrix, dist_coeffs, chessboard_size, 
                                        square_size=30.0, pnp_method=cv2.SOLVEPNP_IPPE, 
-                                       use_sb_detection=True, data_dir=None):
+                                       use_sb_detection=True, data_dir=None, verbose=False):
     """
     Get chessboard pose in camera frame using PnP with improved outlier filtering.
     
@@ -709,11 +712,13 @@ def get_chessboard_pose_in_camera_frame(image, camera_matrix, dist_coeffs, chess
     # Find chessboard corners using selected method
     corners = None
     if use_sb_detection:
-        print("Using findChessboardCornersSB (subpixel detection)")
+        if verbose:
+            print("Using findChessboardCornersSB (subpixel detection)")
         flags = (cv2.CALIB_CB_NORMALIZE_IMAGE + cv2.CALIB_CB_EXHAUSTIVE + cv2.CALIB_CB_ACCURACY)
         ret, corners = cv2.findChessboardCornersSB(gray, chessboard_size, flags=flags)
     else:
-        print("Using findChessboardCorners (traditional detection)")
+        if verbose:
+            print("Using findChessboardCorners (traditional detection)")
         ret, corners = cv2.findChessboardCorners(gray, chessboard_size, None)
     
     if ret:
@@ -728,14 +733,17 @@ def get_chessboard_pose_in_camera_frame(image, camera_matrix, dist_coeffs, chess
             sharpness_result = cv2.estimateChessboardSharpness(image, chessboard_size, corners)
             # The function returns a tuple ((sharpness_value, ...), sharpness_map)
             sharpness = sharpness_result[0][0]  # First element of first tuple
-            print(f"Chessboard sharpness: {sharpness:.2f} pixels")
+            if verbose:
+                print(f"Chessboard sharpness: {sharpness:.2f} pixels")
         except Exception as e:
-            print(f"Could not estimate sharpness: {e}")
+            if verbose:
+                print(f"Could not estimate sharpness: {e}")
             sharpness = float('inf')  # Mark as unknown
         
         
         # Filter outliers before solvePnP with IMPROVED thresholds
-        print(f"Original corners: {len(corners)} points")
+        if verbose:
+            print(f"Original corners: {len(corners)} points")
         
         # Method 1: Use iterative outlier filtering with tighter threshold
         try:
@@ -768,7 +776,7 @@ def get_chessboard_pose_in_camera_frame(image, camera_matrix, dist_coeffs, chess
                 good_indices = errors < threshold
                 
                 n_filtered = len(corners) - np.sum(good_indices)
-                if n_filtered > 0:
+                if n_filtered > 0 and verbose:
                     print(f"Filtering {n_filtered} outliers (threshold: {threshold:.2f}px)")
                     print(f"  Error range: {np.min(errors):.3f} to {np.max(errors):.3f}px")
                     print(f"  Median: {median_error:.3f}px, MAD: {mad:.3f}px")
@@ -776,25 +784,30 @@ def get_chessboard_pose_in_camera_frame(image, camera_matrix, dist_coeffs, chess
                 if np.sum(good_indices) >= 20:  # Need at least 20 points for reliable PnP
                     filtered_corners = corners[good_indices]
                     filtered_objp = objp[good_indices]
-                    print(f"Filtered corners: {len(filtered_corners)}/{len(corners)} points (error < {threshold:.2f}px)")
+                    if verbose:
+                        print(f"Filtered corners: {len(filtered_corners)}/{len(corners)} points (error < {threshold:.2f}px)")
                     
                     # Use filtered points for final solvePnP
                     success, rvec, tvec = cv2.solvePnP(filtered_objp, filtered_corners, camera_matrix, dist_coeffs, flags=pnp_method)
                     corners = filtered_corners  # Update corners for validation
                     objp = filtered_objp  # Update objp for validation
                 else:
-                    print(f"Not enough good points ({np.sum(good_indices)}), using all points")
+                    if verbose:
+                        print(f"Not enough good points ({np.sum(good_indices)}), using all points")
                     success, rvec, tvec = cv2.solvePnP(objp, corners, camera_matrix, dist_coeffs, flags=pnp_method)
             else:
-                print("Initial solvePnP failed, using all points")
+                if verbose:
+                    print("Initial solvePnP failed, using all points")
                 success, rvec, tvec = cv2.solvePnP(objp, corners, camera_matrix, dist_coeffs, flags=pnp_method)
                 
         except Exception as e:
-            print(f"Outlier filtering failed: {e}, using all points")
+            if verbose:
+                print(f"Outlier filtering failed: {e}, using all points")
             success, rvec, tvec = cv2.solvePnP(objp, corners, camera_matrix, dist_coeffs, flags=pnp_method)
 
         if not success:
-            print("Failed to solve PnP")
+            if verbose:
+                print("Failed to solve PnP")
             return False, None, None, None, None
 
         # Enhanced refinement with VVS
@@ -805,10 +818,11 @@ def get_chessboard_pose_in_camera_frame(image, camera_matrix, dist_coeffs, chess
         
         # Validate detection quality
         mean_error, max_error, reprojected_points, errors = validate_chessboard_detection(
-            image, corners, rvec, tvec, camera_matrix, dist_coeffs, chessboard_size, square_size, objp, data_dir
+            image, corners, rvec, tvec, camera_matrix, dist_coeffs, chessboard_size, square_size, objp, data_dir, verbose=verbose
         )
         
-        print(f"Chessboard detection quality: mean={mean_error:.3f}px, max={max_error:.3f}px")
+        if verbose:
+            print(f"Chessboard detection quality: mean={mean_error:.3f}px, max={max_error:.3f}px")
         
         # Return validation info as marker_info
         validation_info = {
@@ -1023,7 +1037,7 @@ def draw_marker_debug(image, rvec, tvec, camera_matrix, dist_coeffs, marker_type
 
 def get_marker_pose_in_camera_frame(image, camera_matrix, dist_coeffs, marker_type='chessboard', 
                                    chessboard_size=(11, 8), square_size=30.0,
-                                   aruco_id=0, aruco_size=200.0, aruco_dict='6X6_250', pnp_method='IPPE_SQUARE', use_sb_detection=True, data_dir=None):
+                                   aruco_id=0, aruco_size=200.0, aruco_dict='6X6_250', pnp_method='IPPE_SQUARE', use_sb_detection=True, data_dir=None, verbose=False):
     """
     Get marker pose in camera frame using PnP.
     Supports both chessboard and ArUco markers.
@@ -1035,7 +1049,7 @@ def get_marker_pose_in_camera_frame(image, camera_matrix, dist_coeffs, marker_ty
     """
     if marker_type == 'chessboard':
         pnp_method_const = get_pnp_method_constant(pnp_method)
-        return get_chessboard_pose_in_camera_frame(image, camera_matrix, dist_coeffs, chessboard_size, square_size, pnp_method=pnp_method_const, use_sb_detection=use_sb_detection, data_dir=data_dir)
+        return get_chessboard_pose_in_camera_frame(image, camera_matrix, dist_coeffs, chessboard_size, square_size, pnp_method=pnp_method_const, use_sb_detection=use_sb_detection, data_dir=data_dir, verbose=verbose)
     elif marker_type == 'aruco':
         aruco_dict_const = get_aruco_dict_constant(aruco_dict)
         pnp_method_const = get_pnp_method_constant(pnp_method)
@@ -1228,12 +1242,12 @@ async def perform_pose_measurement(camera, camera_matrix, dist_coeffs, marker_ty
     # Get camera image
     image = await get_camera_image(camera)
     
-    # Get marker pose
+    # Get marker pose (silently, for data collection)
     success, rvec, tvec, corners, marker_info = get_marker_pose_in_camera_frame(
         image, camera_matrix, dist_coeffs, marker_type=marker_type,
         chessboard_size=(chessboard_cols, chessboard_rows), square_size=chessboard_square_size,
         aruco_id=aruco_id, aruco_size=aruco_size, aruco_dict=aruco_dict, 
-        pnp_method=pnp_method, use_sb_detection=use_sb_detection, data_dir=data_dir
+        pnp_method=pnp_method, use_sb_detection=use_sb_detection, data_dir=data_dir, verbose=False
     )
     
     if not success:
@@ -1242,11 +1256,12 @@ async def perform_pose_measurement(camera, camera_matrix, dist_coeffs, marker_ty
     # Get current arm pose for hand-eye verification
     A_i_pose_world_frame_raw, A_i_pose_world_frame_raw_from_motion_service = await _get_current_arm_pose(motion_service, arm_name, arm)
     
-    # Compare poses from arm vs motion service
+    # Compare poses from arm vs motion service (silently, for data collection)
     pose_comparison = compare_poses(
         A_i_pose_world_frame_raw, 
         A_i_pose_world_frame_raw_from_motion_service,
-        label=f"Pose Comparison - Measurement {measurement_num}"
+        label=f"Pose Comparison - Measurement {measurement_num}",
+        verbose=False
     )
     
     # Invert only the rotation, keep translation unchanged
@@ -2161,8 +2176,6 @@ async def main(
         if not (is_resuming_check and has_existing_config_check):
             if reference_pose is not None:
                 print(f"\n=== MOVING TO REFERENCE POSE ===")
-                print(f"Reference pose: x={reference_pose['x']:.1f}, y={reference_pose['y']:.1f}, z={reference_pose['z']:.1f}")
-                print(f"Orientation: o_x={reference_pose['o_x']:.3f}, o_y={reference_pose['o_y']:.3f}, o_z={reference_pose['o_z']:.3f}, theta={reference_pose['theta']:.1f}°")
                 
                 # Convert reference pose dict to Viam Pose
                 reference_pose_viam = Pose(
@@ -2182,8 +2195,6 @@ async def main(
                 reference_pose_in_frame = PoseInFrame(reference_frame=arm.name  + "_origin", pose=reference_pose_viam)
                 await motion_service.move(component_name=arm.name, destination=reference_pose_in_frame)
                 await asyncio.sleep(DEFAULT_SETTLE_TIME)  # Settle time
-                
-                print(f"✅ Moved to reference pose")
                 # print(f"⏸️  PAUSING FOR EVALUATION - Press Enter to continue...")
                 # input()  # Pause for user evaluation
                 
@@ -2214,8 +2225,7 @@ async def main(
             A_0_pose_world_frame_from_motion_service = _invert_pose_rotation_only(A_0_pose_world_frame_raw_from_motion_service)
             T_A_0_world_frame_from_motion_service = _pose_to_matrix(A_0_pose_world_frame_from_motion_service)
             
-            # Compare the inverted poses as well
-            print(f"\n=== COMPARING INVERTED REFERENCE POSES ===")
+            # Compare the inverted poses as well (silently, for data collection)
             inverted_comparison = compare_poses(
                 A_0_pose_world_frame,
                 A_0_pose_world_frame_from_motion_service,
@@ -2232,11 +2242,9 @@ async def main(
             else:
                 data_dir = f"calibration_data_{timestamp}"
             os.makedirs(data_dir, exist_ok=True)
-            print(f"\n=== CREATING NEW DATA DIRECTORY: {data_dir} ===")
         else:
             # Use existing directory, create if it doesn't exist
             os.makedirs(data_dir, exist_ok=True)
-            print(f"\n=== USING EXISTING DATA DIRECTORY: {data_dir} ===")
         
         # Extract timestamp from existing directory name for consistency
         if data_dir.startswith("calibration_data_"):
@@ -2267,11 +2275,12 @@ async def main(
         
         # Setup logging
         log_file = setup_logging(data_dir, command=command)
-        print(f"Logging to: {log_file}")
         
         # Record start time
         start_time = datetime.now()
-        print(f"Test started at: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"\n=== POSE TEST STARTED ===")
+        print(f"Data directory: {data_dir}")
+        print(f"Started at: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
         
         # Check if we're resuming and if calibration config exists
         calibration_config_path = os.path.join(data_dir, "calibration_config.json")
@@ -2280,7 +2289,7 @@ async def main(
         
         if is_resuming and has_existing_config:
             # Load existing reference pose data
-            print(f"\n=== LOADING EXISTING REFERENCE POSE FROM CONFIG ===")
+            print(f"\n=== RESUMING FROM POSE {resume_from_pose} ===")
             try:
                 with open(calibration_config_path, 'r') as f:
                     existing_config = json.load(f)
@@ -2332,11 +2341,7 @@ async def main(
                 
                 reference_camera_temperature = existing_config.get('reference_camera_temperature', {})
                 
-                print(f"✅ Loaded existing reference pose:")
-                print(f"  Position: ({A_0_pose_world_frame_raw.x:.1f}, {A_0_pose_world_frame_raw.y:.1f}, {A_0_pose_world_frame_raw.z:.1f})")
-                print(f"  Orientation: ({A_0_pose_world_frame_raw.o_x:.3f}, {A_0_pose_world_frame_raw.o_y:.3f}, {A_0_pose_world_frame_raw.o_z:.3f}) @ {A_0_pose_world_frame_raw.theta:.1f}°")
-                print(f"  Reference temperature: RGB={reference_camera_temperature.get('rgb_temp_c', 'N/A'):.1f}°C, "
-                      f"Main Board={reference_camera_temperature.get('main_board_temp_c', 'N/A'):.1f}°C")
+                # Reference pose loaded silently (data is logged to file)
                 
             except Exception as e:
                 print(f"⚠️  Warning: Could not load existing config: {e}")
@@ -2351,23 +2356,28 @@ async def main(
             try:
                 temp_response = await camera.do_command({"get_camera_temperature": {}})
                 reference_camera_temperature = temp_response.get("get_camera_temperature", {})
-                print(f"Reference pose camera temperature: RGB={reference_camera_temperature.get('rgb_temp_c', 'N/A'):.1f}°C, "
-                      f"Main Board={reference_camera_temperature.get('main_board_temp_c', 'N/A'):.1f}°C")
-            except Exception as e:
-                print(f"Warning: Could not get camera temperature for reference pose: {e}")
+                # Temperature captured silently
+            except Exception:
+                pass  # Temperature capture failed silently
                 reference_camera_temperature = {}
 
             success, rvec, tvec, _, marker_info = get_marker_pose_in_camera_frame(
                 image, camera_matrix, dist_coeffs, marker_type=marker_type,
                 chessboard_size=(chessboard_cols, chessboard_rows), square_size=chessboard_square_size,
-                aruco_id=aruco_id, aruco_size=aruco_size, aruco_dict=aruco_dict, pnp_method=pnp_method, use_sb_detection=use_sb_detection, data_dir=data_dir
+                aruco_id=aruco_id, aruco_size=aruco_size, aruco_dict=aruco_dict, pnp_method=pnp_method, use_sb_detection=use_sb_detection, data_dir=data_dir, verbose=False
             )
             if not success:
-                print(f"Failed to detect {marker_type} in reference image")
+                print(f"⚠️  Failed to detect {marker_type} in reference image")
                 return
             
-            if marker_type == 'aruco':
-                print(f"Detected ArUco marker ID: {marker_info}")
+            # Show concise reference pose summary
+            if marker_info:
+                reproj_err = marker_info.get('mean_reprojection_error', 0)
+                reproj_max = marker_info.get('max_reprojection_error', 0)
+                sharpness = marker_info.get('sharpness', float('inf'))
+                reproj_quality = "✅" if reproj_err < 0.5 else "⚠️" if reproj_err < 1.0 else "❌"
+                sharpness_quality = "✅" if sharpness < 3.0 else "⚠️" if sharpness < 5.0 else "❌"
+                print(f"  📊 Reference: Reproj: {reproj_quality} {reproj_err:.3f}px (max: {reproj_max:.3f}px) | Sharpness: {sharpness_quality} {sharpness:.2f}px")
             
             # Convert rvec, tvec to 4x4 transformation matrix (chessboard in camera frame)
             # Don't transpose - solvePnP output is already in OpenCV convention
@@ -2412,7 +2422,7 @@ async def main(
                                           marker_type=marker_type, chessboard_size=(chessboard_cols, chessboard_rows), 
                                           square_size=chessboard_square_size, aruco_size=aruco_size, validation_info=marker_info)
             cv2.imwrite(os.path.join(data_dir, "image_reference.jpg"), debug_image)
-            print(f"Saved reference image and config")
+            print(f"✅ Reference pose saved")
         
         # List to store all rotation data
         rotation_data = []
@@ -2463,8 +2473,7 @@ async def main(
         start_index = resume_from_pose - 1
         poses_to_test = poses[start_index:]
         
-        print(f"\n=== TESTING {len(poses_to_test)} POSES (resuming from pose {resume_from_pose}) ===")
-        print(f"Each pose will be measured 3 times for statistical analysis")
+        print(f"\n=== TESTING {len(poses_to_test)} POSES ===")
         
         for i, pose_spec in enumerate(poses_to_test):
             actual_pose_number = start_index + i + 1
@@ -2485,9 +2494,6 @@ async def main(
             else:
                 # Pose object (default poses)
                 target_pose = pose_spec
-            print(f"  Position: ({target_pose.x:.1f}, {target_pose.y:.1f}, {target_pose.z:.1f})")
-            print(f"  Orientation: ({target_pose.o_x:.3f}, {target_pose.o_y:.3f}, {target_pose.o_z:.3f}) @ {target_pose.theta:.1f}°")
-
             # Move to target pose
             target_pose_in_frame = PoseInFrame(reference_frame=arm.name + "_origin", pose=target_pose)
             await motion_service.move(component_name=arm.name, destination=target_pose_in_frame)
@@ -2496,26 +2502,23 @@ async def main(
             # Get actual arm pose after movement and compare with commanded pose
             A_i_pose_world_frame_raw_after_move, A_i_pose_world_frame_raw_from_motion_service_after_move = await _get_current_arm_pose(motion_service, arm.name, arm)
             
-            # Compare commanded pose vs actual arm pose
+            # Compare commanded pose vs actual arm pose (silently, for data collection)
             commanded_vs_arm_comparison = compare_poses(
                 target_pose,
                 A_i_pose_world_frame_raw_after_move,
-                label=f"Commanded vs Actual Pose - Pose {actual_pose_number}"
+                label=f"Commanded vs Actual Pose - Pose {actual_pose_number}",
+                verbose=False
             )
             
             # Perform 3 measurements for this pose
             measurements = []
+            successful_count = 0
             for measurement_num in range(1, 4):
-                print(f"  Measurement {measurement_num}/3...")
-                
-                # Capture camera temperature
+                # Capture camera temperature (silently)
                 try:
                     temp_response = await camera.do_command({"get_camera_temperature": {}})
                     camera_temperature = temp_response.get("get_camera_temperature", {})
-                    print(f"    Camera temperature: RGB={camera_temperature.get('rgb_temp_c', 'N/A'):.1f}°C, "
-                          f"Main Board={camera_temperature.get('main_board_temp_c', 'N/A'):.1f}°C")
-                except Exception as e:
-                    print(f"    Warning: Could not get camera temperature: {e}")
+                except Exception:
                     camera_temperature = {}
                 
                 measurement = await perform_pose_measurement(
@@ -2531,6 +2534,8 @@ async def main(
                 if measurement is not None:
                     measurement['camera_temperature'] = camera_temperature
                     measurements.append(measurement)
+                    if measurement.get('success', False):
+                        successful_count += 1
                 else:
                     # Create a failed measurement entry with temperature data
                     failed_measurement = {
@@ -2540,12 +2545,6 @@ async def main(
                     }
                     measurements.append(failed_measurement)
                 
-                if measurement is None or not measurement.get('success', False):
-                    print(f"    Failed to detect {marker_type} in measurement {measurement_num}")
-                else:
-                    hand_eye_errors = measurement.get('hand_eye_errors', {})
-                    print(f"    Success: reprojection error={measurement.get('mean_reprojection_error', 0):.3f}px, sharpness={measurement.get('sharpness', 0):.2f}px, rotation error={hand_eye_errors.get('rotation_error', 0):.3f}°, translation error={hand_eye_errors.get('translation_error', 0):.3f}mm")
-                
                 # Small delay between measurements
                 if measurement_num < 3:
                     await asyncio.sleep(1.0)
@@ -2554,33 +2553,46 @@ async def main(
             measurement_stats = calculate_measurement_statistics(measurements)
             
             if measurement_stats is None or measurement_stats.get('success_rate', 0) == 0:
-                print(f"  All measurements failed for pose {actual_pose_number}, skipping")
+                print(f"  ❌ All measurements failed")
                 continue
             
-            print(f"  Measurement statistics:")
-            print(f"    Success rate: {measurement_stats['success_rate']:.1%}")
-            print(f"    Avg reprojection error: {measurement_stats.get('mean_reprojection_error_avg', 0):.3f}±{measurement_stats.get('mean_reprojection_error_std', 0):.3f}px")
-            print(f"    Avg sharpness: {measurement_stats.get('sharpness_avg', 0):.2f}±{measurement_stats.get('sharpness_std', 0):.2f}px")
-            print(f"    Avg corners: {measurement_stats.get('corners_count_avg', 0):.1f}±{measurement_stats.get('corners_count_std', 0):.1f}")
-            print(f"    Avg rotation error: {measurement_stats.get('rotation_error_avg', 0):.3f}±{measurement_stats.get('rotation_error_std', 0):.3f}°")
-            print(f"    Avg translation error: {measurement_stats.get('translation_error_avg', 0):.3f}±{measurement_stats.get('translation_error_std', 0):.3f}mm")
+            # Print concise summary for this pose
+            avg_reproj_err = measurement_stats.get('mean_reprojection_error_avg', 0)
+            avg_reproj_std = measurement_stats.get('mean_reprojection_error_std', 0)
+            avg_sharpness = measurement_stats.get('sharpness_avg', 0)
+            avg_sharpness_std = measurement_stats.get('sharpness_std', 0)
+            avg_rot_err = measurement_stats.get('rotation_error_avg', 0)
+            avg_rot_std = measurement_stats.get('rotation_error_std', 0)
+            avg_trans_err = measurement_stats.get('translation_error_avg', 0)
+            avg_trans_std = measurement_stats.get('translation_error_std', 0)
+            
+            # Quality indicators
+            reproj_quality = "✅" if avg_reproj_err < 0.5 else "⚠️" if avg_reproj_err < 1.0 else "❌"
+            sharpness_quality = "✅" if avg_sharpness < 3.0 else "⚠️" if avg_sharpness < 5.0 else "❌"
+            
+            print(f"  📊 Results: {successful_count}/3 successful | "
+                  f"Reproj: {reproj_quality} {avg_reproj_err:.3f}±{avg_reproj_std:.3f}px | "
+                  f"Sharpness: {sharpness_quality} {avg_sharpness:.2f}±{avg_sharpness_std:.2f}px")
+            print(f"  🎯 Errors: Rot={avg_rot_err:.3f}±{avg_rot_std:.3f}° | Trans={avg_trans_err:.3f}±{avg_trans_std:.3f}mm")
 
             # Get current arm pose for pose data (reuse from after movement)
             A_i_pose_world_frame_raw = A_i_pose_world_frame_raw_after_move
             A_i_pose_world_frame_raw_from_motion_service = A_i_pose_world_frame_raw_from_motion_service_after_move
             
-            # Compare poses from arm vs motion service
+            # Compare poses from arm vs motion service (silently, for data collection)
             arm_vs_motion_comparison = compare_poses(
                 A_i_pose_world_frame_raw,
                 A_i_pose_world_frame_raw_from_motion_service,
-                label=f"Arm vs Motion Service - Pose {actual_pose_number}"
+                label=f"Arm vs Motion Service - Pose {actual_pose_number}",
+                verbose=False
             )
             
-            # Also compare commanded vs motion service
+            # Also compare commanded vs motion service (silently, for data collection)
             commanded_vs_motion_comparison = compare_poses(
                 target_pose,
                 A_i_pose_world_frame_raw_from_motion_service,
-                label=f"Commanded vs Motion Service - Pose {actual_pose_number}"
+                label=f"Commanded vs Motion Service - Pose {actual_pose_number}",
+                verbose=False
             )
             
             # Invert only the rotation, keep translation unchanged
@@ -2729,11 +2741,6 @@ async def main(
             # Save pose data incrementally (in case of crash)
             with open(os.path.join(data_dir, "pose_data.json"), "w", encoding='utf-8') as f:
                 json.dump(rotation_data, f, indent=2, ensure_ascii=False)
-            print(f"  Saved pose {actual_pose_number} data")
-            
-            print(f"\n  📊 HAND-EYE VERIFICATION ERRORS:")
-            print(f"  Rotation error: {hand_eye_errors['rotation_error']:.3f}°")
-            print(f"  Translation error: {hand_eye_errors['translation_error']:.3f} mm")
 
             await asyncio.sleep(1.0)
         
