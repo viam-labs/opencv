@@ -7,6 +7,8 @@ import (
 
 	"github.com/golang/geo/r3"
 	"go.viam.com/rdk/spatialmath"
+
+	vizClient "github.com/viam-labs/motion-tools/client/client"
 )
 
 func orientationVectorToMatrix(ox, oy, oz, theta float64) {
@@ -65,6 +67,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "    %s ov2mat <ox> <oy> <oz> <theta>\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  Convert rotation matrix to orientation vector:\n")
 		fmt.Fprintf(os.Stderr, "    %s mat2ov <m11> <m12> <m13> <m21> <m22> <m23> <m31> <m32> <m33>\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  Visualize pose as a geometry:\n")
+		fmt.Fprintf(os.Stderr, "    %s viz <ox> <oy> <oz> <theta>\n", os.Args[0])
 		os.Exit(1)
 	}
 
@@ -126,6 +130,45 @@ func main() {
 			matrixElements[3], matrixElements[4], matrixElements[5], // Row 2
 			matrixElements[6], matrixElements[7], matrixElements[8], // Row 3
 		)
+
+	case "viz":
+		if len(os.Args) != 6 {
+			fmt.Fprintf(os.Stderr, "Usage: %s viz <ox> <oy> <oz> <theta>\n", os.Args[0])
+			os.Exit(1)
+		}
+
+		// Parse orientation vector components
+		ox, err := strconv.ParseFloat(os.Args[2], 64)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error parsing ox: %v\n", err)
+			os.Exit(1)
+		}
+
+		oy, err := strconv.ParseFloat(os.Args[3], 64)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error parsing oy: %v\n", err)
+			os.Exit(1)
+		}
+
+		oz, err := strconv.ParseFloat(os.Args[4], 64)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error parsing oz: %v\n", err)
+			os.Exit(1)
+		}
+
+		theta, err := strconv.ParseFloat(os.Args[5], 64)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error parsing theta: %v\n", err)
+			os.Exit(1)
+		}
+
+		pose := spatialmath.NewPose(
+			r3.Vector{X: 0, Y: 0, Z: 0},
+			&spatialmath.OrientationVectorDegrees{OX: ox, OY: oy, OZ: oz, Theta: theta},
+		)
+		geom, _ := spatialmath.NewBox(pose, r3.Vector{X: 100, Y: 100, Z: 10}, fmt.Sprintf("pose_%.2f_%.2f_%.2f_%.2f", ox, oy, oz, theta))
+
+		vizClient.DrawGeometry(geom, "red")
 
 	default:
 		// For backward compatibility, if no command is specified but we have 4 args,

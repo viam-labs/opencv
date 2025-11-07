@@ -10,9 +10,9 @@ import numpy as np
 from viam.proto.common import Pose
 
 try:
-    from utils.utils import call_go_mat2ov, call_go_ov2mat
+    from utils.utils import call_go_mat2ov, call_go_ov2mat, call_visualize_pose
 except ModuleNotFoundError:
-    from ..utils.utils import call_go_mat2ov, call_go_ov2mat
+    from ..utils.utils import call_go_mat2ov, call_go_ov2mat, call_visualize_pose
 
 
 def get_calibration_values_from_chessboard_from_image(
@@ -225,6 +225,9 @@ def perform_and_print_calibration(
                 indent=2,
             )
         )
+
+        # Visualize pose
+        call_visualize_pose(ox=ox, oy=oy, oz=oz, theta=theta)
     except Exception as e:
         print(f"Hand-eye calibration failed{print_label}: {e}")
 

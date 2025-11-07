@@ -94,3 +94,24 @@ def call_go_mat2ov(R: np.ndarray) -> tuple:
     except Exception as e:
         print(f"Failed to call Go mat2ov converter: {e}")
         return None
+    
+def call_visualize_pose(ox: float, oy: float, oz: float, theta: float) -> None:
+    # Visualizes a pose as a geometry in the vizClient
+    try:
+        binary_path = _get_binary_path()
+        
+        # Call Go binary with orientation vector parameters
+        result = subprocess.run([
+            binary_path, 'viz',
+            str(ox), str(oy), str(oz), str(theta)
+        ], capture_output=False, text=True)
+        
+        if result.returncode != 0:
+            print(f"Go binary error: {result.stderr}")
+            return None
+        
+        return None
+        
+    except Exception as e:
+        print(f"Failed to call Go orientation converter: {e}")
+        return None
