@@ -435,8 +435,12 @@ def _invert_pose_rotation_only(pose: Pose) -> Pose:
     # Convert back to pose
     return _matrix_to_pose(T_inv_rot)
 
-async def connect():
-    load_dotenv()
+async def connect(env_file: str):
+    load_dotenv(env_file, override=True)
+    print(f"Loaded environment from: {env_file}")
+    print(f"VIAM_MACHINE_API_KEY: {os.getenv('VIAM_MACHINE_API_KEY')}")
+    print(f"VIAM_MACHINE_API_KEY_ID: {os.getenv('VIAM_MACHINE_API_KEY_ID')}")
+    print(f"VIAM_MACHINE_ADDRESS: {os.getenv('VIAM_MACHINE_ADDRESS')}")
     opts = RobotClient.Options.with_api_key( 
         api_key=os.getenv('VIAM_MACHINE_API_KEY'),
         api_key_id=os.getenv('VIAM_MACHINE_API_KEY_ID'),
@@ -2009,6 +2013,7 @@ def create_summary_table_plot(rotation_data, data_dir, tag=None):
     plt.close()
 
 async def main(
+    env_file: str,
     arm_name: str,
     pose_tracker_name: str,
     motion_service_name: str,
@@ -2039,7 +2044,7 @@ async def main(
     viam_client = None
     
     try:
-        viam_client, machine = await connect()
+        viam_client, machine = await connect(env_file)
         app_client = viam_client.app_client
         arm = Arm.from_robot(machine, arm_name)
         await arm.do_command({"set_vel": 25})
@@ -2839,6 +2844,11 @@ Pose JSON format (list of pose objects):
 All pose objects must have: x, y, z, o_x, o_y, o_z, theta
         """
     )
+    parser.add_argument('--env-file', 
+        default='.env',
+        type=str,
+        help='Path to the .env file to use (default: .env)'
+    )
     parser.add_argument(
         '--camera-name',
         type=str,
@@ -2966,6 +2976,7 @@ All pose objects must have: x, y, z, o_x, o_y, o_z, theta
         exit(1)
 
     asyncio.run(main(
+        env_file=args.env_file,
         arm_name=args.arm_name,
         pose_tracker_name=args.pose_tracker_name,
         motion_service_name="motion",
