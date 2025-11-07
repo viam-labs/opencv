@@ -436,10 +436,6 @@ def _invert_pose_rotation_only(pose: Pose) -> Pose:
 
 async def connect(env_file: str):
     load_dotenv(env_file, override=True)
-    print(f"Loaded environment from: {env_file}")
-    print(f"VIAM_MACHINE_API_KEY: {os.getenv('VIAM_MACHINE_API_KEY')}")
-    print(f"VIAM_MACHINE_API_KEY_ID: {os.getenv('VIAM_MACHINE_API_KEY_ID')}")
-    print(f"VIAM_MACHINE_ADDRESS: {os.getenv('VIAM_MACHINE_ADDRESS')}")
     opts = RobotClient.Options.with_api_key( 
         api_key=os.getenv('VIAM_MACHINE_API_KEY'),
         api_key_id=os.getenv('VIAM_MACHINE_API_KEY_ID'),
@@ -1094,21 +1090,12 @@ def load_hand_eye_transform_from_json(json_path: str) -> np.ndarray:
     if isinstance(data, list) and len(data) == 4:
         if all(isinstance(row, list) and len(row) == 4 for row in data):
             T = np.array(data, dtype=np.float64)
-            print(f"Loaded hand-eye transformation from JSON (4x4 matrix format)")
-            print(f"\nHand-Eye Transformation Matrix:")
-            for i in range(4):
-                print(f"  [{T[i,0]:8.4f} {T[i,1]:8.4f} {T[i,2]:8.4f} {T[i,3]:8.4f}]")
             return T
     
     # Check if it's a frame configuration format
     if isinstance(data, dict):
         if 'translation' in data or 'orientation' in data:
             T = frame_config_to_transformation_matrix(data)
-            print(f"Loaded hand-eye transformation from JSON (frame config format)")
-            print (f"Frame config: {json.dumps(data, indent=2)}")
-            print(f"\nHand-Eye Transformation Matrix:")
-            for i in range(4):
-                print(f"  [{T[i,0]:8.4f} {T[i,1]:8.4f} {T[i,2]:8.4f} {T[i,3]:8.4f}]")
             return T
 
     
@@ -1118,7 +1105,6 @@ def load_hand_eye_transform_from_json(json_path: str) -> np.ndarray:
 
 async def get_hand_eye_from_machine(app_client: AppClient, camera_name: str):
     """Get the hand-eye transformation from the machine's frame configuration"""
-    print(f"\n=== EXTRACTING HAND-EYE TRANSFORMATION ===")
 
     try:
         organizations = await app_client.list_organizations()
@@ -1170,19 +1156,10 @@ async def get_hand_eye_from_machine(app_client: AppClient, camera_name: str):
             print(f"Warning: Frame configuration is not a dictionary")
             return None
 
-        print(f"Found camera frame configuration")
 
         parent = frame_config.get('parent', 'unknown')
         translation = frame_config.get('translation', {})
-        print(f"Parent frame: {parent}")
-        print(f"Translation: x={translation.get('x', 0):.3f}, y={translation.get('y', 0):.3f}, z={translation.get('z', 0):.3f}")
-
         T_hand_eye = frame_config_to_transformation_matrix(frame_config)
-
-        print(f"\nHand-Eye Transformation Matrix:")
-        for i in range(4):
-            print(f"  [{T_hand_eye[i,0]:8.4f} {T_hand_eye[i,1]:8.4f} {T_hand_eye[i,2]:8.4f} {T_hand_eye[i,3]:8.4f}]")
-
         return T_hand_eye
 
     except Exception as e:
@@ -2149,19 +2126,15 @@ async def main(
         motion_service = MotionClient.from_robot(machine, motion_service_name)
         pt = PoseTracker.from_robot(machine, pose_tracker_name)
 
-        print(f"Connected to robot")
 
         # Get the hand-eye transformation from camera configuration or manual JSON file
         if hand_eye_transform_file:
-            print(f"\n=== LOADING HAND-EYE TRANSFORMATION FROM FILE ===")
-            print(f"Loading from: {hand_eye_transform_file}")
             try:
                 T_hand_eye = load_hand_eye_transform_from_json(hand_eye_transform_file)
             except Exception as e:
                 print(f"ERROR: Failed to load hand-eye transformation from file: {e}")
                 return
         else:
-            print(f"\n=== EXTRACTING HAND-EYE TRANSFORMATION FROM MACHINE ===")
             T_hand_eye = await get_hand_eye_from_machine(app_client, camera_name)
             if T_hand_eye is None:
                 print("ERROR: Could not retrieve hand-eye transformation")
@@ -2175,7 +2148,6 @@ async def main(
         # Get initial poses (skip if resuming and config exists)
         if not (is_resuming_check and has_existing_config_check):
             if reference_pose is not None:
-                print(f"\n=== MOVING TO REFERENCE POSE ===")
                 
                 # Convert reference pose dict to Viam Pose
                 reference_pose_viam = Pose(
@@ -2259,7 +2231,6 @@ async def main(
             poses_file_dest = os.path.join(data_dir, os.path.basename(poses_file_path))
             try:
                 shutil.copy2(poses_file_path, poses_file_dest)
-                print(f"Copied poses file to: {poses_file_dest}")
             except Exception as e:
                 print(f"Warning: Could not copy poses file: {e}")
         
@@ -2278,9 +2249,6 @@ async def main(
         
         # Record start time
         start_time = datetime.now()
-        print(f"\n=== POSE TEST STARTED ===")
-        print(f"Data directory: {data_dir}")
-        print(f"Started at: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
         
         # Check if we're resuming and if calibration config exists
         calibration_config_path = os.path.join(data_dir, "calibration_config.json")
@@ -2289,7 +2257,6 @@ async def main(
         
         if is_resuming and has_existing_config:
             # Load existing reference pose data
-            print(f"\n=== RESUMING FROM POSE {resume_from_pose} ===")
             try:
                 with open(calibration_config_path, 'r') as f:
                     existing_config = json.load(f)
@@ -2323,7 +2290,6 @@ async def main(
                 
                 # When resuming, optionally re-fetch both poses for comparison
                 # For actual processing, use the saved arm pose
-                print(f"\n=== RE-FETCHING POSES FOR COMPARISON (RESUME) ===")
                 A_0_pose_world_frame_raw_recheck, A_0_pose_world_frame_raw_from_motion_service_recheck = await _get_current_arm_pose(motion_service, arm.name, arm)
                 
                 # Compare current poses (though robot may have moved)
@@ -2448,10 +2414,6 @@ async def main(
                     rotation_data = [pose for pose in existing_poses 
                                    if pose.get('pose_index', 0) < (resume_from_pose - 1)]
                     
-                    removed_count = len(existing_poses) - len(rotation_data)
-                    if removed_count > 0:
-                        print(f"Removed {removed_count} poses that will be re-measured (poses {resume_from_pose} onwards)")
-                    print(f"Loaded existing data for {len(rotation_data)} poses from {pose_data_path}")
                 except Exception as e:
                     print(f"Warning: Could not load existing pose data: {e}")
                     rotation_data = []
@@ -2473,11 +2435,10 @@ async def main(
         start_index = resume_from_pose - 1
         poses_to_test = poses[start_index:]
         
-        print(f"\n=== TESTING {len(poses_to_test)} POSES ===")
         
         for i, pose_spec in enumerate(poses_to_test):
             actual_pose_number = start_index + i + 1
-            print(f"\n=== POSE {actual_pose_number}/{len(poses)} ===")
+            print(f"\nPOSE {actual_pose_number}/{len(poses)}")
 
             # Create target pose from specification
             if isinstance(pose_spec, dict):
@@ -2745,7 +2706,6 @@ async def main(
             await asyncio.sleep(1.0)
         
         # Generate comprehensive statistics and add to pose data
-        print(f"\n=== GENERATING COMPREHENSIVE STATISTICS ===")
         
         # For statistics, we use all poses (rotation_data already contains the cleaned data)
         # rotation_data now contains: poses from before resume_from_pose + new poses from current run
@@ -2776,10 +2736,8 @@ async def main(
         pose_data_file = os.path.join(data_dir, "pose_data.json")
         with open(pose_data_file, "w", encoding='utf-8') as f:
             json.dump(pose_data_with_stats, f, indent=2, ensure_ascii=False)
-        print(f"Updated pose data with statistics saved to: {pose_data_file}")
         
         # Create comprehensive statistics plots
-        print(f"\n=== CREATING COMPREHENSIVE STATISTICS PLOTS ===")
         create_comprehensive_statistics_plot(all_poses_for_statistics, data_dir, tag)
         create_summary_table_plot(all_poses_for_statistics, data_dir, tag)
         create_pose_error_plot(all_poses_for_statistics, data_dir, tag)
@@ -2793,7 +2751,7 @@ async def main(
         print(f"Successful poses: {statistics['successful_poses']}")
         print(f"Success rate: {statistics['success_rate']:.1%}")
         
-        print(f"\n🎯 HAND-EYE VERIFICATION ERRORS (from all individual measurements):")
+        print(f"\n🎯 HAND-EYE VERIFICATION ERRORS (from all individual measurements)t :")
         print(f"Rotation error: {statistics['hand_eye']['rotation_error']['mean']:.3f}° ± {statistics['hand_eye']['rotation_error']['std']:.3f}°")
         print(f"  Range: {statistics['hand_eye']['rotation_error']['min']:.3f}° - {statistics['hand_eye']['rotation_error']['max']:.3f}°")
         print(f"Translation error: {statistics['hand_eye']['translation_error']['mean']:.3f}mm ± {statistics['hand_eye']['translation_error']['std']:.3f}mm")
@@ -2880,29 +2838,12 @@ async def main(
         print(f"Poses tested: {poses_tested}")
         print(f"Average time per pose: {avg_time_per_pose:.1f} seconds")
         
-        print(f"\n✅ ALL DATA SAVED TO: {data_dir}")
-        print(f"   - calibration_config.json (camera params, hand-eye, reference pose, temperature)")
-        print(f"   - pose_data.json (all arm poses, measurements, and comprehensive statistics)")
-        print(f"   - pose_test_log.txt (complete log file)")
-        print(f"   - comprehensive_statistics.png (comprehensive statistics plots)")
-        print(f"   - pose_accuracy_statistics.png (robot pose accuracy plots)")
-        print(f"   - pose_error_analysis.png (pose-by-pose error analysis with temperature overlay)")
-        print(f"   - statistics_summary_table.png (statistics summary table)")
-        if resume_from_pose == 1:
-            print(f"   - image_reference.jpg")
-            print(f"   - pose_images/ (contains image_pose_1-{len(poses)}.jpg)")
-        else:
-            print(f"   - image_reference.jpg")
-            print(f"   - pose_images/ (contains image_pose_{resume_from_pose}-{len(poses)}.jpg)")
-        print(f"   - reprojection_error_histograms/ (contains all reprojection error histograms)")
         
         # Return to reference pose
-        print(f"\n=== RETURNING TO REFERENCE POSE ===")
         A_0_pose_in_frame = PoseInFrame(reference_frame=arm.name + "_origin", pose=A_0_pose_world_frame_raw)
         await motion_service.move(component_name=arm.name, destination=A_0_pose_in_frame)
         await asyncio.sleep(5.0)  # Increased settling time
         
-        print("=" * 60)
         
     except Exception as e:
         print("Caught exception in script main: ")
@@ -3096,10 +3037,7 @@ All pose objects must have: x, y, z, o_x, o_y, o_z, theta
             print("No poses provided, using default poses")
             poses = None
         else:
-            print(f"Loaded {len(poses)} poses to test")
-            if reference_pose:
-                print(f"Reference pose found: x={reference_pose['x']:.1f}, y={reference_pose['y']:.1f}, z={reference_pose['z']:.1f}")
-            else:
+            if not reference_pose:
                 print("No reference pose specified - will use current arm position")
     except Exception as e:
         print(f"Error parsing poses: {e}")
