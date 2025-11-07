@@ -39,8 +39,6 @@ except ModuleNotFoundError:
         generate_object_points,
     )
 
-DEFAULT_WORLD_FRAME = "world"
-DEFAULT_VELOCITY_NORMAL = 25
 DEFAULT_VELOCITY_SLOW = 10
 DEFAULT_SETTLE_TIME = 5.0
 
@@ -2171,9 +2169,9 @@ async def main(
                 input("Press Enter to move to the reference/base position...")
                 
                 # Move to reference pose
-                reference_pose_in_frame = PoseInFrame(reference_frame=DEFAULT_WORLD_FRAME, pose=reference_pose_viam)
+                reference_pose_in_frame = PoseInFrame(reference_frame=arm.name  + "_origin", pose=reference_pose_viam)
                 await motion_service.move(component_name=arm.name, destination=reference_pose_in_frame)
-                await asyncio.sleep(2.0)  # Settle time
+                await asyncio.sleep(DEFAULT_SETTLE_TIME)  # Settle time
                 
                 print(f"✅ Moved to reference pose")
                 # print(f"⏸️  PAUSING FOR EVALUATION - Press Enter to continue...")
@@ -2481,7 +2479,7 @@ async def main(
             print(f"  Orientation: ({target_pose.o_x:.3f}, {target_pose.o_y:.3f}, {target_pose.o_z:.3f}) @ {target_pose.theta:.1f}°")
 
             # Move to target pose
-            target_pose_in_frame = PoseInFrame(reference_frame=DEFAULT_WORLD_FRAME, pose=target_pose)
+            target_pose_in_frame = PoseInFrame(reference_frame=arm.name + "_origin", pose=target_pose)
             await motion_service.move(component_name=arm.name, destination=target_pose_in_frame)
             await asyncio.sleep(DEFAULT_SETTLE_TIME)  # Increased settling time to reduce motion blur
             
@@ -2882,7 +2880,7 @@ async def main(
         
         # Return to reference pose
         print(f"\n=== RETURNING TO REFERENCE POSE ===")
-        A_0_pose_in_frame = PoseInFrame(reference_frame=DEFAULT_WORLD_FRAME, pose=A_0_pose_world_frame_raw)
+        A_0_pose_in_frame = PoseInFrame(reference_frame=arm.name + "_origin", pose=A_0_pose_world_frame_raw)
         await motion_service.move(component_name=arm.name, destination=A_0_pose_in_frame)
         await asyncio.sleep(5.0)  # Increased settling time
         
