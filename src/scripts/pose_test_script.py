@@ -1713,69 +1713,117 @@ def create_comprehensive_statistics_plot(rotation_data, data_dir, tag=None):
         # Row 1: Translation Errors
         # Commanded vs Arm
         if all_cmd_vs_arm_translation:
+            mean_val = np.mean(all_cmd_vs_arm_translation)
+            std_val = np.std(all_cmd_vs_arm_translation)
             axes2[0, 0].hist(all_cmd_vs_arm_translation, bins=20, alpha=0.7, color='darkgreen', edgecolor='black')
-            axes2[0, 0].axvline(np.mean(all_cmd_vs_arm_translation), color='red', linestyle='--', linewidth=2,
-                            label=f'Mean: {np.mean(all_cmd_vs_arm_translation):.3f}mm')
+            axes2[0, 0].axvline(mean_val, color='red', linestyle='--', linewidth=2,
+                            label=f'Mean: {mean_val:.3f}mm')
+            axes2[0, 0].axvline(mean_val + std_val, color='orange', linestyle=':', linewidth=1.5,
+                            label=f'±1σ: {std_val:.3f}mm')
+            axes2[0, 0].axvline(mean_val - std_val, color='orange', linestyle=':', linewidth=1.5)
+            y_max = axes2[0, 0].get_ylim()[1]
+            axes2[0, 0].fill_betweenx([0, y_max], mean_val - std_val, mean_val + std_val, 
+                                     alpha=0.2, color='orange', label=f'±1σ range')
             axes2[0, 0].set_xlabel('Translation Error (mm)')
             axes2[0, 0].set_ylabel('Frequency')
             axes2[0, 0].set_title('Commanded vs Arm (Translation)')
-            axes2[0, 0].legend()
+            axes2[0, 0].legend(fontsize=8)
             axes2[0, 0].grid(True, alpha=0.3)
         
         # Commanded vs Motion Service
         if all_cmd_vs_motion_translation:
+            mean_val = np.mean(all_cmd_vs_motion_translation)
+            std_val = np.std(all_cmd_vs_motion_translation)
             axes2[0, 1].hist(all_cmd_vs_motion_translation, bins=20, alpha=0.7, color='darkblue', edgecolor='black')
-            axes2[0, 1].axvline(np.mean(all_cmd_vs_motion_translation), color='red', linestyle='--', linewidth=2,
-                            label=f'Mean: {np.mean(all_cmd_vs_motion_translation):.3f}mm')
+            axes2[0, 1].axvline(mean_val, color='red', linestyle='--', linewidth=2,
+                            label=f'Mean: {mean_val:.3f}mm')
+            axes2[0, 1].axvline(mean_val + std_val, color='orange', linestyle=':', linewidth=1.5,
+                            label=f'±1σ: {std_val:.3f}mm')
+            axes2[0, 1].axvline(mean_val - std_val, color='orange', linestyle=':', linewidth=1.5)
+            y_max = axes2[0, 1].get_ylim()[1]
+            axes2[0, 1].fill_betweenx([0, y_max], mean_val - std_val, mean_val + std_val, 
+                                     alpha=0.2, color='orange', label=f'±1σ range')
             axes2[0, 1].set_xlabel('Translation Error (mm)')
             axes2[0, 1].set_ylabel('Frequency')
             axes2[0, 1].set_title('Commanded vs Motion Service (Translation)')
-            axes2[0, 1].legend()
+            axes2[0, 1].legend(fontsize=8)
             axes2[0, 1].grid(True, alpha=0.3)
         
         # Arm vs Motion Service
         if all_arm_vs_motion_translation:
+            mean_val = np.mean(all_arm_vs_motion_translation)
+            std_val = np.std(all_arm_vs_motion_translation)
             axes2[0, 2].hist(all_arm_vs_motion_translation, bins=20, alpha=0.7, color='darkorange', edgecolor='black')
-            axes2[0, 2].axvline(np.mean(all_arm_vs_motion_translation), color='red', linestyle='--', linewidth=2,
-                            label=f'Mean: {np.mean(all_arm_vs_motion_translation):.3f}mm')
+            axes2[0, 2].axvline(mean_val, color='red', linestyle='--', linewidth=2,
+                            label=f'Mean: {mean_val:.3f}mm')
+            axes2[0, 2].axvline(mean_val + std_val, color='orange', linestyle=':', linewidth=1.5,
+                            label=f'±1σ: {std_val:.3f}mm')
+            axes2[0, 2].axvline(mean_val - std_val, color='orange', linestyle=':', linewidth=1.5)
+            y_max = axes2[0, 2].get_ylim()[1]
+            axes2[0, 2].fill_betweenx([0, y_max], mean_val - std_val, mean_val + std_val, 
+                                     alpha=0.2, color='orange', label=f'±1σ range')
             axes2[0, 2].set_xlabel('Translation Error (mm)')
             axes2[0, 2].set_ylabel('Frequency')
             axes2[0, 2].set_title('Arm vs Motion Service (Translation)')
-            axes2[0, 2].legend()
+            axes2[0, 2].legend(fontsize=8)
             axes2[0, 2].grid(True, alpha=0.3)
         
         # Row 2: Rotation Errors
         # Commanded vs Arm
         if all_cmd_vs_arm_rotation:
+            mean_val = np.mean(all_cmd_vs_arm_rotation)
+            std_val = np.std(all_cmd_vs_arm_rotation)
             axes2[1, 0].hist(all_cmd_vs_arm_rotation, bins=20, alpha=0.7, color='darkgreen', edgecolor='black')
-            axes2[1, 0].axvline(np.mean(all_cmd_vs_arm_rotation), color='red', linestyle='--', linewidth=2,
-                            label=f'Mean: {np.mean(all_cmd_vs_arm_rotation):.3f}°')
+            axes2[1, 0].axvline(mean_val, color='red', linestyle='--', linewidth=2,
+                            label=f'Mean: {mean_val:.3f}°')
+            axes2[1, 0].axvline(mean_val + std_val, color='orange', linestyle=':', linewidth=1.5,
+                            label=f'±1σ: {std_val:.3f}°')
+            axes2[1, 0].axvline(mean_val - std_val, color='orange', linestyle=':', linewidth=1.5)
+            y_max = axes2[1, 0].get_ylim()[1]
+            axes2[1, 0].fill_betweenx([0, y_max], mean_val - std_val, mean_val + std_val, 
+                                     alpha=0.2, color='orange', label=f'±1σ range')
             axes2[1, 0].set_xlabel('Rotation Error (degrees)')
             axes2[1, 0].set_ylabel('Frequency')
             axes2[1, 0].set_title('Commanded vs Arm (Rotation)')
-            axes2[1, 0].legend()
+            axes2[1, 0].legend(fontsize=8)
             axes2[1, 0].grid(True, alpha=0.3)
         
         # Commanded vs Motion Service
         if all_cmd_vs_motion_rotation:
+            mean_val = np.mean(all_cmd_vs_motion_rotation)
+            std_val = np.std(all_cmd_vs_motion_rotation)
             axes2[1, 1].hist(all_cmd_vs_motion_rotation, bins=20, alpha=0.7, color='darkblue', edgecolor='black')
-            axes2[1, 1].axvline(np.mean(all_cmd_vs_motion_rotation), color='red', linestyle='--', linewidth=2,
-                            label=f'Mean: {np.mean(all_cmd_vs_motion_rotation):.3f}°')
+            axes2[1, 1].axvline(mean_val, color='red', linestyle='--', linewidth=2,
+                            label=f'Mean: {mean_val:.3f}°')
+            axes2[1, 1].axvline(mean_val + std_val, color='orange', linestyle=':', linewidth=1.5,
+                            label=f'±1σ: {std_val:.3f}°')
+            axes2[1, 1].axvline(mean_val - std_val, color='orange', linestyle=':', linewidth=1.5)
+            y_max = axes2[1, 1].get_ylim()[1]
+            axes2[1, 1].fill_betweenx([0, y_max], mean_val - std_val, mean_val + std_val, 
+                                     alpha=0.2, color='orange', label=f'±1σ range')
             axes2[1, 1].set_xlabel('Rotation Error (degrees)')
             axes2[1, 1].set_ylabel('Frequency')
             axes2[1, 1].set_title('Commanded vs Motion Service (Rotation)')
-            axes2[1, 1].legend()
+            axes2[1, 1].legend(fontsize=8)
             axes2[1, 1].grid(True, alpha=0.3)
         
         # Arm vs Motion Service
         if all_arm_vs_motion_rotation:
+            mean_val = np.mean(all_arm_vs_motion_rotation)
+            std_val = np.std(all_arm_vs_motion_rotation)
             axes2[1, 2].hist(all_arm_vs_motion_rotation, bins=20, alpha=0.7, color='darkorange', edgecolor='black')
-            axes2[1, 2].axvline(np.mean(all_arm_vs_motion_rotation), color='red', linestyle='--', linewidth=2,
-                            label=f'Mean: {np.mean(all_arm_vs_motion_rotation):.3f}°')
+            axes2[1, 2].axvline(mean_val, color='red', linestyle='--', linewidth=2,
+                            label=f'Mean: {mean_val:.3f}°')
+            axes2[1, 2].axvline(mean_val + std_val, color='orange', linestyle=':', linewidth=1.5,
+                            label=f'±1σ: {std_val:.3f}°')
+            axes2[1, 2].axvline(mean_val - std_val, color='orange', linestyle=':', linewidth=1.5)
+            y_max = axes2[1, 2].get_ylim()[1]
+            axes2[1, 2].fill_betweenx([0, y_max], mean_val - std_val, mean_val + std_val, 
+                                     alpha=0.2, color='orange', label=f'±1σ range')
             axes2[1, 2].set_xlabel('Rotation Error (degrees)')
             axes2[1, 2].set_ylabel('Frequency')
             axes2[1, 2].set_title('Arm vs Motion Service (Rotation)')
-            axes2[1, 2].legend()
+            axes2[1, 2].legend(fontsize=8)
             axes2[1, 2].grid(True, alpha=0.3)
         
         plt.tight_layout()
@@ -1783,7 +1831,6 @@ def create_comprehensive_statistics_plot(rotation_data, data_dir, tag=None):
         # Save the pose comparison plot
         pose_accuracy_file = os.path.join(data_dir, "pose_accuracy_statistics.png")
         plt.savefig(pose_accuracy_file, dpi=300, bbox_inches='tight')
-        print(f"Pose comparison statistics plot saved to: {pose_accuracy_file}")
         
         plt.close(fig2)
     
@@ -2391,8 +2438,6 @@ async def main(
             debug_image = draw_marker_debug(image, rvec, tvec, camera_matrix, dist_coeffs, 
                                           marker_type=marker_type, chessboard_size=(chessboard_cols, chessboard_rows), 
                                           square_size=chessboard_square_size, aruco_size=aruco_size, validation_info=marker_info)
-            # Save to root directory
-            cv2.imwrite(os.path.join(data_dir, "image_reference.jpg"), debug_image)
             # Also save to pose_images directory
             pose_images_dir = os.path.join(data_dir, "pose_images")
             os.makedirs(pose_images_dir, exist_ok=True)
