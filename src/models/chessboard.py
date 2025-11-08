@@ -33,8 +33,14 @@ except ModuleNotFoundError:
 
 # required attributes
 cam_attr = "camera_name"
+camera_intrinsics = "camera_intrinsics"
 pattern_attr = "pattern_size"
 square_attr = "square_size_mm"
+
+# Camera intrinsics required keys
+K_KEYS = ["fx", "fy", "cx", "cy"]
+DIST_KEYS = ["k1", "k2", "k3", "p1", "p2"]
+
 
 
 class Chessboard(PoseTracker, EasyResource):
@@ -81,6 +87,21 @@ class Chessboard(PoseTracker, EasyResource):
             raise Exception(f"Missing required {pattern_attr} attribute.")
         if attrs.get(square_attr) is None:
             raise Exception(f"Missing required {square_attr} attribute.")
+        if attrs.get(camera_intrinsics) is not None:
+            # Check to make sure the right keys are available
+            intrinsics_config = attrs.get(camera_intrinsics)
+            if intrinsics_config.get("K") is None:
+                raise Exception(f"Missing required K for camera intrinsics.")
+            K: dict = intrinsics_config.get("K")
+            for K_key in K_KEYS:
+                if K.get(K_key) is None:
+                    raise Exception(f"Missing required key {K_key} for K camera intrinsics.")
+            if intrinsics_config.get("dist") is None:
+                raise Exception(f"Missing required dist for camera intrinsics")
+            dist: dict = intrinsics_config.get("dist")
+            for dist_key in DIST_KEYS:
+                if dist.get(dist_key) is None:
+                    raise Exception(f"Missing required key {dist_key} for dist camera intrinsics.")
 
         return [str(cam)], []
 
@@ -104,14 +125,21 @@ class Chessboard(PoseTracker, EasyResource):
         self.pattern_size = [int(x) for x in pattern_list]
         self.square_size = attrs.get(square_attr)
 
+        # Get camera intrinsics provided by user if available
+        self.camera_intrinsics = attrs.get(camera_intrinsics)
+
         return super().reconfigure(config, dependencies)
     
     async def get_camera_intrinsics(self) -> tuple:
         """Get camera intrinsic parameters"""
-        camera_params = await self.camera.do_command({"get_camera_params": None})
-        intrinsics = camera_params["Color"]["intrinsics"]
-        dist_params = camera_params["Color"]["distortion"]
-        
+        if self.camera_intrinsics is None:
+            camera_params = await self.camera.do_command({"get_camera_params": None})
+            intrinsics = camera_params["Color"]["intrinsics"]
+            dist_params = camera_params["Color"]["distortion"]
+        else:
+            intrinsics = self.camera_intrinsics["K"]
+            dist_params = self.camera_intrinsics["dist"]
+
         K = np.array([
             [intrinsics["fx"], 0, intrinsics["cx"]],
             [0, intrinsics["fy"], intrinsics["cy"]],
