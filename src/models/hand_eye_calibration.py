@@ -19,6 +19,8 @@ from viam.media.video import CameraMimeType
 from viam.media.utils.pil import viam_to_pil_image
 
 from utils.utils import call_go_ov2mat, call_go_mat2ov
+from utils.camera_utils import get_camera_image, get_camera_intrinsics
+from utils.pose_utils import get_chessboard_pose_in_camera_frame
 
 CALIBS = ["eye-in-hand", "eye-to-hand"]
 METHODS = [
@@ -442,7 +444,27 @@ class HandEyeCalibration(Generic, EasyResource):
                 await self._move_arm_to_position(position, i, total_positions)
                 await asyncio.sleep(self.sleep_seconds)
 
-                R_base2gripper, t_base2gripper, R_cam2target, t_cam2target = await self.get_calibration_values()
+                if self.use_internal_pose_tracker:
+                    print("Using internal pose tracker")
+                    # Get arm pose separately
+                    arm_pose = await self.arm.get_end_position()
+                    R_base2gripper = call_go_ov2mat(
+                        arm_pose.o_x,
+                        arm_pose.o_y,
+                        arm_pose.o_z,
+                        arm_pose.theta
+                    )
+                    t_base2gripper = np.array([[arm_pose.x], [arm_pose.y], [arm_pose.z]], dtype=np.float64)
+                    
+                    # Get camera-to-target pose from chessboard
+                    image = await get_camera_image(self.camera)
+                    camera_matrix, dist_coeffs = await get_camera_intrinsics(self.camera)
+                    success, rvec, tvec, R_cam2target, t_cam2target, corners, validation_info = get_chessboard_pose_in_camera_frame(image, camera_matrix, dist_coeffs, self.pattern_size)
+                    if not success:
+                        self.logger.warning(f"Could not find calibration values from chessboard for position {i+1}/{total_positions}")
+                        continue
+                else:
+                    R_base2gripper, t_base2gripper, R_cam2target, t_cam2target = await self.get_calibration_values()
 
                 # TODO: Implement eye-to-hand. This should just be changing the
                 # order/in-frame values
