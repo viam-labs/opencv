@@ -6,6 +6,7 @@ from typing import Any, ClassVar, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
+
 from typing_extensions import Self
 from viam.components.arm import Arm, JointPositions
 from viam.components.camera import Camera
@@ -52,6 +53,7 @@ METHOD_ATTR = "method"
 MOTION_ATTR = "motion"
 POSE_TRACKER_ATTR = "pose_tracker"
 SLEEP_ATTR = "sleep_seconds"
+WEB_APP_RESOURCE_NAME_ATTR = "web_app_resource_name"
 PATTERN_SIZE_ATTR = "pattern_size"
 SQUARE_SIZE_MM_ATTR = "square_size_mm"
 WEB_APP_RESOURCE_NAME_ATTR = "web_app_resource_name"
@@ -210,6 +212,7 @@ class HandEyeCalibration(Generic, EasyResource):
         self.method = attrs.get(METHOD_ATTR, DEFAULT_METHOD)
         self.sleep_seconds = attrs.get(SLEEP_ATTR, DEFAULT_SLEEP_SECONDS)
         self.body_names = [attrs.get(BODY_NAME_ATTR)] if attrs.get(BODY_NAME_ATTR) is not None else []
+
         self.use_internal_pose_tracker = attrs.get(USE_INTERNAL_POSE_TRACKER_ATTR, False)
         if self.use_internal_pose_tracker and self.camera is None:
             raise Exception("Internal pose tracker requires a valid camera dependency.")
@@ -235,6 +238,14 @@ class HandEyeCalibration(Generic, EasyResource):
             self.logger.debug(f"Web app service configured: {self.web_app.name}")
         else:
             self.logger.debug("No web app service configured")
+
+        web_app_resource_name = attrs.get(WEB_APP_RESOURCE_NAME_ATTR)
+        self.web_app: EasyResource = dependencies.get(web_app_resource_name) if web_app_resource_name else None
+        if self.web_app is not None:
+            self.logger.debug(f"Web app service configured: {self.web_app.name}")
+        else:
+            self.logger.debug("No web app service configured")
+            
 
         return super().reconfigure(config, dependencies)
 
@@ -549,6 +560,20 @@ class HandEyeCalibration(Generic, EasyResource):
         resp = {}
         for key, value in command.items():
             match key:
+                case "run_simulated_calibration":
+                    print("running simulated calibration")
+                    calibration_id = str(uuid.uuid4())
+                    resp["run_simulated_calibration"] = {
+                        "calibration_id": calibration_id,
+                        "tracking_directory": None
+                    }
+
+                    tracking_dir = await self._resolve_tracking_directory(calibration_id)
+                    resp["run_simulated_calibration"]["tracking_directory"] = tracking_dir
+
+                    for i in range(10):
+                        np.save(os.path.join(tracking_dir, f"data_{i}.npy"), np.random.rand(10, 10))
+
                 case "run_calibration":
                     calibration_id = str(uuid.uuid4())
                     tracking_dir = await self._resolve_tracking_directory(calibration_id)
