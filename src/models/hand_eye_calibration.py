@@ -240,7 +240,23 @@ class HandEyeCalibration(Generic, EasyResource):
             self.logger.debug("No web app service configured")
 
         web_app_resource_name = attrs.get(WEB_APP_RESOURCE_NAME_ATTR)
-        self.web_app: EasyResource = dependencies.get(web_app_resource_name) if web_app_resource_name else None
+        self.web_app: Optional[Generic] = None
+        if web_app_resource_name:
+            print(f"web_app_resource_name: {web_app_resource_name}")
+            if isinstance(web_app_resource_name, str):
+                dependency_name = Generic.get_resource_name(web_app_resource_name)
+            elif isinstance(web_app_resource_name, Mapping):
+                dependency_name = ResourceName(**web_app_resource_name)
+            else:
+                raise Exception(
+                    f"'{WEB_APP_RESOURCE_NAME_ATTR}' must be a string or resource name mapping, got {type(web_app_resource_name)}"
+                )
+
+            dependency_name.type = "service"
+            dependency_name.namespace = dependency_name.namespace or "rdk"
+
+            self.web_app = dependencies.get(dependency_name)
+
         if self.web_app is not None:
             self.logger.debug(f"Web app service configured: {self.web_app.name}")
         else:
@@ -563,13 +579,11 @@ class HandEyeCalibration(Generic, EasyResource):
                 case "run_simulated_calibration":
                     print("running simulated calibration")
                     calibration_id = str(uuid.uuid4())
+                    tracking_dir = await self._resolve_tracking_directory(calibration_id)
                     resp["run_simulated_calibration"] = {
                         "calibration_id": calibration_id,
-                        "tracking_directory": None
+                        "tracking_directory": tracking_dir
                     }
-
-                    tracking_dir = await self._resolve_tracking_directory(calibration_id)
-                    resp["run_simulated_calibration"]["tracking_directory"] = tracking_dir
 
                     for i in range(10):
                         np.save(os.path.join(tracking_dir, f"data_{i}.npy"), np.random.rand(10, 10))
