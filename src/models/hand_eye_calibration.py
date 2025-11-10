@@ -1,6 +1,8 @@
 import asyncio
 import cv2
 import numpy as np
+import uuid
+import os
 from typing import ClassVar, Dict, Mapping, Optional, Sequence, Tuple
 
 from typing_extensions import Self
@@ -45,7 +47,7 @@ POSE_TRACKER_ATTR = "pose_tracker"
 SLEEP_ATTR = "sleep_seconds"
 PATTERN_SIZE_ATTR = "pattern_size"
 SQUARE_SIZE_MM_ATTR = "square_size_mm"
-
+WEB_APP_RESOURCE_NAME_ATTR = "web_app_resource_name"
 # Default config attribute values
 DEFAULT_SLEEP_SECONDS = 2.0
 DEFAULT_METHOD = "CALIB_HAND_EYE_TSAI"
@@ -126,6 +128,11 @@ class HandEyeCalibration(Generic, EasyResource):
             if camera_name is None:
                 raise Exception(f"When {USE_INTERNAL_POSE_TRACKER_ATTR} is True, {CAMERA_NAME_ATTR} is required.")
 
+        web_app_resource_name = attrs.get(WEB_APP_RESOURCE_NAME_ATTR)
+        if web_app_resource_name is not None:
+            if not isinstance(web_app_resource_name, str):
+                raise Exception(f"'{WEB_APP_RESOURCE_NAME_ATTR}' must be a string, got {type(web_app_resource_name)}")
+
         motion = attrs.get(MOTION_ATTR)
         optional_deps = []
         if motion is not None:
@@ -164,7 +171,6 @@ class HandEyeCalibration(Generic, EasyResource):
 
         # Parse joint positions or poses from config
         self.joint_positions = attrs.get(JOINT_POSITIONS_ATTR, [])
-
         poses_config = attrs.get(POSES_ATTR, [])
         self.poses = []
         for pose_dict in poses_config:
@@ -182,6 +188,7 @@ class HandEyeCalibration(Generic, EasyResource):
         self.method = attrs.get(METHOD_ATTR, DEFAULT_METHOD)
         self.sleep_seconds = attrs.get(SLEEP_ATTR, DEFAULT_SLEEP_SECONDS)
         self.body_names = [attrs.get(BODY_NAME_ATTR)] if attrs.get(BODY_NAME_ATTR) is not None else []
+    
         self.use_internal_pose_tracker = attrs.get(USE_INTERNAL_POSE_TRACKER_ATTR, False)
         if self.use_internal_pose_tracker:
             camera_name = attrs.get(CAMERA_NAME_ATTR)
@@ -196,6 +203,20 @@ class HandEyeCalibration(Generic, EasyResource):
             self.camera = dependencies.get(Camera.get_resource_name(camera_name))
             if self.camera is None:
                 raise Exception(f"Camera dependency '{camera_name}' not found in dependencies.")
+
+        web_app_resource_name = attrs.get(WEB_APP_RESOURCE_NAME_ATTR)
+        self.web_app: EasyResource = dependencies.get(web_app_resource_name) if web_app_resource_name else None
+        if self.web_app is not None:
+            self.logger.debug(f"Web app service configured: {self.web_app.name}")
+        else:
+            self.logger.debug("No web app service configured")
+
+        web_app_resource_name = attrs.get(WEB_APP_RESOURCE_NAME_ATTR)
+        self.web_app: EasyResource = dependencies.get(web_app_resource_name) if web_app_resource_name else None
+        if self.web_app is not None:
+            self.logger.debug(f"Web app service configured: {self.web_app.name}")
+        else:
+            self.logger.debug("No web app service configured")
 
         return super().reconfigure(config, dependencies)
 
@@ -382,6 +403,20 @@ class HandEyeCalibration(Generic, EasyResource):
         resp = {}
         for key, value in command.items():
             match key:
+                case "run_simulated_calibration":
+                    print("running simulated calibration")
+                    calibration_id = str(uuid.uuid4())
+                    resp["run_simulated_calibration"] = {
+                        "calibration_id": calibration_id,
+                        "tracking_directory": None
+                    }
+
+                    tracking_dir = await self._resolve_tracking_directory(calibration_id)
+                    resp["run_simulated_calibration"]["tracking_directory"] = tracking_dir
+
+                    for i in range(10):
+                        np.save(os.path.join(tracking_dir, f"data_{i}.npy"), np.random.rand(10, 10))
+
                 case "run_calibration":
                     R_gripper2base_list, t_gripper2base_list, R_target2cam_list, t_target2cam_list = await self._collect_calibration_data()
 
@@ -500,3 +535,29 @@ class HandEyeCalibration(Generic, EasyResource):
             return None, "no valid do_command submitted"
         
         return resp
+
+    async def _resolve_tracking_directory(self, calibration_id: str) -> str:
+        tracking_dir: Optional[str] = None
+
+        if self.web_app is not None:
+            try:
+                response = await self.web_app.do_command({"get_base_dir": None})
+                if isinstance(response, Mapping):
+                    tracking_dir = response.get("base_dir") or response.get("tracking_directory")
+                elif isinstance(response, (str, os.PathLike)):
+                    tracking_dir = os.fspath(response)
+            except Exception as err:
+                self.logger.warning(f"Failed to retrieve base directory from web app: {err}")
+
+        if not tracking_dir:
+            env_dir = os.getenv("HAND_EYE_TRACKING_DIR") or os.getenv("VIAM_MODULE_DATA")
+            if env_dir:
+                tracking_dir = os.path.join(env_dir, "calibration-passes")
+
+        if not tracking_dir:
+            tracking_dir = os.path.join(os.path.expanduser("~/.viam"), "calibration-passes")
+
+        tracking_dir = os.path.join(tracking_dir, calibration_id)
+        os.makedirs(tracking_dir, exist_ok=True)
+        self.logger.info(f"Capturing calibration data to {tracking_dir}")
+        return tracking_dir
