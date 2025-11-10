@@ -797,11 +797,13 @@ class HandEyeCalibration(Generic, EasyResource):
                 case "run_simulated_calibration":
                     print("running simulated calibration")
                     calibration_id = str(uuid.uuid4())
-                    tracking_dir = await self._resolve_tracking_directory(calibration_id)
                     resp["run_simulated_calibration"] = {
                         "calibration_id": calibration_id,
-                        "tracking_directory": tracking_dir
+                        "tracking_directory": None
                     }
+
+                    tracking_dir = await self._resolve_tracking_directory(calibration_id)
+                    resp["run_simulated_calibration"]["tracking_directory"] = tracking_dir
 
                     for i in range(10):
                         np.save(os.path.join(tracking_dir, f"data_{i}.npy"), np.random.rand(10, 10))
