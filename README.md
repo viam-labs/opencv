@@ -62,7 +62,8 @@ The following attribute template can be used to configure this model:
 "method": <string>,
 "pose_tracker": <string>,
 "motion": <string>,
-"sleep_seconds": <float>
+"sleep_seconds": <float>,
+"use_motion_service_for_poses": <bool>
 }
 ```
 
@@ -80,6 +81,7 @@ The following attributes are available for this model:
 | `pose_tracker`    | `string` | `Required` | Name of the pose tracker component to detect tracked bodies.                       |
 | `motion`          | `string` | `Optional` | Name of the motion service for motion planning with obstacle avoidance. When provided with `poses`, uses motion planning. When not provided with `poses`, uses direct `arm.move_to_position`. |
 | `sleep_seconds`   | `float`  | `Optional` | Sleep time between movements to allow for arm to settle (defaults to 2.0 seconds). |
+| `use_motion_service_for_poses` | `bool` | `Optional` | Whether to use the motion service's `get_pose()` method to retrieve arm poses during calibration (defaults to true). When true, uses `motion.get_pose()` with the arm's origin frame. When false, uses `arm.get_end_position()`. Requires `motion` service to be configured when true. |
 | `body_name`       | `string` | `Optional` | Name of the specific tracked body to use (e.g., AprilTag ID like "tag36h11:0" or chessboard corner like "corner_0"). Calibration expects exactly one pose, so if the pose tracker's `get_poses` returns more than one pose, this attribute will be necessary to specify. **Important**: When using chessboard corners, ensure the chessboard maintains consistent orientation across all calibration poses to ensure the same corner is tracked. |
 
 **Note**: Either `joint_positions` or `poses` must be provided. If both are provided, `poses` will take precedence.
@@ -144,7 +146,8 @@ Available methods are:
   "method": "CALIB_HAND_EYE_TSAI",
   "pose_tracker": "pose_tracker_opencv",
   "motion": "motion",
-  "sleep_seconds": 2.0
+  "sleep_seconds": 2.0,
+  "use_motion_service_for_poses": true
 }
 ```
 

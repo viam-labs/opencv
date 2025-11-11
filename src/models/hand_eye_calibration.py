@@ -37,10 +37,12 @@ METHOD_ATTR = "method"
 MOTION_ATTR = "motion"
 POSE_TRACKER_ATTR = "pose_tracker"
 SLEEP_ATTR = "sleep_seconds"
+USE_MOTION_SERVICE_FOR_POSES_ATTR = "use_motion_service_for_poses"
 
 # Default config attribute values
 DEFAULT_SLEEP_SECONDS = 2.0
 DEFAULT_METHOD = "CALIB_HAND_EYE_TSAI"
+DEFAULT_USE_MOTION_SERVICE_FOR_POSES = True
 
 
 class HandEyeCalibration(Generic, EasyResource):
@@ -117,6 +119,11 @@ class HandEyeCalibration(Generic, EasyResource):
         if motion is not None:
             optional_deps.append(str(motion))
 
+        # Validate that motion service is configured if use_motion_service_for_poses is true
+        use_motion_service_for_poses = attrs.get(USE_MOTION_SERVICE_FOR_POSES_ATTR, DEFAULT_USE_MOTION_SERVICE_FOR_POSES)
+        if use_motion_service_for_poses and motion is None:
+            raise Exception(f"'{USE_MOTION_SERVICE_FOR_POSES_ATTR}' is set to true but '{MOTION_ATTR}' is not configured. Either set '{USE_MOTION_SERVICE_FOR_POSES_ATTR}' to false or provide a '{MOTION_ATTR}' service name.")
+
         return [str(arm), str(pose_tracker)], optional_deps
 
     def reconfigure(
@@ -131,6 +138,7 @@ class HandEyeCalibration(Generic, EasyResource):
         attrs = struct_to_dict(config.attributes)
 
         arm = attrs.get(ARM_ATTR)
+        self.arm_name = arm
         self.arm: Arm = dependencies.get(Arm.get_resource_name(arm))
 
         pose_tracker = attrs.get(POSE_TRACKER_ATTR)
@@ -164,12 +172,21 @@ class HandEyeCalibration(Generic, EasyResource):
         self.method = attrs.get(METHOD_ATTR, DEFAULT_METHOD)
         self.sleep_seconds = attrs.get(SLEEP_ATTR, DEFAULT_SLEEP_SECONDS)
         self.body_names = [attrs.get(BODY_NAME_ATTR)] if attrs.get(BODY_NAME_ATTR) is not None else []
+        self.use_motion_service_for_poses = attrs.get(USE_MOTION_SERVICE_FOR_POSES_ATTR, DEFAULT_USE_MOTION_SERVICE_FOR_POSES)
 
         return super().reconfigure(config, dependencies)
     
     async def get_calibration_values(self):
-        arm_pose = await self.arm.get_end_position()
-        self.logger.debug(f"Found end of arm pose: {arm_pose}")
+        if self.use_motion_service_for_poses and self.motion is not None:
+            arm_pose_in_frame = await self.motion.get_pose(
+                component_name=self.arm_name,
+                destination_frame=self.arm_name + "_origin"
+            )
+            arm_pose = arm_pose_in_frame.pose
+            self.logger.debug(f"Found end of arm pose from motion service: {arm_pose}")
+        else:
+            arm_pose = await self.arm.get_end_position()
+            self.logger.debug(f"Found end of arm pose from arm.get_end_position: {arm_pose}")
 
         # Get rotation matrix: base -> gripper
         R_base2gripper = call_go_ov2mat(
@@ -373,7 +390,15 @@ class HandEyeCalibration(Generic, EasyResource):
 
                     resp["check_bodies"] = f"Number of tracked bodies seen: {len(tracked_poses)}"
                 case "get_current_arm_pose":
-                    arm_pose = await self.arm.get_end_position()
+                    if self.use_motion_service_for_poses and self.motion is not None:
+                        arm_pose_in_frame = await self.motion.get_pose(
+                            component_name=self.arm_name,
+                            destination_frame=self.arm_name + "_origin"
+                        )
+                        arm_pose = arm_pose_in_frame.pose
+                    else:
+                        arm_pose = await self.arm.get_end_position()
+                    
                     if arm_pose is None:
                         resp["get_current_arm_pose"] = "Could not get end position of arm"
                         break
