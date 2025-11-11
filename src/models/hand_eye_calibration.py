@@ -390,7 +390,10 @@ class HandEyeCalibration(Generic, EasyResource):
 
                     resp["check_bodies"] = f"Number of tracked bodies seen: {len(tracked_poses)}"
                 case "get_current_arm_pose":
-                    if self.use_motion_service_for_poses and self.motion is not None:
+                    if self.use_motion_service_for_poses:
+                        if self.motion is None:
+                            resp["get_current_arm_pose"] = f"{USE_MOTION_SERVICE_FOR_POSES_ATTR} is true, but motion service was None."
+                            break
                         arm_pose_in_frame = await self.motion.get_pose(
                             component_name=self.arm_name,
                             destination_frame=self.arm_name + "_origin"
