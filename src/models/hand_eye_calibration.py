@@ -58,6 +58,8 @@ WEB_APP_RESOURCE_NAME_ATTR = "web_app_resource_name"
 PATTERN_SIZE_ATTR = "pattern_size"
 SQUARE_SIZE_MM_ATTR = "square_size_mm"
 WEB_APP_RESOURCE_NAME_ATTR = "web_app_resource_name"
+ARM_POSE_SOURCE_ATTR = "arm_pose_source"
+ARM_POSE_SOURCE_VALUES = {"arm", "motion_service"}
 # Default config attribute values
 DEFAULT_SLEEP_SECONDS = 2.0
 DEFAULT_METHOD = "CALIB_HAND_EYE_TSAI"
@@ -122,6 +124,12 @@ class HandEyeCalibration(Generic, EasyResource):
             raise Exception(f"Missing required {CALIB_ATTR} attribute.")
         if calib not in CALIBS:
             raise Exception(f"{calib} is not an available calibration.")
+
+        arm_pose_source = attrs.get(ARM_POSE_SOURCE_ATTR, "motion_service").lower()
+        if arm_pose_source not in ARM_POSE_SOURCE_VALUES:
+            raise Exception(f"{arm_pose_source} is not a valid {ARM_POSE_SOURCE_ATTR}. Choose one of {sorted(ARM_POSE_SOURCE_VALUES)}.")
+        if arm_pose_source == "motion_service" and attrs.get(MOTION_ATTR) is None:
+            raise Exception(f"{ARM_POSE_SOURCE_ATTR}='{arm_pose_source}' requires '{MOTION_ATTR}' to be configured.")
 
         method = attrs.get(METHOD_ATTR, DEFAULT_METHOD)
         method_upper = method.upper()
@@ -211,6 +219,7 @@ class HandEyeCalibration(Generic, EasyResource):
         self.square_size = float(attrs.get(SQUARE_SIZE_MM_ATTR, 20.0))
 
         self.calibration_type = attrs.get(CALIB_ATTR, CALIBS[0])
+        self.arm_pose_source = attrs.get(ARM_POSE_SOURCE_ATTR, "motion_service").lower()
         requested_method = attrs.get(METHOD_ATTR, DEFAULT_METHOD).upper()
         if requested_method != "ALL" and requested_method not in METHODS:
             raise Exception(f"{requested_method} is not an available method for calibration.")
@@ -271,17 +280,16 @@ class HandEyeCalibration(Generic, EasyResource):
         return super().reconfigure(config, dependencies)
 
     async def get_calibration_values(self):
-        arm_pose = await self.arm.get_end_position()
-        self.logger.debug(f"Found end of arm pose: {arm_pose}")
+        arm_pose_primary, _, _ = await self._get_arm_pose_pair()
+        self.logger.debug(f"Using arm pose from '{self.arm_pose_source}': {arm_pose_primary}")
 
-        # Get rotation matrix: base -> gripper
         R_base2gripper = call_go_ov2mat(
-            arm_pose.o_x,
-            arm_pose.o_y,
-            arm_pose.o_z,
-            arm_pose.theta
+            arm_pose_primary.o_x,
+            arm_pose_primary.o_y,
+            arm_pose_primary.o_z,
+            arm_pose_primary.theta,
         )
-        t_base2gripper = np.array([[arm_pose.x], [arm_pose.y], [arm_pose.z]], dtype=np.float64)
+        t_base2gripper = np.array([[arm_pose_primary.x], [arm_pose_primary.y], [arm_pose_primary.z]], dtype=np.float64)
 
         # Get pose from the tracker (AprilTag, chessboard corner, etc.)
         tracked_poses: Dict[str, PoseInFrame] = await self.pose_tracker.get_poses(body_names=self.body_names)
@@ -355,6 +363,42 @@ class HandEyeCalibration(Generic, EasyResource):
                 await asyncio.sleep(0.05)
             self.logger.debug(f"Moved arm to joint position: {jp}")
 
+    async def _get_arm_pose_pair(self) -> Tuple[Pose, Optional[Pose], Optional[Pose]]:
+        pose_from_arm: Optional[Pose] = None
+        pose_from_motion_service: Optional[Pose] = None
+
+        try:
+            pose_from_arm = await self.arm.get_end_position()
+        except Exception as err:
+            if self.arm_pose_source == "arm":
+                raise Exception(f"Failed to get pose from arm: {err}") from err
+
+        if self.motion is not None:
+            try:
+                pose_in_frame_motion = await self.motion.get_pose(
+                    component_name=self.arm.name,
+                    destination_frame="world",
+                )
+                pose_from_motion_service = pose_in_frame_motion.pose
+            except Exception as err:
+                if self.arm_pose_source == "motion_service":
+                    raise Exception(f"Failed to get pose from motion service: {err}") from err
+
+        if self.arm_pose_source == "arm":
+            if pose_from_arm is None:
+                raise Exception("arm_pose_source 'arm' requires arm pose.")
+            primary_pose = pose_from_arm
+        else:  # motion_service
+            if pose_from_motion_service is None:
+                if pose_from_arm is None:
+                    raise Exception("arm_pose_source 'motion_service' requires motion service pose.")
+                self.logger.warning("Motion service pose unavailable; falling back to arm end position for calibration.")
+                primary_pose = pose_from_arm
+            else:
+                primary_pose = pose_from_motion_service
+
+        return primary_pose, pose_from_arm, pose_from_motion_service
+
     async def _collect_calibration_data(
         self,
         tracking_dir: Optional[str],
@@ -385,15 +429,8 @@ class HandEyeCalibration(Generic, EasyResource):
                 await self._move_arm_to_position(position, i, total_positions)
                 await asyncio.sleep(self.sleep_seconds)
 
-                arm_pose_raw = await self.arm.get_end_position()
-                arm_pose_inverted = invert_pose_rotation_only(arm_pose_raw)
-                arm_pose_motion_service: Optional[Pose] = None
-                if self.motion is not None:
-                    pose_in_frame_motion = await self.motion.get_pose(
-                        component_name=self.arm.name,
-                        destination_frame="world",
-                    )
-                    arm_pose_motion_service = pose_in_frame_motion.pose
+                arm_pose_primary, arm_pose_from_arm, arm_pose_motion_service = await self._get_arm_pose_pair()
+                arm_pose_inverted = invert_pose_rotation_only(arm_pose_primary)
 
                 detection_image: Optional[np.ndarray] = None
                 marker_info: Optional[Dict[str, Any]] = None
@@ -428,13 +465,14 @@ class HandEyeCalibration(Generic, EasyResource):
                         )
                         continue
 
+                    source_pose = arm_pose_primary
                     R_base2gripper = call_go_ov2mat(
-                        arm_pose_raw.o_x,
-                        arm_pose_raw.o_y,
-                        arm_pose_raw.o_z,
-                        arm_pose_raw.theta,
+                        source_pose.o_x,
+                        source_pose.o_y,
+                        source_pose.o_z,
+                        source_pose.theta,
                     )
-                    t_base2gripper = np.array([[arm_pose_raw.x], [arm_pose_raw.y], [arm_pose_raw.z]], dtype=np.float64)
+                    t_base2gripper = np.array([[source_pose.x], [source_pose.y], [source_pose.z]], dtype=np.float64)
 
                     R_cam2target = cv2.Rodrigues(rvec_detected)[0]
                     R_cam2target = R_cam2target.T
@@ -490,16 +528,20 @@ class HandEyeCalibration(Generic, EasyResource):
                 pose_info: Dict[str, Any] = {
                     "pose_index": i,
                     "pose_command": pose_command,
-                    "arm_pose_raw": pose_to_dict_struct(arm_pose_raw),
+                    "arm_pose_source": self.arm_pose_source,
                     "arm_pose_inverted": pose_to_dict_struct(arm_pose_inverted),
+                    "arm_pose_used": pose_to_dict_struct(arm_pose_primary),
                     "measurements": measurements,
                 }
 
+                if arm_pose_from_arm is not None:
+                    pose_info["arm_pose_from_arm"] = pose_to_dict_struct(arm_pose_from_arm)
                 if arm_pose_motion_service is not None:
                     pose_info["arm_pose_from_motion_service"] = pose_to_dict_struct(arm_pose_motion_service)
-                    pose_info["pose_comparisons"] = {
-                        "arm_vs_motion_service": compare_poses(arm_pose_raw, arm_pose_motion_service)
-                    }
+                if arm_pose_from_arm is not None and arm_pose_motion_service is not None:
+                    pose_info.setdefault("pose_comparisons", {})[
+                        "arm_vs_motion_service"
+                    ] = compare_poses(arm_pose_from_arm, arm_pose_motion_service)
 
                 pose_info["measurement_statistics"] = calculate_measurement_statistics(measurements)
                 rotation_data.append(pose_info)
@@ -630,6 +672,7 @@ class HandEyeCalibration(Generic, EasyResource):
                         "calibration_type": self.calibration_type,
                         "sleep_seconds": self.sleep_seconds,
                         "positions_tested": len(rotation_data),
+                        "arm_pose_source": self.arm_pose_source,
                     }
 
                     method_results: Dict[str, Any] = {}
