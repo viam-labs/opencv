@@ -33,8 +33,6 @@ try:
     from utils.chessboard_utils import (
         generate_object_points,
     )
-    from utils.camera_utils import get_camera_image, get_camera_intrinsics
-    from utils.pose_utils import get_chessboard_pose_in_camera_frame, pose_to_matrix, matrix_to_pose, invert_pose_rotation_only
 except ModuleNotFoundError:
     from ..utils.utils import call_go_ov2mat, call_go_mat2ov
     from ..utils.chessboard_utils import (
@@ -120,8 +118,8 @@ def compare_poses(pose1: Pose, pose2: Pose, label: str = "Pose comparison", verb
         Dictionary with comparison metrics
     """
     # Convert poses to matrices for comparison
-    T1 = pose_to_matrix(pose1)
-    T2 = pose_to_matrix(pose2)
+    T1 = _pose_to_matrix(pose1)
+    T2 = _pose_to_matrix(pose2)
     
     R1 = T1[:3, :3]
     R2 = T2[:3, :3]
@@ -377,6 +375,65 @@ def parse_poses_from_json(json_path: str) -> tuple:
 
     return poses, reference_pose
 
+def _pose_to_matrix(pose: Pose) -> np.ndarray:
+    """Convert a Viam Pose to a 4x4 homogeneous transformation matrix."""
+    # Get 3x3 rotation matrix from orientation vector
+    R = call_go_ov2mat(pose.o_x, pose.o_y, pose.o_z, pose.theta)
+    if R is None:
+        raise Exception("Failed to convert orientation vector to rotation matrix")
+
+    # Build 4x4 homogeneous transformation matrix
+    T = np.eye(4)
+    T[0:3, 0:3] = R
+    T[0:3, 3] = [pose.x, pose.y, pose.z]
+
+    return T
+
+def _matrix_to_pose(T: np.ndarray) -> Pose:
+    """Convert a 4x4 homogeneous transformation matrix to a Viam Pose."""
+    # Extract rotation matrix (top-left 3x3)
+    R = T[0:3, 0:3]
+
+    # Extract translation vector
+    t = T[0:3, 3]
+
+    # Convert rotation matrix to orientation vector
+    ov = call_go_mat2ov(R)
+    if ov is None:
+        raise Exception("Failed to convert rotation matrix to orientation vector")
+
+    ox, oy, oz, theta = ov
+
+    return Pose(
+        x=float(t[0]),
+        y=float(t[1]),
+        z=float(t[2]),
+        o_x=ox,
+        o_y=oy,
+        o_z=oz,
+        theta=theta
+    )
+
+def _invert_pose_rotation_only(pose: Pose) -> Pose:
+    """Invert only the rotation of a pose, keeping translation unchanged."""
+    # Convert pose to matrix
+    T = _pose_to_matrix(pose)
+
+    # Extract rotation and translation
+    R = T[0:3, 0:3]
+    t = T[0:3, 3]
+
+    # Invert rotation (transpose for rotation matrices)
+    R_inv = R.T
+
+    # Build new transformation with inverted rotation but same translation
+    T_inv_rot = np.eye(4)
+    T_inv_rot[0:3, 0:3] = R_inv
+    T_inv_rot[0:3, 3] = t  # Keep original translation
+
+    # Convert back to pose
+    return _matrix_to_pose(T_inv_rot)
+
 async def connect(env_file: str):
     load_dotenv(env_file, override=True)
     print(f"Loaded environment from: {env_file}")
@@ -481,6 +538,341 @@ def frame_config_to_transformation_matrix(frame_config):
     return T
 
 
+def validate_chessboard_detection(image, corners, rvec, tvec, camera_matrix, dist_coeffs, 
+                                   chessboard_size, square_size=30.0, objp=None, data_dir=None, verbose=False):
+    """
+    Validate chessboard detection quality by computing reprojection error and sharpness.
+    
+    Args:
+        objp: If provided, use this object points array. Otherwise generate from chessboard_size.
+              This is important when corners have been filtered for outliers!
+        data_dir: Directory to save histogram. If None, saves in current directory.
+    
+    Returns: (mean_reprojection_error, max_reprojection_error, reprojected_points, sharpness, errors)
+    """
+    # Generate 3D object points ONLY if not provided
+    if objp is None:
+        objp = np.zeros((chessboard_size[0] * chessboard_size[1], 3), np.float32)
+        objp[:, :2] = np.mgrid[0:chessboard_size[0], 0:chessboard_size[1]].T.reshape(-1, 2)
+        objp *= square_size
+    
+    # CRITICAL FIX: Reshape corners to (N, 2) to match reprojected_points
+    # OpenCV returns corners as (N, 1, 2), but we need (N, 2) for calculations
+    corners_2d = corners.reshape(-1, 2)
+    
+    # Verify dimensions match
+    if len(corners_2d) != len(objp):
+        raise ValueError(f"Dimension mismatch: {len(corners_2d)} corners but {len(objp)} object points")
+    
+    # Calculate reprojection errors using the same method as camera_calibration.py
+    # Project 3D points back to image space
+    reprojected_points, _ = cv2.projectPoints(objp, rvec, tvec, camera_matrix, dist_coeffs)
+    reprojected_points = reprojected_points.reshape(-1, 2)
+    
+    # Calculate reprojection error using camera_calibration.py method (OpenCV standard)
+    imgpoints2, _ = cv2.projectPoints(objp, rvec, tvec, camera_matrix, dist_coeffs)
+    error = cv2.norm(corners, imgpoints2, cv2.NORM_L2) / len(imgpoints2)
+    mean_error = error
+    
+    # Calculate per-point errors (NOW WITH CORRECT DIMENSIONS!)
+    errors = np.linalg.norm(corners_2d - reprojected_points, axis=1)
+    
+    # Filter outliers using multiple methods
+    # Method 1: Remove errors > 3 standard deviations
+    mean_error_raw = np.mean(errors)
+    std_error = np.std(errors)
+    threshold_3std = mean_error_raw + 3 * std_error
+    filtered_errors_3std = errors[errors < threshold_3std]
+    
+    # Method 2: Remove top 5% of errors (percentile-based)
+    threshold_95th = np.percentile(errors, 95)
+    filtered_errors_95th = errors[errors < threshold_95th]
+    
+    # Method 3: Remove errors > 2 pixels (tighter absolute threshold for calibration)
+    threshold_abs = 2.0
+    filtered_errors_abs = errors[errors < threshold_abs]
+    
+    # Calculate statistics
+    mean_error2 = np.mean(errors)
+    max_error2 = np.max(errors)
+    mean_error_filtered_3std = np.mean(filtered_errors_3std) if len(filtered_errors_3std) > 0 else 0
+    mean_error_filtered_95th = np.mean(filtered_errors_95th) if len(filtered_errors_95th) > 0 else 0
+    mean_error_filtered_abs = np.mean(filtered_errors_abs) if len(filtered_errors_abs) > 0 else 0
+    
+    # Count outliers with different thresholds (needed for histogram even if not verbose)
+    outliers_1px = np.sum(errors > 1.0)
+    outliers_2px = np.sum(errors > 2.0)
+    outliers_5px = np.sum(errors > 5.0)
+    
+    if verbose:
+        print(f"Reprojection error (OpenCV method): {mean_error:.3f} pixels")
+        print(f"Reprojection error (mean): {mean_error2:.3f} pixels")
+        print(f"Reprojection error (3σ filtered): {mean_error_filtered_3std:.3f} pixels ({len(filtered_errors_3std)}/{len(errors)} points)")
+        print(f"Reprojection error (95th percentile): {mean_error_filtered_95th:.3f} pixels ({len(filtered_errors_95th)}/{len(errors)} points)")
+        print(f"Reprojection error (<2px): {mean_error_filtered_abs:.3f} pixels ({len(filtered_errors_abs)}/{len(errors)} points)")
+        print(f"Max individual error: {max_error2:.3f} pixels")
+        print(f"Outliers: {outliers_1px} >1px, {outliers_2px} >2px, {outliers_5px} >5px")
+    
+    # Create histogram of reprojection errors
+    try:
+        import matplotlib.pyplot as plt
+        
+        plt.figure(figsize=(12, 7))
+        
+        # Create histogram with appropriate bins for sub-pixel errors
+        max_bin_value = min(max_error2 * 1.1, 10.0)  # Cap at 10 pixels for better visualization
+        bins = np.linspace(0, max_bin_value, 51)
+        
+        plt.hist(errors, bins=bins, alpha=0.7, color='blue', edgecolor='black')
+        plt.axvline(mean_error2, color='red', linestyle='--', linewidth=2, label=f'Mean: {mean_error2:.3f}px')
+        plt.axvline(threshold_abs, color='green', linestyle='--', linewidth=2, label=f'{threshold_abs}px threshold')
+        
+        # Add percentile lines
+        p50 = np.percentile(errors, 50)
+        p95 = np.percentile(errors, 95)
+        plt.axvline(p50, color='purple', linestyle=':', linewidth=1.5, label=f'Median: {p50:.3f}px')
+        plt.axvline(p95, color='orange', linestyle=':', linewidth=1.5, label=f'95th %ile: {p95:.3f}px')
+        
+        plt.xlabel('Reprojection Error (pixels)', fontsize=12)
+        plt.ylabel('Number of Corners', fontsize=12)
+        plt.title('Distribution of Reprojection Errors\n(After Outlier Filtering)', fontsize=14)
+        plt.legend(fontsize=10)
+        plt.grid(True, alpha=0.3)
+        
+        # Add comprehensive statistics text
+        stats_text = (f'Total points: {len(errors)}\n'
+                     f'Mean: {mean_error2:.3f}px\n'
+                     f'Median: {p50:.3f}px\n'
+                     f'Std: {np.std(errors):.3f}px\n'
+                     f'Max: {max_error2:.3f}px\n'
+                     f'Outliers >2px: {outliers_2px}')
+        plt.text(0.98, 0.98, stats_text, transform=plt.gca().transAxes, 
+                verticalalignment='top', horizontalalignment='right',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8),
+                fontsize=10, family='monospace')
+        
+        plt.tight_layout()
+        
+        # Save histogram
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        histogram_filename = f"reprojection_error_histogram_{timestamp}.png"
+        
+        if data_dir:
+            # Create subdirectory for reprojection error histograms
+            histograms_dir = os.path.join(data_dir, "reprojection_error_histograms")
+            os.makedirs(histograms_dir, exist_ok=True)
+            histogram_path = os.path.join(histograms_dir, histogram_filename)
+        else:
+            histogram_path = histogram_filename
+            
+        plt.savefig(histogram_path, dpi=150, bbox_inches='tight')
+        if verbose:
+            print(f"Saved reprojection error histogram: {histogram_path}")
+        
+        plt.close()  # Close to free memory
+        
+    except ImportError:
+        print("Matplotlib not available, skipping histogram")
+    except Exception as e:
+        print(f"Failed to create histogram: {e}")
+    
+    return mean_error, max_error2, reprojected_points, errors
+
+
+def get_chessboard_pose_in_camera_frame(image, camera_matrix, dist_coeffs, chessboard_size, 
+                                       square_size=30.0, pnp_method=cv2.SOLVEPNP_IPPE, 
+                                       use_sb_detection=True, data_dir=None, verbose=False):
+    """
+    Get chessboard pose in camera frame using PnP with improved outlier filtering.
+    
+    Args:
+        data_dir: Directory to save histogram. If None, saves in current directory.
+    
+    Note: cv2.solvePnP returns the transformation from chessboard coordinates to camera coordinates.
+    This is T_chessboard_to_camera, NOT T_camera_to_chessboard.
+    
+    Args:
+        use_sb_detection: If True, use findChessboardCornersSB (more robust), otherwise use findChessboardCorners
+    
+    Returns: (success, rotation_vector, translation_vector, corners, marker_info)
+        - rvec, tvec represent the chessboard's pose in the camera's coordinate system
+        - marker_info contains validation info (reprojection error, sharpness)
+    """
+    # Convert to grayscale if needed
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image
+    
+    # Prepare 3D object points (chessboard corners in world coordinates)
+    objp = np.zeros((chessboard_size[0] * chessboard_size[1], 3), np.float32)
+    objp[:,:2] = np.mgrid[0:chessboard_size[0], 0:chessboard_size[1]].T.reshape(-1,2)
+    objp *= square_size  # Scale by square size (e.g., 25mm)
+    
+    # Find chessboard corners using selected method
+    corners = None
+    if use_sb_detection:
+        if verbose:
+            print("Using findChessboardCornersSB (subpixel detection)")
+        flags = (cv2.CALIB_CB_NORMALIZE_IMAGE + cv2.CALIB_CB_EXHAUSTIVE + cv2.CALIB_CB_ACCURACY)
+        ret, corners = cv2.findChessboardCornersSB(gray, chessboard_size, flags=flags)
+    else:
+        if verbose:
+            print("Using findChessboardCorners (traditional detection)")
+        ret, corners = cv2.findChessboardCorners(gray, chessboard_size, None)
+    
+    if ret:
+        # Enhanced corner refinement for higher accuracy (only for traditional method)
+        if not use_sb_detection:
+            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 50, 0.0001)  # More iterations, stricter convergence
+            corners = cv2.cornerSubPix(gray, corners, (15,15), (-1,-1), criteria)  # Larger refinement window
+
+        # Estimate chessboard sharpness (only when detection succeeds)
+        sharpness = float('inf')
+        try:
+            sharpness_result = cv2.estimateChessboardSharpness(image, chessboard_size, corners)
+            # The function returns a tuple ((sharpness_value, ...), sharpness_map)
+            sharpness = sharpness_result[0][0]  # First element of first tuple
+            if verbose:
+                print(f"Chessboard sharpness: {sharpness:.2f} pixels")
+        except Exception as e:
+            if verbose:
+                print(f"Could not estimate sharpness: {e}")
+            sharpness = float('inf')  # Mark as unknown
+        
+        
+        # Filter outliers before solvePnP with IMPROVED thresholds
+        if verbose:
+            print(f"Original corners: {len(corners)} points")
+        
+        # Method 1: Use iterative outlier filtering with tighter threshold
+        try:
+            # First, try to get an initial pose estimate with all points
+            success_init, rvec_init, tvec_init = cv2.solvePnP(objp, corners, camera_matrix, dist_coeffs, flags=pnp_method)
+            
+            if success_init:
+                # Project points back and calculate errors
+                projected_points, _ = cv2.projectPoints(objp, rvec_init, tvec_init, camera_matrix, dist_coeffs)
+                projected_points = projected_points.reshape(-1, 2)
+                corners_2d = corners.reshape(-1, 2)
+                
+                # Calculate reprojection errors
+                errors = np.linalg.norm(corners_2d - projected_points, axis=1)
+                
+                # IMPROVED: Use statistical outlier detection
+                # Filter using median absolute deviation (more robust than std)
+                median_error = np.median(errors)
+                mad = np.median(np.abs(errors - median_error))
+                
+                # Modified z-score using MAD
+                modified_z_scores = 0.6745 * (errors - median_error) / (mad + 1e-10)
+                
+                # Keep points with modified z-score < 3.5 (equivalent to ~3 sigma)
+                # OR use absolute threshold of 2 pixels (whichever is stricter)
+                threshold_statistical = median_error + 3.5 * mad
+                threshold_absolute = 2.0
+                threshold = min(threshold_statistical, threshold_absolute)
+                
+                good_indices = errors < threshold
+                
+                n_filtered = len(corners) - np.sum(good_indices)
+                if n_filtered > 0 and verbose:
+                    print(f"Filtering {n_filtered} outliers (threshold: {threshold:.2f}px)")
+                    print(f"  Error range: {np.min(errors):.3f} to {np.max(errors):.3f}px")
+                    print(f"  Median: {median_error:.3f}px, MAD: {mad:.3f}px")
+                
+                if np.sum(good_indices) >= 20:  # Need at least 20 points for reliable PnP
+                    filtered_corners = corners[good_indices]
+                    filtered_objp = objp[good_indices]
+                    if verbose:
+                        print(f"Filtered corners: {len(filtered_corners)}/{len(corners)} points (error < {threshold:.2f}px)")
+                    
+                    # Use filtered points for final solvePnP
+                    success, rvec, tvec = cv2.solvePnP(filtered_objp, filtered_corners, camera_matrix, dist_coeffs, flags=pnp_method)
+                    corners = filtered_corners  # Update corners for validation
+                    objp = filtered_objp  # Update objp for validation
+                else:
+                    if verbose:
+                        print(f"Not enough good points ({np.sum(good_indices)}), using all points")
+                    success, rvec, tvec = cv2.solvePnP(objp, corners, camera_matrix, dist_coeffs, flags=pnp_method)
+            else:
+                if verbose:
+                    print("Initial solvePnP failed, using all points")
+                success, rvec, tvec = cv2.solvePnP(objp, corners, camera_matrix, dist_coeffs, flags=pnp_method)
+                
+        except Exception as e:
+            if verbose:
+                print(f"Outlier filtering failed: {e}, using all points")
+            success, rvec, tvec = cv2.solvePnP(objp, corners, camera_matrix, dist_coeffs, flags=pnp_method)
+
+        if not success:
+            if verbose:
+                print("Failed to solve PnP")
+            return False, None, None, None, None
+
+        # Enhanced refinement with VVS
+        rvec, tvec = cv2.solvePnPRefineVVS(objp, corners, camera_matrix, dist_coeffs, rvec, tvec)
+        
+        # Additional refinement with LM method
+        rvec, tvec = cv2.solvePnPRefineLM(objp, corners, camera_matrix, dist_coeffs, rvec, tvec)
+        
+        # Validate detection quality
+        mean_error, max_error, reprojected_points, errors = validate_chessboard_detection(
+            image, corners, rvec, tvec, camera_matrix, dist_coeffs, chessboard_size, square_size, objp, data_dir, verbose=verbose
+        )
+        
+        if verbose:
+            print(f"Chessboard detection quality: mean={mean_error:.3f}px, max={max_error:.3f}px")
+        
+        # Return validation info as marker_info
+        validation_info = {
+            'mean_reprojection_error': mean_error,
+            'max_reprojection_error': max_error,
+            'reprojected_points': reprojected_points,
+            'sharpness': sharpness,
+            'errors': errors
+        }
+        
+        return True, rvec, tvec, corners, validation_info
+    else:
+        return False, None, None, None, None
+
+
+# [Rest of the file remains the same - just include the complete original file from line 696 onwards]
+# I'll mark this with a comment so you know where to append the rest
+
+async def get_camera_image(camera: Camera) -> np.ndarray:
+    cam_images = await camera.get_images()
+    pil_image = None
+    for cam_image in cam_images[0]:
+        # Accept any standard image format that viam_to_pil_image can handle
+        if cam_image.mime_type in [CameraMimeType.JPEG, CameraMimeType.PNG, CameraMimeType.VIAM_RGBA]:
+            pil_image = viam_to_pil_image(cam_image)
+            break
+    if pil_image is None:
+        raise Exception("Could not get latest image from camera")        
+    image = np.array(pil_image)
+    return image
+    
+async def get_camera_intrinsics(camera: Camera) -> tuple:
+    """Get camera intrinsic parameters"""
+    camera_params = await camera.do_command({"get_camera_params": None})
+    intrinsics = camera_params["Color"]["intrinsics"]
+    dist_params = camera_params["Color"]["distortion"]
+    
+    K = np.array([
+        [intrinsics["fx"], 0, intrinsics["cx"]],
+        [0, intrinsics["fy"], intrinsics["cy"]],
+        [0, 0, 1]
+    ], dtype=np.float32)
+
+    dist = np.array([dist_params["k1"], dist_params["k2"], dist_params["p1"], dist_params["p2"], dist_params["k3"]], dtype=np.float32)
+    
+    if K is None or dist is None:
+        raise Exception("Could not get camera intrinsic parameters")
+    
+    return K, dist
+
 def rvec_tvec_to_matrix(rvec, tvec):
     """Convert rotation vector and translation vector to 4x4 transformation matrix"""
     # Convert rotation vector to rotation matrix
@@ -493,6 +885,104 @@ def rvec_tvec_to_matrix(rvec, tvec):
     
     return T
 
+def get_aruco_pose_in_camera_frame(image, camera_matrix, dist_coeffs, marker_id=0, marker_size=300.0, aruco_dict=cv2.aruco.DICT_6X6_250, pnp_method=cv2.SOLVEPNP_IPPE_SQUARE):
+    """
+    Get ArUco marker pose in camera frame using PnP.
+    
+    Args:
+        image: Input image
+        camera_matrix: Camera intrinsic matrix
+        dist_coeffs: Distortion coefficients
+        marker_id: ID of the marker to detect (if None, uses first detected marker)
+        marker_size: Size of the marker in mm
+        aruco_dict: ArUco dictionary to use
+        pnp_method: PnP method to use (cv2.SOLVEPNP_* constant)
+        
+    Returns: (success, rotation_vector, translation_vector, corners, detected_id)
+        - rvec, tvec represent the marker's pose in the camera's coordinate system
+    """
+    # Convert to grayscale if needed
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image
+    
+    # Create ArUco detector with optimized parameters
+    aruco_dictionary = cv2.aruco.getPredefinedDictionary(aruco_dict)
+    parameters = cv2.aruco.DetectorParameters()
+    
+    # Optimize corner refinement for higher accuracy
+    parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+    parameters.cornerRefinementMaxIterations = 50
+    parameters.cornerRefinementMinAccuracy = 0.01
+    parameters.cornerRefinementWinSize = 7
+    parameters.relativeCornerRefinmentWinSize = 0.4
+    
+    # Optimize detection sensitivity
+    parameters.minMarkerPerimeterRate = 0.02
+    parameters.maxMarkerPerimeterRate = 3.0
+    parameters.minCornerDistanceRate = 0.03
+    
+    # Improve error correction
+    parameters.errorCorrectionRate = 0.8
+    parameters.maxErroneousBitsInBorderRate = 0.2
+    
+    # Optimize adaptive thresholding
+    parameters.adaptiveThreshWinSizeMin = 5
+    parameters.adaptiveThreshWinSizeMax = 25
+    parameters.adaptiveThreshWinSizeStep = 8
+    parameters.adaptiveThreshConstant = 5
+    
+    detector = cv2.aruco.ArucoDetector(aruco_dictionary, parameters)
+    
+    # Detect markers
+    corners, ids, rejected = detector.detectMarkers(gray)
+    
+    if ids is not None and len(ids) > 0:
+        # Find the requested marker (or use first one if marker_id is None)
+        marker_idx = None
+        if marker_id is None:
+            marker_idx = 0
+            detected_id = ids[0][0]
+        else:
+            for i, id_val in enumerate(ids):
+                if id_val[0] == marker_id:
+                    marker_idx = i
+                    detected_id = marker_id
+                    break
+        
+        if marker_idx is None:
+            print(f"Marker ID {marker_id} not found. Detected IDs: {ids.flatten()}")
+            return False, None, None, None, None
+        
+        # Get corners for the detected marker
+        marker_corners = corners[marker_idx][0]  # Shape: (4, 2)
+        
+        # Define 3D points of the marker (standard ArUco coordinate system)
+        # Origin at top-left, X-right, Y-down, Z-out
+        objp = np.array([
+            [0, 0, 0],                    # Top-left
+            [marker_size, 0, 0],          # Top-right
+            [marker_size, marker_size, 0], # Bottom-right
+            [0, marker_size, 0]           # Bottom-left
+        ], dtype=np.float32)
+        
+        # Solve PnP for this marker using specified method
+        success, rvec, tvec = cv2.solvePnP(
+            objp, marker_corners, camera_matrix, dist_coeffs,
+            flags=pnp_method
+        )
+        
+        if not success:
+            print("Failed to solve PnP for ArUco marker")
+            return False, None, None, None, None
+        
+        # Refine with VVS
+        rvec, tvec = cv2.solvePnPRefineVVS(objp, marker_corners, camera_matrix, dist_coeffs, rvec, tvec)
+        
+        return True, rvec, tvec, marker_corners, detected_id
+    else:
+        return False, None, None, None, None
 
 def get_pnp_method_constant(method_name: str):
     """Convert string PnP method name to cv2 constant."""
@@ -559,19 +1049,7 @@ def get_marker_pose_in_camera_frame(image, camera_matrix, dist_coeffs, marker_ty
     """
     if marker_type == 'chessboard':
         pnp_method_const = get_pnp_method_constant(pnp_method)
-        chessboard_result = get_chessboard_pose_in_camera_frame(
-            image,
-            camera_matrix,
-            dist_coeffs,
-            chessboard_size,
-            square_size,
-            pnp_method=pnp_method_const,
-            use_sb_detection=True,
-            verbose=False,
-        )
-        # get_chessboard_pose_in_camera_frame returns 7 values; map to the 5-value interface
-        success, rvec, tvec, _, _, corners, marker_info = chessboard_result
-        return success, rvec, tvec, corners, marker_info
+        return get_chessboard_pose_in_camera_frame(image, camera_matrix, dist_coeffs, chessboard_size, square_size, pnp_method=pnp_method_const, use_sb_detection=use_sb_detection, data_dir=data_dir, verbose=verbose)
     elif marker_type == 'aruco':
         aruco_dict_const = get_aruco_dict_constant(aruco_dict)
         pnp_method_const = get_pnp_method_constant(pnp_method)
@@ -768,10 +1246,10 @@ async def perform_pose_measurement(camera, camera_matrix, dist_coeffs, marker_ty
     )
     
     # Invert only the rotation, keep translation unchanged
-    A_i_pose_world_frame = invert_pose_rotation_only(A_i_pose_world_frame_raw)
-    A_i_pose_world_frame_from_motion_service = invert_pose_rotation_only(A_i_pose_world_frame_raw_from_motion_service)
-    T_A_i_world_frame = pose_to_matrix(A_i_pose_world_frame)
-    T_A_i_world_frame_from_motion_service = pose_to_matrix(A_i_pose_world_frame_from_motion_service)
+    A_i_pose_world_frame = _invert_pose_rotation_only(A_i_pose_world_frame_raw)
+    A_i_pose_world_frame_from_motion_service = _invert_pose_rotation_only(A_i_pose_world_frame_raw_from_motion_service)
+    T_A_i_world_frame = _pose_to_matrix(A_i_pose_world_frame)
+    T_A_i_world_frame_from_motion_service = _pose_to_matrix(A_i_pose_world_frame_from_motion_service)
     
     # Convert chessboard pose (don't transpose - solvePnP is OpenCV convention)
     T_B_i_camera_frame = rvec_tvec_to_matrix(rvec, tvec)
@@ -1699,9 +2177,6 @@ async def main(
         motion_service = MotionClient.from_robot(machine, motion_service_name)
         pt = PoseTracker.from_robot(machine, pose_tracker_name)
 
-        # Normalize PnP method string to OpenCV constant once for reuse
-        pnp_method_const = get_pnp_method_constant(pnp_method)
-
 
         # Get the hand-eye transformation from camera configuration or manual JSON file
         if hand_eye_transform_file:
@@ -1768,10 +2243,10 @@ async def main(
         
         # Invert only the rotation, keep translation unchanged (only if not resuming)
         if A_0_pose_world_frame_raw is not None:
-            A_0_pose_world_frame = invert_pose_rotation_only(A_0_pose_world_frame_raw)
-            T_A_0_world_frame = pose_to_matrix(A_0_pose_world_frame)
-            A_0_pose_world_frame_from_motion_service = invert_pose_rotation_only(A_0_pose_world_frame_raw_from_motion_service)
-            T_A_0_world_frame_from_motion_service = pose_to_matrix(A_0_pose_world_frame_from_motion_service)
+            A_0_pose_world_frame = _invert_pose_rotation_only(A_0_pose_world_frame_raw)
+            T_A_0_world_frame = _pose_to_matrix(A_0_pose_world_frame)
+            A_0_pose_world_frame_from_motion_service = _invert_pose_rotation_only(A_0_pose_world_frame_raw_from_motion_service)
+            T_A_0_world_frame_from_motion_service = _pose_to_matrix(A_0_pose_world_frame_from_motion_service)
             
             # Compare the inverted poses as well (silently, for data collection)
             inverted_comparison = compare_poses(
@@ -1862,7 +2337,7 @@ async def main(
                 )
                 
                 # Reconstruct T_A_0_world_frame and T_B_0_camera_frame
-                T_A_0_world_frame = pose_to_matrix(A_0_pose_world_frame)
+                T_A_0_world_frame = _pose_to_matrix(A_0_pose_world_frame)
                 
                 # When resuming, optionally re-fetch both poses for comparison
                 # For actual processing, use the saved arm pose
@@ -1876,8 +2351,8 @@ async def main(
                 )
                 
                 # Use the saved pose for processing, but note the motion service version for reference
-                A_0_pose_world_frame_from_motion_service = invert_pose_rotation_only(A_0_pose_world_frame_raw_from_motion_service_recheck)
-                T_A_0_world_frame_from_motion_service = pose_to_matrix(A_0_pose_world_frame_from_motion_service)
+                A_0_pose_world_frame_from_motion_service = _invert_pose_rotation_only(A_0_pose_world_frame_raw_from_motion_service_recheck)
+                T_A_0_world_frame_from_motion_service = _pose_to_matrix(A_0_pose_world_frame_from_motion_service)
                 
                 T_B_0_camera_frame = np.array(existing_config.get('T_B_0_camera_frame', []))
                 
@@ -1903,15 +2378,10 @@ async def main(
                 pass  # Temperature capture failed silently
                 reference_camera_temperature = {}
 
-            success, rvec, tvec, R_cam2target, t_cam2target, corners, marker_info = get_chessboard_pose_in_camera_frame(
-                image,
-                camera_matrix,
-                dist_coeffs,
-                (chessboard_cols, chessboard_rows),
-                square_size=chessboard_square_size,
-                pnp_method=pnp_method_const,
-                use_sb_detection=use_sb_detection,
-                verbose=False,
+            success, rvec, tvec, _, marker_info = get_marker_pose_in_camera_frame(
+                image, camera_matrix, dist_coeffs, marker_type=marker_type,
+                chessboard_size=(chessboard_cols, chessboard_rows), square_size=chessboard_square_size,
+                aruco_id=aruco_id, aruco_size=aruco_size, aruco_dict=aruco_dict, pnp_method=pnp_method, use_sb_detection=use_sb_detection, data_dir=data_dir, verbose=False
             )
             if not success:
                 print(f"⚠️  Failed to detect {marker_type} in reference image")
@@ -2141,8 +2611,8 @@ async def main(
             )
             
             # Invert only the rotation, keep translation unchanged
-            A_i_pose_world_frame = invert_pose_rotation_only(A_i_pose_world_frame_raw)
-            A_i_pose_world_frame_from_motion_service = invert_pose_rotation_only(A_i_pose_world_frame_raw_from_motion_service)
+            A_i_pose_world_frame = _invert_pose_rotation_only(A_i_pose_world_frame_raw)
+            A_i_pose_world_frame_from_motion_service = _invert_pose_rotation_only(A_i_pose_world_frame_raw_from_motion_service)
 
             # Use the first successful measurement for pose data
             successful_measurement = next((m for m in measurements if m and m.get('success', False)), None)
