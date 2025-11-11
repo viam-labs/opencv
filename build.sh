@@ -9,6 +9,10 @@ if ! $PYTHON -m pip install pyinstaller -Uqq; then
     exit 1
 fi
 
+if ! $PYTHON -m pip install -r requirements.txt -Uqq; then
+    exit 1
+fi
+
 # Build the Go binary
 echo "Building Go utils..."
 cd go_utils

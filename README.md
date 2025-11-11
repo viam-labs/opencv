@@ -286,6 +286,184 @@ The command returns a dictionary with the following structure:
 - Tilt and rotate the chessboard or the camera between captures for better calibration
 - At least 3 valid images are required for calibration to succeed
 
+## Model viam:opencv:pose-test
+
+A generic service that tests hand-eye calibration accuracy by measuring pose estimation errors across multiple arm positions. This service moves an arm with a mounted camera through predefined poses and compares the predicted camera motion (based on hand-eye calibration) against the actual arm motion to quantify calibration accuracy.
+
+### Pose Test Configuration
+
+The following attribute template can be used to configure this model:
+
+```json
+{
+  "arm_name": <string>,
+  "camera_name": <string>,
+  "pose_tracker": <string>,
+  "motion_service": <string>,
+  "world_frame": <string>,
+  "poses": <list>
+}
+```
+
+#### Pose Test Attributes
+
+The following attributes are available for this model:
+
+| Name              | Type     | Inclusion  | Description                                                                        |
+|-------------------|----------|------------|------------------------------------------------------------------------------------|
+| `arm_name`        | `string` | `Required` | Name of the arm component to move and test.                                        |
+| `camera_name`     | `string` | `Required` | Name of the camera component (must be mounted on arm with hand-eye calibration).  |
+| `pose_tracker`    | `string` | `Required` | Name of the pose tracker component.                                                |
+| `motion_service`  | `string` | `Required` | Name of the motion service for movement and pose queries.                          |
+| `world_frame`     | `string` | `Optional` | Name of the world reference frame (defaults to "world").                           |
+| `poses`           | `list`   | `Required` | List of poses to test. Each pose is a dict with keys: x, y, z, o_x, o_y, o_z, theta. Index 0 is the anchor pose. Minimum 2 poses required. |
+
+#### Pose Test Example Configuration
+
+```json
+{
+  "arm_name": "ur5e",
+  "camera_name": "cam",
+  "pose_tracker": "pose-tracker-opencv",
+  "motion_service": "motion",
+  "world_frame": "world",
+  "poses": [
+    {"x": 100, "y": 200, "z": 300, "o_x": 0, "o_y": 0, "o_z": 1, "theta": 0},
+    {"x": 150, "y": 200, "z": 300, "o_x": 0, "o_y": 0, "o_z": 1, "theta": 45},
+    {"x": 100, "y": 250, "z": 350, "o_x": 0, "o_y": 0, "o_z": 1, "theta": 90}
+  ]
+}
+```
+
+### Pose Test Commands
+
+The pose test service exposes the following commands via `do_command`:
+
+#### Get Current Pose
+
+Use the `get_current_pose` command to retrieve the current arm pose in the world frame. This is useful for building your list of test poses.
+
+**Command:**
+```python
+await pose_test.do_command({"get_current_pose": {}})
+```
+
+**Returns:**
+```json
+{
+  "pose": {
+    "x": 100.5,
+    "y": 200.3,
+    "z": 300.7,
+    "o_x": 0.0,
+    "o_y": 0.0,
+    "o_z": 1.0,
+    "theta": 45.2
+  }
+}
+```
+
+#### Validate Setup
+
+Use the `validate_setup` command to verify that all dependencies and configuration are correct before running the test.
+
+**Command:**
+```python
+await pose_test.do_command({"validate_setup": {}})
+```
+
+**Returns:**
+```json
+{
+  "success": true,
+  "arm_reachable": true,
+  "pose_tracker_exists": true,
+  "motion_exists": true,
+  "camera_frame_exists": true,
+  "hand_eye_transform_exists": true,
+  "num_poses_configured": 3,
+  "warnings": []
+}
+```
+
+#### Run Pose Test
+
+Use the `run_pose_test` command to execute the pose test algorithm. The service will move through all configured poses, calculate errors between predicted and actual camera motion, and return comprehensive results.
+
+**Command:**
+```python
+await pose_test.do_command({"run_pose_test": {}})
+```
+
+**Returns:**
+```json
+{
+  "success": true,
+  "num_poses_tested": 2,
+  "pose_errors": [
+    {
+      "pose_index": 1,
+      "translational_error_mm": {
+        "delta_x": 2.3,
+        "delta_y": -1.5,
+        "delta_z": 0.8,
+        "magnitude": 2.89
+      },
+      "rotational_error_deg": 1.2
+    },
+    {
+      "pose_index": 2,
+      "translational_error_mm": {
+        "delta_x": 3.1,
+        "delta_y": -2.1,
+        "delta_z": 1.2,
+        "magnitude": 3.95
+      },
+      "rotational_error_deg": 2.5
+    }
+  ],
+  "aggregate_errors": {
+    "mean_translational_error_mm": 3.42,
+    "max_translational_error_mm": 3.95,
+    "mean_rotational_error_deg": 1.85,
+    "max_rotational_error_deg": 2.5
+  }
+}
+```
+
+### How It Works
+
+The pose test algorithm works by comparing predicted camera motion (based on hand-eye calibration) against actual arm motion:
+
+1. **Anchor Pose**: The first pose (index 0) in the `poses` list serves as the reference/anchor
+2. **Hand-Eye Transform**: The transform X between camera and arm is derived from the frame system
+3. **For Each Test Pose**:
+   - Move arm to the test pose
+   - Calculate delta_B: Camera motion from anchor to current pose
+   - Calculate delta_A_estimated: Predicted arm motion based on camera motion and hand-eye transform (X * delta_B * inv(X))
+   - Calculate delta_A_actual: Actual arm motion from anchor to current pose
+   - Compare predicted vs actual to compute translational and rotational errors
+4. **Results**: Per-pose errors and aggregate statistics (mean and max errors)
+
+**Translational error** is measured as the absolute difference in x, y, z coordinates (in mm) and the magnitude of the difference vector.
+
+**Rotational error** is measured as the angular difference (in degrees) between predicted and actual orientations.
+
+### Workflow
+
+1. **Perform hand-eye calibration** using the `viam:opencv:handeyecalibration` service
+2. **Configure pose test service** with dependencies on arm, pose tracker, and motion service
+3. **Collect test poses**:
+   - Move arm to various positions
+   - Call `get_current_pose` at each position
+   - Add returned poses to the config's `poses` list
+   - Repeat for at least 2 poses (recommend 5-10 for better coverage)
+4. **Validate setup** by calling `validate_setup` to check configuration
+5. **Run test** by calling `run_pose_test` to execute the algorithm
+6. **Analyze results** to assess calibration quality:
+   - Low errors (< 5mm translational, < 5° rotational) indicate good calibration
+   - High errors suggest the hand-eye calibration may need adjustment
+
 ## Utility Scripts
 
 ### Touch Test Script
