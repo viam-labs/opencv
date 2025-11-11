@@ -26,6 +26,7 @@ from utils.calibration_logging import (
     calculate_measurement_statistics,
     compare_poses,
     draw_marker_debug,
+    rotation_error,
     save_run_outputs,
     save_json,
     update_hand_eye_errors_for_run,
@@ -686,6 +687,32 @@ class HandEyeCalibration(Generic, EasyResource):
                     pose_info.setdefault("pose_comparisons", {})[
                         "arm_vs_motion_service"
                     ] = compare_poses(arm_pose_from_arm, arm_pose_motion_service)
+
+                    t_arm = np.array([arm_pose_from_arm.x, arm_pose_from_arm.y, arm_pose_from_arm.z], dtype=float)
+                    t_motion = np.array(
+                        [arm_pose_motion_service.x, arm_pose_motion_service.y, arm_pose_motion_service.z],
+                        dtype=float,
+                    )
+                    translation_diff = float(np.linalg.norm(t_arm - t_motion))
+
+                    R_arm = call_go_ov2mat(
+                        arm_pose_from_arm.o_x,
+                        arm_pose_from_arm.o_y,
+                        arm_pose_from_arm.o_z,
+                        arm_pose_from_arm.theta,
+                    )
+                    R_motion = call_go_ov2mat(
+                        arm_pose_motion_service.o_x,
+                        arm_pose_motion_service.o_y,
+                        arm_pose_motion_service.o_z,
+                        arm_pose_motion_service.theta,
+                    )
+                    rotation_diff = rotation_error(R_arm, R_motion)
+
+                    pose_info.setdefault("pose_errors", {})["arm_vs_motion_service"] = {
+                        "translation_mm": translation_diff,
+                        "rotation_deg": rotation_diff,
+                    }
 
                 pose_info["measurement_statistics"] = calculate_measurement_statistics(measurements)
                 rotation_data.append(pose_info)
