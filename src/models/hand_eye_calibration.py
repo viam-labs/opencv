@@ -1,6 +1,7 @@
 import asyncio
 import os
 import uuid
+from copy import deepcopy
 from datetime import datetime
 from typing import Any, ClassVar, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -122,8 +123,9 @@ class HandEyeCalibration(Generic, EasyResource):
         if calib not in CALIBS:
             raise Exception(f"{calib} is not an available calibration.")
 
-        method = attrs.get(METHOD_ATTR)
-        if method not in METHODS:
+        method = attrs.get(METHOD_ATTR, DEFAULT_METHOD)
+        method_upper = method.upper()
+        if method_upper != "ALL" and method_upper not in METHODS:
             raise Exception(f"{method} is not an available method for calibration.")
 
         body_name = attrs.get(BODY_NAME_ATTR)
@@ -209,7 +211,10 @@ class HandEyeCalibration(Generic, EasyResource):
         self.square_size = float(attrs.get(SQUARE_SIZE_MM_ATTR, 20.0))
 
         self.calibration_type = attrs.get(CALIB_ATTR, CALIBS[0])
-        self.method = attrs.get(METHOD_ATTR, DEFAULT_METHOD)
+        requested_method = attrs.get(METHOD_ATTR, DEFAULT_METHOD).upper()
+        if requested_method != "ALL" and requested_method not in METHODS:
+            raise Exception(f"{requested_method} is not an available method for calibration.")
+        self.method = requested_method
         self.sleep_seconds = attrs.get(SLEEP_ATTR, DEFAULT_SLEEP_SECONDS)
         self.body_names = [attrs.get(BODY_NAME_ATTR)] if attrs.get(BODY_NAME_ATTR) is not None else []
 
@@ -756,77 +761,97 @@ class HandEyeCalibration(Generic, EasyResource):
 
                     self.logger.info(f"collected {len(R_gripper2base_list)} measurements, running calibration...")
 
-                    R_cam2gripper, t_cam2gripper = cv2.calibrateHandEye(
-                        R_gripper2base=R_gripper2base_list,
-                        t_gripper2base=t_gripper2base_list,
-                        R_target2cam=R_target2cam_list,
-                        t_target2cam=t_target2cam_list,
-                        method=getattr(cv2, self.method)
-                    )
-                    if R_cam2gripper is None or t_cam2gripper is None:
-                        raise Exception("could not solve calibration")
-                    
-                    # Convert OpenCV output to frame system format
-                    # Transpose rotation but keep translation as-is (consistent with input handling)
-                    R_gripper2cam = R_cam2gripper.T
-                    t_gripper2cam = t_cam2gripper.reshape(3, 1)
-                    
-                    # Rotation matrix to orientation vector
-                    orientation_result = call_go_mat2ov(R_gripper2cam)
-                    if orientation_result is None:
-                        raise Exception("failed to convert rotation matrix to orientation vector")
-                    ox, oy, oz, theta = orientation_result
-                    
-                    # Translation
-                    x = float(t_gripper2cam[0][0])
-                    y = float(t_gripper2cam[1][0])
-                    z = float(t_gripper2cam[2][0])
+                    method_names: List[str]
+                    if self.method == "ALL":
+                        method_names = METHODS
+                    else:
+                        method_names = [self.method]
 
-                    viam_pose = Pose(x=x, y=y, z=z, o_x=ox, o_y=oy, o_z=oz, theta=theta)
-
-                    self.logger.info(f"calibration success: {viam_pose}")
-
-                    T_hand_eye = np.eye(4)
-                    T_hand_eye[:3, :3] = R_cam2gripper
-                    T_hand_eye[:3, 3] = t_gripper2cam.flatten()
-
-                    update_hand_eye_errors_for_run(rotation_data, T_A_world_frames, T_B_camera_frames, T_hand_eye)
-
-                    metadata = {
+                    metadata_common = {
                         "calibration_id": calibration_id,
                         "generated_at": datetime.utcnow().isoformat() + "Z",
                         "arm": self.arm.name,
-                        "method": self.method,
                         "calibration_type": self.calibration_type,
                         "sleep_seconds": self.sleep_seconds,
                         "positions_tested": len(rotation_data),
                     }
-                    summary = save_run_outputs(tracking_dir, rotation_data, metadata=metadata)
+
+                    method_results: Dict[str, Any] = {}
+
+                    for method_name in method_names:
+                        method_constant = getattr(cv2, method_name)
+
+                        R_cam2gripper, t_cam2gripper = cv2.calibrateHandEye(
+                            R_gripper2base=R_gripper2base_list,
+                            t_gripper2base=t_gripper2base_list,
+                            R_target2cam=R_target2cam_list,
+                            t_target2cam=t_target2cam_list,
+                            method=method_constant,
+                        )
+                        if R_cam2gripper is None or t_cam2gripper is None:
+                            raise Exception(f"Could not solve calibration using method {method_name}")
+
+                        R_gripper2cam = R_cam2gripper.T
+                        t_gripper2cam = t_cam2gripper.reshape(3, 1)
+
+                        orientation_result = call_go_mat2ov(R_gripper2cam)
+                        if orientation_result is None:
+                            raise Exception("failed to convert rotation matrix to orientation vector")
+                        ox, oy, oz, theta = orientation_result
+                        x = float(t_gripper2cam[0][0])
+                        y = float(t_gripper2cam[1][0])
+                        z = float(t_gripper2cam[2][0])
+
+                        viam_pose = Pose(x=x, y=y, z=z, o_x=ox, o_y=oy, o_z=oz, theta=theta)
+
+                        self.logger.info(f"{method_name}: calibration success: {viam_pose}")
+
+                        T_hand_eye = np.eye(4)
+                        T_hand_eye[:3, :3] = R_cam2gripper
+                        T_hand_eye[:3, 3] = t_gripper2cam.flatten()
+
+                        rotation_data_copy = deepcopy(rotation_data)
+                        update_hand_eye_errors_for_run(rotation_data_copy, T_A_world_frames, T_B_camera_frames, T_hand_eye)
+
+                        method_dir = os.path.join(tracking_dir, method_name.lower())
+                        metadata = {
+                            **metadata_common,
+                            "method": method_name,
+                        }
+                        summary = save_run_outputs(method_dir, rotation_data_copy, metadata=metadata)
+
+                        save_json(
+                            os.path.join(method_dir, ".complete"),
+                            {
+                                "completed_at": datetime.utcnow().isoformat() + "Z",
+                                "method": method_name,
+                            },
+                        )
+
+                        method_results[method_name] = {
+                            "frame": {
+                                "translation": {"x": x, "y": y, "z": z},
+                                "orientation": {
+                                    "type": "ov_degrees",
+                                    "value": {"x": ox, "y": oy, "z": oz, "th": theta},
+                                },
+                                "parent": self.arm.name,
+                            },
+                            "tracking_directory": method_dir,
+                            "summary": summary,
+                        }
 
                     complete_path = os.path.join(tracking_dir, ".complete")
-                    save_json(complete_path, {"completed_at": datetime.utcnow().isoformat() + "Z"})
+                    save_json(complete_path, {"completed_at": datetime.utcnow().isoformat() + "Z", "methods": method_names})
 
-                    resp["run_calibration"] = {
-                        "frame": {
-                            "translation": {
-                                "x": x,
-                                "y": y,
-                                "z": z
-                            },
-                            "orientation": {
-                                "type": "ov_degrees",
-                                "value": {
-                                    "x": ox,
-                                    "y": oy,
-                                    "z": oz,
-                                    "th": theta
-                                }
-                            },
-                            "parent": self.arm.name
-                        },
-                        "tracking_directory": tracking_dir,
-                        "summary": summary,
-                    }
+                    if len(method_results) == 1:
+                        method_name = method_names[0]
+                        resp["run_calibration"] = method_results[method_name]
+                    else:
+                        resp["run_calibration"] = {
+                            "methods": method_results,
+                            "tracking_directory": tracking_dir,
+                        }
                 case "move_arm": 
                     raise NotImplementedError("This is not yet implemented")
                 case "check_bodies":
@@ -901,8 +926,7 @@ class HandEyeCalibration(Generic, EasyResource):
                     tracking_dir = os.fspath(response)
             except Exception as err:
                 self.logger.warning(f"Failed to retrieve base directory from web app: {err}")
-        else:
-            print("No web app service configured")
+
         if tracking_dir is None:
             raise Exception("could not get tracking directory")
 
