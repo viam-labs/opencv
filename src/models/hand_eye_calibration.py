@@ -1,10 +1,11 @@
 import asyncio
+import os
+import uuid
+from datetime import datetime
+from typing import Any, ClassVar, Dict, List, Mapping, Optional, Sequence, Tuple
+
 import cv2
 import numpy as np
-import uuid
-import os
-from typing import ClassVar, Dict, Mapping, Optional, Sequence, Tuple
-
 from typing_extensions import Self
 from viam.components.arm import Arm, JointPositions
 from viam.components.camera import Camera
@@ -14,15 +15,21 @@ from viam.proto.common import Pose, PoseInFrame, ResourceName
 from viam.resource.base import ResourceBase
 from viam.resource.easy_resource import EasyResource
 from viam.resource.types import Model, ModelFamily
-from viam.services.generic import *
+from viam.services.generic import Generic
 from viam.services.motion import Motion
-from viam.utils import struct_to_dict, ValueTypes
-from viam.media.video import CameraMimeType
-from viam.media.utils.pil import viam_to_pil_image
+from viam.utils import ValueTypes, struct_to_dict
 
-from utils.utils import call_go_ov2mat, call_go_mat2ov
 from utils.camera_utils import get_camera_image, get_camera_intrinsics
-from utils.pose_utils import get_chessboard_pose_in_camera_frame
+from utils.calibration_logging import (
+    calculate_measurement_statistics,
+    compare_poses,
+    draw_marker_debug,
+    save_run_outputs,
+    save_json,
+    update_hand_eye_errors_for_run,
+)
+from utils.pose_utils import get_chessboard_pose_in_camera_frame, invert_pose_rotation_only, pose_to_matrix
+from utils.utils import call_go_mat2ov, call_go_ov2mat
 
 CALIBS = ["eye-in-hand", "eye-to-hand"]
 METHODS = [
@@ -129,9 +136,8 @@ class HandEyeCalibration(Generic, EasyResource):
                 raise Exception(f"When {USE_INTERNAL_POSE_TRACKER_ATTR} is True, {CAMERA_NAME_ATTR} is required.")
 
         web_app_resource_name = attrs.get(WEB_APP_RESOURCE_NAME_ATTR)
-        if web_app_resource_name is not None:
-            if not isinstance(web_app_resource_name, str):
-                raise Exception(f"'{WEB_APP_RESOURCE_NAME_ATTR}' must be a string, got {type(web_app_resource_name)}")
+        if web_app_resource_name is not None and not isinstance(web_app_resource_name, str):
+            raise Exception(f"'{WEB_APP_RESOURCE_NAME_ATTR}' must be a string, got {type(web_app_resource_name)}")
 
         motion = attrs.get(MOTION_ATTR)
         optional_deps = []
@@ -185,36 +191,32 @@ class HandEyeCalibration(Generic, EasyResource):
             )
             self.poses.append(pose)
 
+        camera_name = attrs.get(CAMERA_NAME_ATTR)
+        self.camera: Optional[Camera] = None
+        if camera_name:
+            camera_resource = dependencies.get(Camera.get_resource_name(camera_name))
+            if camera_resource is None:
+                self.logger.warning(f"Camera dependency '{camera_name}' not found. Images will not be captured.")
+            else:
+                self.camera = camera_resource
+
+        pattern_size_raw = attrs.get(PATTERN_SIZE_ATTR, [11, 8])
+        if not isinstance(pattern_size_raw, (list, tuple)) or len(pattern_size_raw) != 2:
+            raise Exception(f"{PATTERN_SIZE_ATTR} must be a list or tuple of 2 integers (rows, cols), got: {pattern_size_raw}")
+        self.pattern_size = [int(pattern_size_raw[0]), int(pattern_size_raw[1])]
+        self.square_size = float(attrs.get(SQUARE_SIZE_MM_ATTR, 20.0))
+
+        self.calibration_type = attrs.get(CALIB_ATTR, CALIBS[0])
         self.method = attrs.get(METHOD_ATTR, DEFAULT_METHOD)
         self.sleep_seconds = attrs.get(SLEEP_ATTR, DEFAULT_SLEEP_SECONDS)
         self.body_names = [attrs.get(BODY_NAME_ATTR)] if attrs.get(BODY_NAME_ATTR) is not None else []
-    
         self.use_internal_pose_tracker = attrs.get(USE_INTERNAL_POSE_TRACKER_ATTR, False)
-        if self.use_internal_pose_tracker:
-            camera_name = attrs.get(CAMERA_NAME_ATTR)
-            if camera_name is None:
-                raise Exception(f"When {USE_INTERNAL_POSE_TRACKER_ATTR} is True, {CAMERA_NAME_ATTR} is required.")
-            pattern_size_raw = attrs.get(PATTERN_SIZE_ATTR, [11, 8])
-            # Ensure pattern_size is a list of integers (config might have floats)
-            if not isinstance(pattern_size_raw, (list, tuple)) or len(pattern_size_raw) != 2:
-                raise Exception(f"{PATTERN_SIZE_ATTR} must be a list or tuple of 2 integers (rows, cols), got: {pattern_size_raw}")
-            self.pattern_size = [int(pattern_size_raw[0]), int(pattern_size_raw[1])]
-            self.square_size = attrs.get(SQUARE_SIZE_MM_ATTR, 20.0)
-            self.camera = dependencies.get(Camera.get_resource_name(camera_name))
-            if self.camera is None:
-                raise Exception(f"Camera dependency '{camera_name}' not found in dependencies.")
-
-        web_app_resource_name = attrs.get(WEB_APP_RESOURCE_NAME_ATTR)
-        self.web_app: EasyResource = dependencies.get(web_app_resource_name) if web_app_resource_name else None
-        if self.web_app is not None:
-            self.logger.debug(f"Web app service configured: {self.web_app.name}")
-        else:
-            self.logger.debug("No web app service configured")
+        if self.use_internal_pose_tracker and self.camera is None:
+            raise Exception("Internal pose tracker requires a valid camera dependency.")
 
         web_app_resource_name = attrs.get(WEB_APP_RESOURCE_NAME_ATTR)
         self.web_app: Optional[Generic] = None
         if web_app_resource_name:
-            print(f"web_app_resource_name: {web_app_resource_name}")
             if isinstance(web_app_resource_name, str):
                 dependency_name = Generic.get_resource_name(web_app_resource_name)
             elif isinstance(web_app_resource_name, Mapping):
@@ -321,14 +323,28 @@ class HandEyeCalibration(Generic, EasyResource):
                 await asyncio.sleep(0.05)
             self.logger.debug(f"Moved arm to joint position: {jp}")
 
-    async def _collect_calibration_data(self):
-        """Collect calibration data for all joint positions or poses."""
-        R_gripper2base_list = []
-        t_gripper2base_list = []
-        R_target2cam_list = []
-        t_target2cam_list = []
+    async def _collect_calibration_data(
+        self,
+        tracking_dir: Optional[str],
+        camera_matrix: Optional[np.ndarray],
+        dist_coeffs: Optional[np.ndarray],
+    ):
+        """Collect calibration data, capturing debug artifacts and per-pose metadata."""
+        R_gripper2base_list: List[np.ndarray] = []
+        t_gripper2base_list: List[np.ndarray] = []
+        R_target2cam_list: List[np.ndarray] = []
+        t_target2cam_list: List[np.ndarray] = []
+        rotation_data: List[Dict[str, Any]] = []
+        T_A_world_frames: List[np.ndarray] = []
+        T_B_camera_frames: List[np.ndarray] = []
 
-        # Use poses if available (motion planning mode), otherwise use joint positions
+        images_dir = os.path.join(tracking_dir, "pose_images") if tracking_dir else None
+        raw_images_dir = os.path.join(tracking_dir, "raw_images") if tracking_dir else None
+        poses_dir = os.path.join(tracking_dir, "poses") if tracking_dir else None
+        for directory in (images_dir, raw_images_dir, poses_dir):
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+
         positions = self.poses if self.poses else self.joint_positions
         total_positions = len(positions)
 
@@ -337,33 +353,63 @@ class HandEyeCalibration(Generic, EasyResource):
                 await self._move_arm_to_position(position, i, total_positions)
                 await asyncio.sleep(self.sleep_seconds)
 
-                if self.use_internal_pose_tracker:
-                    print("Using internal pose tracker")
-                    # Get arm pose separately
-                    arm_pose = await self.arm.get_end_position()
-                    R_base2gripper = call_go_ov2mat(
-                        arm_pose.o_x,
-                        arm_pose.o_y,
-                        arm_pose.o_z,
-                        arm_pose.theta
+                arm_pose_raw = await self.arm.get_end_position()
+                arm_pose_inverted = invert_pose_rotation_only(arm_pose_raw)
+                arm_pose_motion_service: Optional[Pose] = None
+                if self.motion is not None:
+                    pose_in_frame_motion = await self.motion.get_pose(
+                        component_name=self.arm.name,
+                        destination_frame="world",
                     )
-                    t_base2gripper = np.array([[arm_pose.x], [arm_pose.y], [arm_pose.z]], dtype=np.float64)
-                    
-                    # Get camera-to-target pose from chessboard
-                    image = await get_camera_image(self.camera)
-                    camera_matrix, dist_coeffs = await get_camera_intrinsics(self.camera)
-                    success, rvec, tvec, R_cam2target, t_cam2target, corners, validation_info = get_chessboard_pose_in_camera_frame(image, camera_matrix, dist_coeffs, self.pattern_size)
-                    if not success:
-                        self.logger.warning(f"Could not find calibration values from chessboard for position {i+1}/{total_positions}")
+                    arm_pose_motion_service = pose_in_frame_motion.pose
+
+                detection_image: Optional[np.ndarray] = None
+                marker_info: Optional[Dict[str, Any]] = None
+                rvec_detected: Optional[np.ndarray] = None
+                tvec_detected: Optional[np.ndarray] = None
+
+                if self.camera is not None and camera_matrix is not None and dist_coeffs is not None:
+                    detection_image = await get_camera_image(self.camera)
+                    success_det, rvec_det, tvec_det, _, _, _, marker_info_det = get_chessboard_pose_in_camera_frame(
+                        detection_image,
+                        camera_matrix,
+                        dist_coeffs,
+                        tuple(self.pattern_size),
+                        square_size=self.square_size,
+                    )
+                    if success_det and marker_info_det:
+                        marker_info = {
+                            "mean_reprojection_error": float(marker_info_det.get("mean_reprojection_error", 0.0)),
+                            "max_reprojection_error": float(marker_info_det.get("max_reprojection_error", 0.0)),
+                            "sharpness": float(marker_info_det.get("sharpness", float("inf"))),
+                            "corners": len(marker_info_det.get("reprojected_points", [])),
+                        }
+                        rvec_detected = rvec_det
+                        tvec_detected = tvec_det
+
+                if self.use_internal_pose_tracker:
+                    if self.camera is None or camera_matrix is None or dist_coeffs is None:
+                        raise Exception("Internal pose tracker requires camera images and intrinsics.")
+                    if rvec_detected is None or tvec_detected is None:
+                        self.logger.warning(
+                            f"Could not detect calibration marker for position {i+1}/{total_positions} with internal pose tracker."
+                        )
                         continue
+
+                    R_base2gripper = call_go_ov2mat(
+                        arm_pose_raw.o_x,
+                        arm_pose_raw.o_y,
+                        arm_pose_raw.o_z,
+                        arm_pose_raw.theta,
+                    )
+                    t_base2gripper = np.array([[arm_pose_raw.x], [arm_pose_raw.y], [arm_pose_raw.z]], dtype=np.float64)
+
+                    R_cam2target = cv2.Rodrigues(rvec_detected)[0]
+                    R_cam2target = R_cam2target.T
+                    t_cam2target = tvec_detected.reshape(3, 1)
                 else:
                     R_base2gripper, t_base2gripper, R_cam2target, t_cam2target = await self.get_calibration_values()
 
-                # TODO: Implement eye-to-hand. This should just be changing the
-                # order/in-frame values
-
-                # OpenCV calibrateHandEye expects transposed rotations but original translation vectors
-                # Only invert rotation matrices, keep translation vectors as-is
                 R_gripper2base = R_base2gripper.T
                 t_gripper2base = t_base2gripper
                 R_target2cam = R_cam2target.T
@@ -374,31 +420,107 @@ class HandEyeCalibration(Generic, EasyResource):
                 R_target2cam_list.append(R_target2cam)
                 t_target2cam_list.append(t_target2cam)
 
+                T_A_i_world_frame = pose_to_matrix(arm_pose_inverted)
+                T_B_i_camera_frame = np.eye(4)
+                T_B_i_camera_frame[:3, :3] = R_target2cam
+                T_B_i_camera_frame[:3, 3] = t_target2cam.flatten()
+                T_A_world_frames.append(T_A_i_world_frame)
+                T_B_camera_frames.append(T_B_i_camera_frame)
+
+                measurement_entry: Dict[str, Any] = {
+                    "measurement_num": 0,
+                    "success": True,
+                    "rvec": rvec_detected.tolist() if isinstance(rvec_detected, np.ndarray) else None,
+                    "tvec": tvec_detected.tolist() if isinstance(tvec_detected, np.ndarray) else None,
+                    "corners_count": marker_info.get("corners", 0) if marker_info else 0,
+                    "mean_reprojection_error": marker_info.get("mean_reprojection_error") if marker_info else None,
+                    "max_reprojection_error": marker_info.get("max_reprojection_error") if marker_info else None,
+                    "sharpness": marker_info.get("sharpness") if marker_info else None,
+                }
+
+                measurements = [measurement_entry]
+
+                def pose_to_dict_struct(pose: Pose) -> Dict[str, float]:
+                    return {
+                        "x": float(pose.x),
+                        "y": float(pose.y),
+                        "z": float(pose.z),
+                        "o_x": float(pose.o_x),
+                        "o_y": float(pose.o_y),
+                        "o_z": float(pose.o_z),
+                        "theta": float(pose.theta),
+                    }
+
+                pose_command = (
+                    pose_to_dict_struct(position) if isinstance(position, Pose) else {"joint_positions": list(position)}
+                )
+
+                pose_info: Dict[str, Any] = {
+                    "pose_index": i,
+                    "pose_command": pose_command,
+                    "arm_pose_raw": pose_to_dict_struct(arm_pose_raw),
+                    "arm_pose_inverted": pose_to_dict_struct(arm_pose_inverted),
+                    "measurements": measurements,
+                }
+
+                if arm_pose_motion_service is not None:
+                    pose_info["arm_pose_from_motion_service"] = pose_to_dict_struct(arm_pose_motion_service)
+                    pose_info["pose_comparisons"] = {
+                        "arm_vs_motion_service": compare_poses(arm_pose_raw, arm_pose_motion_service)
+                    }
+
+                pose_info["measurement_statistics"] = calculate_measurement_statistics(measurements)
+                rotation_data.append(pose_info)
+
+                if tracking_dir:
+                    if poses_dir:
+                        save_json(os.path.join(poses_dir, f"pose_{i:02d}.json"), pose_info)
+                    if detection_image is not None and raw_images_dir:
+                        cv2.imwrite(os.path.join(raw_images_dir, f"pose_{i:02d}.png"), detection_image)
+                    if (
+                        detection_image is not None
+                        and rvec_detected is not None
+                        and tvec_detected is not None
+                        and camera_matrix is not None
+                        and dist_coeffs is not None
+                        and images_dir
+                    ):
+                        debug_image = draw_marker_debug(
+                            detection_image,
+                            rvec_detected,
+                            tvec_detected,
+                            camera_matrix,
+                            dist_coeffs,
+                            validation_info=marker_info,
+                            chessboard_size=tuple(self.pattern_size),
+                            square_size=self.square_size,
+                        )
+                        cv2.imwrite(os.path.join(images_dir, f"pose_{i:02d}_debug.png"), debug_image)
+
                 self.logger.info(f"successfully collected calibration data for position {i+1}/{total_positions}")
 
             except Exception as e:
                 error_msg = str(e)
-                # Check if this is a timeout or cancellation error (recoverable)
-                # Handle tuple errors like (Status.CANCELLED, 'cbirrt timeout context canceled', None)
                 error_str = str(e)
                 is_timeout = (
-                    "timeout" in error_str.lower() 
-                    or "cancelled" in error_str.lower() 
+                    "timeout" in error_str.lower()
+                    or "cancelled" in error_str.lower()
                     or "CANCELLED" in error_str
                     or (isinstance(e, tuple) and len(e) > 0 and "CANCELLED" in str(e[0]))
                 )
-                
+
                 if is_timeout:
-                    self.logger.warning(f"Skipping position {i+1}/{total_positions} due to timeout/cancellation: {error_msg}")
-                    self.logger.warning(f"Continuing with remaining positions. Progress: {len(R_gripper2base_list)}/{total_positions} collected so far")
+                    self.logger.warning(
+                        f"Skipping position {i+1}/{total_positions} due to timeout/cancellation: {error_msg}"
+                    )
+                    self.logger.warning(
+                        f"Continuing with remaining positions. Progress: {len(R_gripper2base_list)}/{total_positions} collected so far"
+                    )
                     continue
-                else:
-                    # For other errors, log and raise
-                    error_msg_full = f"Could not find calibration values for position {i+1}/{total_positions}: {error_msg}"
-                    self.logger.error(error_msg_full)
-                    raise Exception(error_msg_full)
-        
-        # Check if we have enough measurements after skipping any positions
+                error_msg_full = f"Could not find calibration values for position {i+1}/{total_positions}: {error_msg}"
+                self.logger.error(error_msg_full)
+                raise Exception(error_msg_full)
+
         if len(R_gripper2base_list) < 3:
             raise Exception(
                 f"Not enough valid measurements collected after processing {total_positions} positions. "
@@ -406,8 +528,16 @@ class HandEyeCalibration(Generic, EasyResource):
                 f"Some positions may have been skipped due to timeouts or errors. "
                 f"Consider adjusting motion planning parameters or checking pose reachability."
             )
-        
-        return R_gripper2base_list, t_gripper2base_list, R_target2cam_list, t_target2cam_list
+
+        return (
+            R_gripper2base_list,
+            t_gripper2base_list,
+            R_target2cam_list,
+            t_target2cam_list,
+            rotation_data,
+            T_A_world_frames,
+            T_B_camera_frames,
+        )
 
     async def do_command(
         self,
@@ -419,22 +549,27 @@ class HandEyeCalibration(Generic, EasyResource):
         resp = {}
         for key, value in command.items():
             match key:
-                case "run_simulated_calibration":
-                    print("running simulated calibration")
+                case "run_calibration":
                     calibration_id = str(uuid.uuid4())
                     tracking_dir = await self._resolve_tracking_directory(calibration_id)
-                    resp["run_simulated_calibration"] = {
-                        "calibration_id": calibration_id,
-                        "tracking_directory": tracking_dir
-                    }
 
-                    for i in range(10):
-                        np.save(os.path.join(tracking_dir, f"data_{i}.npy"), np.random.rand(10, 10))
+                    camera_matrix = None
+                    dist_coeffs = None
+                    if self.camera is not None:
+                        try:
+                            camera_matrix, dist_coeffs = await get_camera_intrinsics(self.camera)
+                        except Exception as err:
+                            self.logger.warning(f"Could not fetch camera intrinsics: {err}")
 
-                case "run_calibration":
-                    R_gripper2base_list, t_gripper2base_list, R_target2cam_list, t_target2cam_list = await self._collect_calibration_data()
-
-                    # Note: Minimum measurements check is done in _collect_calibration_data()
+                    (
+                        R_gripper2base_list,
+                        t_gripper2base_list,
+                        R_target2cam_list,
+                        t_target2cam_list,
+                        rotation_data,
+                        T_A_world_frames,
+                        T_B_camera_frames,
+                    ) = await self._collect_calibration_data(tracking_dir, camera_matrix, dist_coeffs)
 
                     self.logger.info(f"collected {len(R_gripper2base_list)} measurements, running calibration...")
 
@@ -468,7 +603,26 @@ class HandEyeCalibration(Generic, EasyResource):
 
                     self.logger.info(f"calibration success: {viam_pose}")
 
-                    # Format output to be frame system compatible
+                    T_hand_eye = np.eye(4)
+                    T_hand_eye[:3, :3] = R_cam2gripper
+                    T_hand_eye[:3, 3] = t_gripper2cam.flatten()
+
+                    update_hand_eye_errors_for_run(rotation_data, T_A_world_frames, T_B_camera_frames, T_hand_eye)
+
+                    metadata = {
+                        "calibration_id": calibration_id,
+                        "generated_at": datetime.utcnow().isoformat() + "Z",
+                        "arm": self.arm.name,
+                        "method": self.method,
+                        "calibration_type": self.calibration_type,
+                        "sleep_seconds": self.sleep_seconds,
+                        "positions_tested": len(rotation_data),
+                    }
+                    summary = save_run_outputs(tracking_dir, rotation_data, metadata=metadata)
+
+                    complete_path = os.path.join(tracking_dir, ".complete")
+                    save_json(complete_path, {"completed_at": datetime.utcnow().isoformat() + "Z"})
+
                     resp["run_calibration"] = {
                         "frame": {
                             "translation": {
@@ -486,7 +640,9 @@ class HandEyeCalibration(Generic, EasyResource):
                                 }
                             },
                             "parent": self.arm.name
-                        }
+                        },
+                        "tracking_directory": tracking_dir,
+                        "summary": summary,
                     }
                 case "move_arm": 
                     raise NotImplementedError("This is not yet implemented")
