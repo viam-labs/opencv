@@ -62,6 +62,8 @@ SQUARE_SIZE_MM_ATTR = "square_size_mm"
 WEB_APP_RESOURCE_NAME_ATTR = "web_app_resource_name"
 ARM_POSE_SOURCE_ATTR = "arm_pose_source"
 ARM_POSE_SOURCE_VALUES = {"arm", "motion_service"}
+ARM_POSE_SOURCE_ATTR = "arm_pose_source"
+ARM_POSE_SOURCE_VALUES = {"arm", "motion_service"}
 # Default config attribute values
 DEFAULT_SLEEP_SECONDS = 2.0
 DEFAULT_METHOD = "CALIB_HAND_EYE_TSAI"
