@@ -124,6 +124,7 @@ celerybeat.pid
 
 # Environments
 .env
+.env.*
 .venv
 env/
 venv/
@@ -172,3 +173,9 @@ reload-*/
 
 # Go binary
 go_utils/go_utils
+
+# Calibration outputs
+calibration_data*
+
+# Poses
+poses_*.json
