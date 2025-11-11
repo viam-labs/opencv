@@ -2142,7 +2142,7 @@ async def main(
             
             # Invert only the rotation, keep translation unchanged
             A_i_pose_world_frame = invert_pose_rotation_only(A_i_pose_world_frame_raw)
-            A_i_pose_world_frame_from_motion_service = _invert_pose_rotation_only(A_i_pose_world_frame_raw_from_motion_service)
+            A_i_pose_world_frame_from_motion_service = invert_pose_rotation_only(A_i_pose_world_frame_raw_from_motion_service)
 
             # Use the first successful measurement for pose data
             successful_measurement = next((m for m in measurements if m and m.get('success', False)), None)
