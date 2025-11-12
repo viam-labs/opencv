@@ -47,11 +47,13 @@ SLEEP_ATTR = "sleep_seconds"
 PATTERN_SIZE_ATTR = "pattern_size"
 SQUARE_SIZE_MM_ATTR = "square_size_mm"
 WEB_APP_RESOURCE_NAME_ATTR = "web_app_resource_name"
+USE_MOTION_SERVICE_FOR_POSES_ATTR = "use_motion_service_for_poses"
 
 
 # Default config attribute values
 DEFAULT_SLEEP_SECONDS = 2.0
 DEFAULT_METHOD = "CALIB_HAND_EYE_TSAI"
+DEFAULT_USE_MOTION_SERVICE_FOR_POSES = False
 
 
 class HandEyeCalibration(Generic, EasyResource):
@@ -138,6 +140,11 @@ class HandEyeCalibration(Generic, EasyResource):
         if motion is not None:
             optional_deps.append(str(motion))
 
+        # Validate that motion service is configured if use_motion_service_for_poses is true
+        use_motion_service_for_poses = attrs.get(USE_MOTION_SERVICE_FOR_POSES_ATTR, DEFAULT_USE_MOTION_SERVICE_FOR_POSES)
+        if use_motion_service_for_poses and motion is None:
+            raise Exception(f"'{USE_MOTION_SERVICE_FOR_POSES_ATTR}' is set to true but '{MOTION_ATTR}' is not configured. Either set '{USE_MOTION_SERVICE_FOR_POSES_ATTR}' to false or provide a '{MOTION_ATTR}' service name.")
+
         required_deps = [str(arm), str(pose_tracker)]
         if use_internal_pose_tracker:
             required_deps.append(str(camera_name))
@@ -156,6 +163,7 @@ class HandEyeCalibration(Generic, EasyResource):
         attrs = struct_to_dict(config.attributes)
 
         arm = attrs.get(ARM_ATTR)
+        self.arm_name = arm
         self.arm: Arm = dependencies.get(Arm.get_resource_name(arm))
 
         pose_tracker = attrs.get(POSE_TRACKER_ATTR)
@@ -190,6 +198,7 @@ class HandEyeCalibration(Generic, EasyResource):
         self.sleep_seconds = attrs.get(SLEEP_ATTR, DEFAULT_SLEEP_SECONDS)
         self.body_names = [attrs.get(BODY_NAME_ATTR)] if attrs.get(BODY_NAME_ATTR) is not None else []
         self.use_internal_pose_tracker = attrs.get(USE_INTERNAL_POSE_TRACKER_ATTR, False)
+        self.use_motion_service_for_poses = attrs.get(USE_MOTION_SERVICE_FOR_POSES_ATTR, DEFAULT_USE_MOTION_SERVICE_FOR_POSES)
         web_app_resource_name = attrs.get(WEB_APP_RESOURCE_NAME_ATTR)
         self.web_app: Optional[Generic] = None
         if web_app_resource_name:
