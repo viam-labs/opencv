@@ -59,30 +59,38 @@ def call_go_ov2mat(ox: float, oy: float, oz: float, theta: float) -> np.ndarray:
 def call_go_mat2ov(R: np.ndarray) -> tuple:
     """
     Call Go binary to convert rotation matrix to Viam orientation vector
+
     Args:
         R: 3x3 rotation matrix as numpy array
+
     Returns:
         (ox, oy, oz, theta): Orientation vector components, or None if failed
     """
     try:
         binary_path = _get_binary_path()
+
         # Flatten the rotation matrix to get 9 elements
         flat_matrix = R.flatten()
         matrix_args = [str(val) for val in flat_matrix]
+
         # Call Go binary with mat2ov command and 9 matrix elements
         result = subprocess.run([
             binary_path, 'mat2ov'
         ] + matrix_args, capture_output=True, text=True)
+
         if result.returncode != 0:
             print(f"Go binary error: {result.stderr}")
             return None
+
         # Parse the 4 values returned by Go binary (ox, oy, oz, theta)
         values = [float(x) for x in result.stdout.strip().split()]
         if len(values) != 4:
             print(f"Expected 4 values from Go binary, got {len(values)}")
             return None
+
         # Return orientation vector components
         return values[0], values[1], values[2], values[3]
+
     except Exception as e:
         print(f"Failed to call Go mat2ov converter: {e}")
         return None
