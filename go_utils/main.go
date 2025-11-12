@@ -65,10 +65,6 @@ func main() {
 		fmt.Fprintf(os.Stderr, "    %s ov2mat <ox> <oy> <oz> <theta>\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  Convert rotation matrix to orientation vector:\n")
 		fmt.Fprintf(os.Stderr, "    %s mat2ov <m11> <m12> <m13> <m21> <m22> <m23> <m31> <m32> <m33>\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "  Compose two poses:\n")
-		fmt.Fprintf(os.Stderr, "    %s compose <x1> <y1> <z1> <ox1> <oy1> <oz1> <th1> <x2> <y2> <z2> <ox2> <oy2> <oz2> <th2>\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "  Invert a pose:\n")
-		fmt.Fprintf(os.Stderr, "    %s inverse_pose <x> <y> <z> <ox> <oy> <oz> <theta>\n", os.Args[0])
 		os.Exit(1)
 	}
 
@@ -130,6 +126,7 @@ func main() {
 			matrixElements[3], matrixElements[4], matrixElements[5], // Row 2
 			matrixElements[6], matrixElements[7], matrixElements[8], // Row 3
 		)
+
 	default:
 		// For backward compatibility, if no command is specified but we have 4 args,
 		// assume it's the old ov2mat format
