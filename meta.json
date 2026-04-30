@@ -16,6 +16,12 @@
       "model": "viam:opencv:hand_eye_calibration",
       "short_description": "OpenCV-based hand-eye calibration service",
       "markdown_link": "README.md#model-viamopencvhandeyecalibration"
+    },
+    {
+      "api": "rdk:service:generic",
+      "model": "viam:opencv:camera_calibration",
+      "short_description": "OpenCV-based camera calibration service",
+      "markdown_link": "README.md#model-viamopencvcameracalibration"
     }
   ],
   "applications": null,
