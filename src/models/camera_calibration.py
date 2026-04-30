@@ -38,7 +38,7 @@ class CameraCalibration(Generic, EasyResource):
     This service uses chessboard patterns to calibrate camera intrinsic parameters.
     """
 
-    MODEL: ClassVar[Model] = Model(ModelFamily("viam", "opencv"), "camera-calibration")
+    MODEL: ClassVar[Model] = Model(ModelFamily("viam", "opencv"), "camera_calibration")
 
     @classmethod
     def validate_config(
