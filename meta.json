@@ -21,7 +21,7 @@
       "api": "rdk:service:generic",
       "model": "viam:opencv:camera_calibration",
       "short_description": "OpenCV-based camera calibration service",
-      "markdown_link": "README.md#model-viamopencvcameracalibration"
+      "markdown_link": "README.md#model-viamopencvcamera-calibration"
     }
   ],
   "applications": null,
