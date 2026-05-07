@@ -159,15 +159,13 @@ class Chessboard(PoseTracker, EasyResource):
         
         return K, dist
 
-    async def get_poses(
-        self,
-        body_names: List[str],
-        *,
-        extra: Optional[Mapping[str, Any]] = None,
-        timeout: Optional[float] = None,
-        **kwargs
-    ) -> Dict[str, PoseInFrame]:
-        
+    async def _detect_chessboard_observation(self):
+        """Capture an image and run corner detection + PnP.
+
+        Returns:
+            (corners_2d, objp, K, dist, rvec, tvec, R) — raw corner pixels,
+            board object points, intrinsics, and PnP solution.
+        """
         cam_images = await self.camera.get_images()
         pil_image = None
         for cam_image in cam_images[0]:
@@ -177,30 +175,36 @@ class Chessboard(PoseTracker, EasyResource):
                 self.logger.debug(f"Found {cam_image.mime_type} image from camera")
                 break
         if pil_image is None:
-            raise Exception("Could not get latest image from camera")        
+            raise Exception("Could not get latest image from camera")
         image = np.array(pil_image)
-        
+
         K, dist = await self.get_camera_intrinsics()
 
-        # Detect and refine chessboard corners
         corners = detect_chessboard_corners(image, tuple(self.pattern_size))
         if corners is None:
             raise Exception("Could not find chessboard pattern in image")
         self.logger.debug(f"Found chessboard with corners: {corners}")
 
-        # Generate 3D object points for the chessboard
         objp = generate_object_points(tuple(self.pattern_size), self.square_size)
-        
-        # Solve PnP to get pose
+
         success, rvec, tvec = cv2.solvePnP(objp, corners, K, dist)
         if not success:
             raise Exception("Could not solve PnP for chessboard")
-        self.logger.debug(f"Solved PnP")
-        self.logger.debug(f"Rotation vector: {rvec}")
-        self.logger.debug(f"Translation vector: {tvec}")
-        
-        # Convert rotation vector to rotation matrix
+        self.logger.debug(f"Solved PnP rvec={rvec.flatten()} tvec={tvec.flatten()}")
+
         R, _ = cv2.Rodrigues(rvec)
+        return corners, objp, K, dist, rvec, tvec, R
+
+    async def get_poses(
+        self,
+        body_names: List[str],
+        *,
+        extra: Optional[Mapping[str, Any]] = None,
+        timeout: Optional[float] = None,
+        **kwargs
+    ) -> Dict[str, PoseInFrame]:
+
+        _, objp, _, _, _, tvec, R = await self._detect_chessboard_observation()
 
         # Transpose needed due to frame convention mismatch:
         # OpenCV solvePnP returns object -> camera transform, but Viam expects camera -> object transform.
@@ -246,8 +250,23 @@ class Chessboard(PoseTracker, EasyResource):
         timeout: Optional[float] = None,
         **kwargs
     ) -> Mapping[str, ValueTypes]:
-        self.logger.error("`do_command` is not implemented")
-        raise NotImplementedError()
+        resp = {}
+        for key, _value in command.items():
+            if key == "get_chessboard_observation":
+                corners, objp, K, dist, rvec, tvec, _ = await self._detect_chessboard_observation()
+                resp["get_chessboard_observation"] = {
+                    "corners_2d": corners.reshape(-1, 2).tolist(),
+                    "corners_3d": objp.tolist(),
+                    "K": K.tolist(),
+                    "dist": dist.tolist(),
+                    "rvec": rvec.flatten().tolist(),
+                    "tvec": tvec.flatten().tolist(),
+                    "pattern_size": list(self.pattern_size),
+                    "square_size_mm": float(self.square_size),
+                }
+            else:
+                resp[key] = "unsupported key"
+        return resp
 
     async def get_geometries(
         self, *, extra: Optional[Dict[str, Any]] = None, timeout: Optional[float] = None
