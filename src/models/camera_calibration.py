@@ -91,6 +91,7 @@ class CameraCalibration(Generic, EasyResource):
         """
         object_points = []  # 3D points in real world space
         image_points = []   # 2D points in image plane
+        used_image_indices = []  # Original 1-based indices of images that were successfully detected
         image_size = None
 
         num_images = len(base64_images)
@@ -109,10 +110,7 @@ class CameraCalibration(Generic, EasyResource):
 
                 # Store image size (width, height)
                 if image_size is None:
-                    if len(image.shape) == 3:
-                        image_size = (image.shape[1], image.shape[0])  # (width, height)
-                    else:
-                        image_size = (image.shape[1], image.shape[0])
+                    image_size = (image.shape[1], image.shape[0])  # (width, height)
 
                 # Detect chessboard corners
                 corners = detect_chessboard_corners(image, tuple(self.pattern_size))
@@ -124,6 +122,7 @@ class CameraCalibration(Generic, EasyResource):
                 # Add to calibration dataset
                 object_points.append(generate_object_points(tuple(self.pattern_size), self.square_size))
                 image_points.append(corners)
+                used_image_indices.append(idx + 1)
                 successful_detections += 1
 
                 self.logger.info(f"Successfully processed image {successful_detections}/{num_images} (image {idx + 1})")
@@ -149,17 +148,25 @@ class CameraCalibration(Generic, EasyResource):
             image_size,
             camera_matrix,
             dist_coeffs,
-            flags=cv2.CALIB_RATIONAL_MODEL
         )
 
-        # Calculate re-projection error
-        mean_error = 0
+        # Calculate per-image RMS reprojection error and overall mean
+        total_error = 0
+        total_points = 0
+        per_image_errors = []
         for i in range(len(object_points)):
             imgpoints2, _ = cv2.projectPoints(object_points[i], rvecs[i], tvecs[i], camera_matrix, dist_coeffs)
-            error = cv2.norm(image_points[i], imgpoints2, cv2.NORM_L2) / len(imgpoints2)
-            mean_error += error
+            diff = image_points[i].reshape(-1, 2) - imgpoints2.reshape(-1, 2)
+            sq_err = np.sum(diff ** 2)
+            n_pts = len(imgpoints2)
+            per_image_errors.append({
+                "image_index": used_image_indices[i],
+                "rms_error": float(np.sqrt(sq_err / n_pts)),
+            })
+            total_error += sq_err
+            total_points += n_pts
 
-        reprojection_error = mean_error / len(object_points)
+        reprojection_error = float(np.sqrt(total_error / total_points))
 
         self.logger.info(f"Calibration complete with RMS error: {ret:.6f}")
         self.logger.info(f"Mean re-projection error: {reprojection_error:.6f}")
@@ -171,6 +178,7 @@ class CameraCalibration(Generic, EasyResource):
             "reprojection_error": float(reprojection_error),
             "num_images": successful_detections,
             "image_size": {"width": image_size[0], "height": image_size[1]},
+            "per_image_errors": per_image_errors,
             "camera_matrix": {
                 "fx": float(camera_matrix[0, 0]),
                 "fy": float(camera_matrix[1, 1]),
