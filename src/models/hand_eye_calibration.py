@@ -269,6 +269,79 @@ class HandEyeCalibration(Generic, EasyResource):
                 await asyncio.sleep(0.05)
             self.logger.debug(f"Moved arm to joint position: {jp}")
 
+    def _compute_per_pose_residuals(
+        self,
+        R_gripper2base_list,
+        t_gripper2base_list,
+        R_target2cam_list,
+        t_target2cam_list,
+        R_cam2gripper,
+        t_cam2gripper,
+    ):
+        """Evaluate per-pose calibration residuals to identify outlier measurements.
+
+        For a correct calibration, the target's pose expressed in the base frame
+        (T_target2base = T_gripper2base · T_cam2gripper · T_target2cam) should be
+        identical across every pose, since the target is physically fixed.
+        Deviations from the mean reveal which poses contributed bad measurements.
+
+        Returns a list of per-pose residual dicts plus summary stats.
+        """
+        n = len(R_gripper2base_list)
+        R_target2base = []
+        t_target2base = []
+
+        R_c2g = np.asarray(R_cam2gripper)
+        t_c2g = np.asarray(t_cam2gripper).reshape(3)
+
+        for i in range(n):
+            R_g2b = np.asarray(R_gripper2base_list[i])
+            t_g2b = np.asarray(t_gripper2base_list[i]).reshape(3)
+            R_t2c = np.asarray(R_target2cam_list[i])
+            t_t2c = np.asarray(t_target2cam_list[i]).reshape(3)
+
+            R_t2b = R_g2b @ R_c2g @ R_t2c
+            t_t2b = R_g2b @ R_c2g @ t_t2c + R_g2b @ t_c2g + t_g2b
+
+            R_target2base.append(R_t2b)
+            t_target2base.append(t_t2b)
+
+        t_array = np.array(t_target2base)
+        t_mean = np.mean(t_array, axis=0)
+
+        # Mean rotation: Frobenius average projected back onto SO(3) via SVD
+        R_stack = np.stack(R_target2base, axis=0)
+        R_avg = np.mean(R_stack, axis=0)
+        U, _, Vt = np.linalg.svd(R_avg)
+        R_mean = U @ Vt
+        if np.linalg.det(R_mean) < 0:
+            Vt[-1] *= -1
+            R_mean = U @ Vt
+
+        residuals = []
+        for i in range(n):
+            t_resid = float(np.linalg.norm(t_target2base[i] - t_mean))
+            R_diff = R_target2base[i] @ R_mean.T
+            cos_angle = np.clip((np.trace(R_diff) - 1) / 2, -1, 1)
+            rot_resid_deg = float(np.degrees(np.arccos(cos_angle)))
+            residuals.append({
+                "pose_index": i + 1,
+                "translation_residual_mm": t_resid,
+                "rotation_residual_deg": rot_resid_deg,
+            })
+
+        translation_resids = np.array([r["translation_residual_mm"] for r in residuals])
+        rotation_resids = np.array([r["rotation_residual_deg"] for r in residuals])
+
+        summary = {
+            "translation_mean_mm": float(np.mean(translation_resids)),
+            "translation_max_mm": float(np.max(translation_resids)),
+            "rotation_mean_deg": float(np.mean(rotation_resids)),
+            "rotation_max_deg": float(np.max(rotation_resids)),
+        }
+
+        return residuals, summary
+
     async def _collect_calibration_data(self):
         """Collect calibration data for all joint positions or poses."""
         R_gripper2base_list = []
@@ -339,7 +412,30 @@ class HandEyeCalibration(Generic, EasyResource):
                     )
                     if R_cam2gripper is None or t_cam2gripper is None:
                         raise Exception("could not solve calibration")
-                    
+
+                    # Per-pose residuals to identify outlier poses
+                    per_pose_residuals, residual_summary = self._compute_per_pose_residuals(
+                        R_gripper2base_list,
+                        t_gripper2base_list,
+                        R_target2cam_list,
+                        t_target2cam_list,
+                        R_cam2gripper,
+                        t_cam2gripper,
+                    )
+
+                    self.logger.info(
+                        f"Residual summary: translation mean={residual_summary['translation_mean_mm']:.3f}mm "
+                        f"max={residual_summary['translation_max_mm']:.3f}mm; "
+                        f"rotation mean={residual_summary['rotation_mean_deg']:.3f}deg "
+                        f"max={residual_summary['rotation_max_deg']:.3f}deg"
+                    )
+                    sorted_resids = sorted(per_pose_residuals, key=lambda r: r["translation_residual_mm"], reverse=True)
+                    for r in sorted_resids:
+                        self.logger.info(
+                            f"  pose {r['pose_index']:>3}: t_resid={r['translation_residual_mm']:.3f}mm "
+                            f"r_resid={r['rotation_residual_deg']:.3f}deg"
+                        )
+
                     # Convert OpenCV output to frame system format
                     # Transpose rotation but keep translation as-is (consistent with input handling)
                     R_gripper2cam = R_cam2gripper.T
@@ -378,7 +474,11 @@ class HandEyeCalibration(Generic, EasyResource):
                                 }
                             },
                             "parent": self.arm.name
-                        }
+                        },
+                        "residuals": {
+                            "summary": residual_summary,
+                            "per_pose": per_pose_residuals,
+                        },
                     }
                 case "move_arm": 
                     raise NotImplementedError("This is not yet implemented")
