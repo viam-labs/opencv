@@ -18,6 +18,14 @@ from viam.utils import struct_to_dict, ValueTypes
 
 from utils.utils import call_go_ov2mat, call_go_mat2ov
 
+try:
+    from diagnostics.pose_diversity import compute_pose_diversity
+    from solvers.reprojection_solver import refine_handeye
+except ModuleNotFoundError:
+    # when running as local module with run.sh
+    from ..diagnostics.pose_diversity import compute_pose_diversity
+    from ..solvers.reprojection_solver import refine_handeye
+
 CALIBS = ["eye-in-hand", "eye-to-hand"]
 METHODS = [
     "CALIB_HAND_EYE_TSAI",
@@ -37,11 +45,19 @@ METHOD_ATTR = "method"
 MOTION_ATTR = "motion"
 POSE_TRACKER_ATTR = "pose_tracker"
 SLEEP_ATTR = "sleep_seconds"
+SOLVER_ATTR = "solver"
 USE_MOTION_SERVICE_FOR_POSES_ATTR = "use_motion_service_for_poses"
+
+# Solver options
+SOLVER_OPENCV = "opencv"
+SOLVER_HYBRID = "hybrid"
+SOLVER_REPROJECTION = "reprojection"
+SOLVERS = [SOLVER_OPENCV, SOLVER_HYBRID, SOLVER_REPROJECTION]
 
 # Default config attribute values
 DEFAULT_SLEEP_SECONDS = 2.0
 DEFAULT_METHOD = "CALIB_HAND_EYE_TSAI"
+DEFAULT_SOLVER = SOLVER_OPENCV
 DEFAULT_USE_MOTION_SERVICE_FOR_POSES = False
 
 
@@ -109,6 +125,10 @@ class HandEyeCalibration(Generic, EasyResource):
         if method not in METHODS:
             raise Exception(f"{method} is not an available method for calibration.")
 
+        solver = attrs.get(SOLVER_ATTR, DEFAULT_SOLVER)
+        if solver not in SOLVERS:
+            raise Exception(f"'{solver}' is not a valid {SOLVER_ATTR}; must be one of {SOLVERS}.")
+
         body_name = attrs.get(BODY_NAME_ATTR)
         if body_name is not None:
             if not isinstance(body_name, str):
@@ -170,6 +190,7 @@ class HandEyeCalibration(Generic, EasyResource):
             self.poses.append(pose)
 
         self.method = attrs.get(METHOD_ATTR, DEFAULT_METHOD)
+        self.solver = attrs.get(SOLVER_ATTR, DEFAULT_SOLVER)
         self.sleep_seconds = attrs.get(SLEEP_ATTR, DEFAULT_SLEEP_SECONDS)
         self.body_names = [attrs.get(BODY_NAME_ATTR)] if attrs.get(BODY_NAME_ATTR) is not None else []
         self.use_motion_service_for_poses = attrs.get(USE_MOTION_SERVICE_FOR_POSES_ATTR, DEFAULT_USE_MOTION_SERVICE_FOR_POSES)
@@ -342,6 +363,87 @@ class HandEyeCalibration(Generic, EasyResource):
 
         return residuals, summary
 
+    async def _collect_calibration_data_with_corners(self):
+        """Collect end-effector poses and chessboard corner observations.
+
+        Used by the reprojection-based solver path. Returns data in the
+        OpenCV-standard convention:
+            T_be: gripper-in-base (4x4)
+            T_cw: target-in-camera (4x4) — board ≡ world for eye-in-hand
+
+        Note: ``call_go_ov2mat`` returns body-from-parent (R_eb for an arm
+        pose), so we transpose to get parent-from-body (R_be).
+        """
+        positions = self.poses if self.poses else self.joint_positions
+        total_positions = len(positions)
+
+        T_be_list = []
+        T_cw_list = []
+        corners_2d_list = []
+        corners_3d = None
+        K = None
+        dist = None
+
+        for i, position in enumerate(positions):
+            try:
+                await self._move_arm_to_position(position, i, total_positions)
+                await asyncio.sleep(self.sleep_seconds)
+
+                if self.use_motion_service_for_poses and self.motion is not None:
+                    arm_pose_in_frame = await self.motion.get_pose(
+                        component_name=self.arm_name,
+                        destination_frame=self.arm_name + "_origin",
+                    )
+                    arm_pose = arm_pose_in_frame.pose
+                else:
+                    arm_pose = await self.arm.get_end_position()
+
+                R_eb = call_go_ov2mat(arm_pose.o_x, arm_pose.o_y, arm_pose.o_z, arm_pose.theta)
+                if R_eb is None:
+                    raise Exception("could not convert arm orientation to rotation matrix")
+                T_be = np.eye(4)
+                T_be[:3, :3] = R_eb.T  # R_be: gripper-in-base
+                T_be[:3, 3] = [arm_pose.x, arm_pose.y, arm_pose.z]
+
+                obs_resp = await self.pose_tracker.do_command(
+                    {"get_chessboard_observation": True}
+                )
+                obs = obs_resp.get("get_chessboard_observation")
+                if obs is None or not isinstance(obs, dict):
+                    raise Exception(
+                        "pose_tracker.do_command did not return a chessboard observation; "
+                        "ensure the pose tracker is the viam:opencv:chessboard model"
+                    )
+
+                corners_2d = np.asarray(obs["corners_2d"], dtype=np.float64).reshape(-1, 2)
+                if corners_3d is None:
+                    corners_3d = np.asarray(obs["corners_3d"], dtype=np.float64).reshape(-1, 3)
+                    K = np.asarray(obs["K"], dtype=np.float64)
+                    dist = np.asarray(obs["dist"], dtype=np.float64).reshape(-1)
+
+                rvec = np.asarray(obs["rvec"], dtype=np.float64).reshape(3, 1)
+                tvec = np.asarray(obs["tvec"], dtype=np.float64).reshape(3)
+                R_ct, _ = cv2.Rodrigues(rvec)
+                T_cw = np.eye(4)
+                T_cw[:3, :3] = R_ct
+                T_cw[:3, 3] = tvec
+
+                T_be_list.append(T_be)
+                T_cw_list.append(T_cw)
+                corners_2d_list.append(corners_2d)
+
+                self.logger.info(
+                    f"successfully collected corner observation for position {i+1}/{total_positions}"
+                )
+            except Exception as e:
+                error_msg = (
+                    f"could not collect data for position {i+1}/{total_positions}: {e}"
+                )
+                self.logger.error(error_msg)
+                raise Exception(error_msg)
+
+        return T_be_list, T_cw_list, corners_2d_list, corners_3d, K, dist
+
     async def _collect_calibration_data(self):
         """Collect calibration data for all joint positions or poses."""
         R_gripper2base_list = []
@@ -400,23 +502,91 @@ class HandEyeCalibration(Generic, EasyResource):
         for key, value in command.items():
             match key:
                 case "run_calibration":
-                    R_gripper2base_list, t_gripper2base_list, R_target2cam_list, t_target2cam_list = await self._collect_calibration_data()
+                    refinement_info = None
+                    if self.solver == SOLVER_OPENCV:
+                        R_gripper2base_list, t_gripper2base_list, R_target2cam_list, t_target2cam_list = await self._collect_calibration_data()
 
-                    # Check if we have enough measurements
-                    if len(R_gripper2base_list) < 3:
-                        raise Exception(f"not enough valid measurements collected. Got {len(R_gripper2base_list)}, need at least 3. Make sure the pose tracker can see exactly one target in each calibration position.")
+                        # Check if we have enough measurements
+                        if len(R_gripper2base_list) < 3:
+                            raise Exception(f"not enough valid measurements collected. Got {len(R_gripper2base_list)}, need at least 3. Make sure the pose tracker can see exactly one target in each calibration position.")
 
-                    self.logger.info(f"collected {len(R_gripper2base_list)} measurements, running calibration...")
+                        self.logger.info(f"collected {len(R_gripper2base_list)} measurements, running calibration...")
 
-                    R_cam2gripper, t_cam2gripper = cv2.calibrateHandEye(
-                        R_gripper2base=R_gripper2base_list,
-                        t_gripper2base=t_gripper2base_list,
-                        R_target2cam=R_target2cam_list,
-                        t_target2cam=t_target2cam_list,
-                        method=getattr(cv2, self.method)
-                    )
-                    if R_cam2gripper is None or t_cam2gripper is None:
-                        raise Exception("could not solve calibration")
+                        R_cam2gripper, t_cam2gripper = cv2.calibrateHandEye(
+                            R_gripper2base=R_gripper2base_list,
+                            t_gripper2base=t_gripper2base_list,
+                            R_target2cam=R_target2cam_list,
+                            t_target2cam=t_target2cam_list,
+                            method=getattr(cv2, self.method)
+                        )
+                        if R_cam2gripper is None or t_cam2gripper is None:
+                            raise Exception("could not solve calibration")
+                    else:
+                        # Reprojection-based path: collect corner observations and use
+                        # OpenCV-standard conventions throughout.
+                        T_be_list, T_cw_list, corners_2d_list, corners_3d, K, dist = (
+                            await self._collect_calibration_data_with_corners()
+                        )
+                        if len(T_be_list) < 3:
+                            raise Exception(
+                                f"not enough valid measurements collected. Got {len(T_be_list)}, need at least 3."
+                            )
+                        self.logger.info(
+                            f"collected {len(T_be_list)} corner observations, "
+                            f"bootstrapping with cv2.calibrateHandEye({self.method})"
+                        )
+
+                        # Bootstrap with cv2.calibrateHandEye in standard convention.
+                        # R_be = T_be[:3,:3] (gripper-in-base), R_ct = T_cw[:3,:3] (target-in-cam).
+                        R_g2b = [T[:3, :3] for T in T_be_list]
+                        t_g2b = [T[:3, 3].reshape(3, 1) for T in T_be_list]
+                        R_t2c = [T[:3, :3] for T in T_cw_list]
+                        t_t2c = [T[:3, 3].reshape(3, 1) for T in T_cw_list]
+                        R_c2g_init, t_c2g_init = cv2.calibrateHandEye(
+                            R_g2b, t_g2b, R_t2c, t_t2c, method=getattr(cv2, self.method)
+                        )
+                        X_init = np.eye(4)
+                        X_init[:3, :3] = R_c2g_init
+                        X_init[:3, 3] = t_c2g_init.flatten()
+
+                        self.logger.info("refining with reprojection-error solver...")
+                        refinement = refine_handeye(
+                            T_be_list,
+                            corners_2d_list,
+                            corners_3d,
+                            K,
+                            dist,
+                            X_init=X_init,
+                            T_cw_list=T_cw_list,
+                        )
+                        X_refined = refinement["X_refined"]
+                        R_cam2gripper = X_refined[:3, :3]
+                        t_cam2gripper = X_refined[:3, 3].reshape(3, 1)
+                        refinement_info = {
+                            "rmse_pixels": refinement["rmse_pixels"],
+                            "per_pose_rmse_pixels": refinement["per_pose_rmse_pixels"],
+                            "iterations": refinement["n_iterations"],
+                            "success": refinement["success"],
+                            "message": refinement["message"],
+                        }
+                        self.logger.info(
+                            f"reprojection refinement: rmse={refinement['rmse_pixels']:.3f}px "
+                            f"after {refinement['n_iterations']} fn evals "
+                            f"(success={refinement['success']})"
+                        )
+                        median_rmse = float(np.median(refinement["per_pose_rmse_pixels"]))
+                        for idx, r in enumerate(refinement["per_pose_rmse_pixels"]):
+                            if median_rmse > 0 and r > 3.0 * median_rmse:
+                                self.logger.warning(
+                                    f"pose {idx+1}: per-pose rmse={r:.3f}px > 3× median ({median_rmse:.3f}px) — possible outlier"
+                                )
+
+                        # For the legacy per-pose residual summary, reconstruct the
+                        # rotation/translation lists in the convention that helper expects.
+                        R_gripper2base_list = R_g2b
+                        t_gripper2base_list = t_g2b
+                        R_target2cam_list = R_t2c
+                        t_target2cam_list = t_t2c
 
                     # Per-pose residuals to identify outlier poses
                     per_pose_residuals, residual_summary = self._compute_per_pose_residuals(
@@ -462,7 +632,7 @@ class HandEyeCalibration(Generic, EasyResource):
                     self.logger.info(f"calibration success: {viam_pose}")
 
                     # Format output to be frame system compatible
-                    resp["run_calibration"] = {
+                    response = {
                         "frame": {
                             "translation": {
                                 "x": x,
@@ -484,7 +654,11 @@ class HandEyeCalibration(Generic, EasyResource):
                             "summary": residual_summary,
                             "per_pose": per_pose_residuals,
                         },
+                        "solver": self.solver,
                     }
+                    if refinement_info is not None:
+                        response["refinement"] = refinement_info
+                    resp["run_calibration"] = response
                 case "move_arm": 
                     raise NotImplementedError("This is not yet implemented")
                 case "check_bodies":
@@ -550,6 +724,60 @@ class HandEyeCalibration(Generic, EasyResource):
                     resp["move_arm_to_position"] = len(tracked_poses)
                 case "auto_calibrate":
                     raise NotImplementedError("This is not yet implemented")
+                case "compute_pose_diversity":
+                    poses_input = None
+                    if isinstance(value, dict):
+                        poses_input = value.get("poses")
+
+                    if poses_input is not None:
+                        poses_for_diag = []
+                        for p in poses_input:
+                            poses_for_diag.append(Pose(
+                                x=p.get("x", 0),
+                                y=p.get("y", 0),
+                                z=p.get("z", 0),
+                                o_x=p.get("o_x", 0),
+                                o_y=p.get("o_y", 0),
+                                o_z=p.get("o_z", 1),
+                                theta=p.get("theta", 0),
+                            ))
+                    else:
+                        poses_for_diag = self.poses
+
+                    if not poses_for_diag:
+                        resp["compute_pose_diversity"] = {
+                            "error": (
+                                f"no poses available. Configure '{POSES_ATTR}' on the service "
+                                f"or pass {{'poses': [...]}} in the command. "
+                                f"Joint-position-only configurations are not supported by "
+                                f"the diagnostic — convert to cartesian poses first."
+                            ),
+                        }
+                        break
+
+                    transforms = []
+                    convert_failed = False
+                    for pose in poses_for_diag:
+                        R = call_go_ov2mat(pose.o_x, pose.o_y, pose.o_z, pose.theta)
+                        if R is None:
+                            convert_failed = True
+                            break
+                        T = np.eye(4)
+                        T[:3, :3] = R
+                        T[:3, 3] = [pose.x, pose.y, pose.z]
+                        transforms.append(T)
+
+                    if convert_failed:
+                        resp["compute_pose_diversity"] = {
+                            "error": "could not convert orientation vector to rotation matrix",
+                        }
+                        break
+
+                    diversity = compute_pose_diversity(transforms)
+                    self.logger.info(f"pose-set diagnostics: {diversity['feedback']}")
+                    for w in diversity.get("warnings", []):
+                        self.logger.warning(f"pose-set diagnostics: {w}")
+                    resp["compute_pose_diversity"] = diversity
                 case _:
                     resp[key] = "unsupported key"
 
