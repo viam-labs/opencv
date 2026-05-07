@@ -23,6 +23,8 @@ import base64
 import io
 import os
 import sys
+from datetime import datetime
+from pathlib import Path
 
 from dotenv import load_dotenv
 from PIL import Image
@@ -32,6 +34,8 @@ from viam.robot.client import RobotClient
 from viam.media.video import CameraMimeType
 from viam.media.utils.pil import viam_to_pil_image
 from viam.services.generic import Generic
+
+JPEG_QUALITY = 95
 
 
 async def connect():
@@ -45,9 +49,9 @@ async def connect():
 
 
 def pil_image_to_base64(pil_image: Image.Image) -> str:
-    """Convert a PIL Image to base64 encoded string."""
+    """Convert a PIL Image to base64 encoded JPEG string."""
     buffer = io.BytesIO()
-    pil_image.save(buffer, format='JPEG')
+    pil_image.save(buffer, format='JPEG', quality=JPEG_QUALITY)
     img_bytes = buffer.getvalue()
     return base64.b64encode(img_bytes).decode('utf-8')
 
@@ -85,18 +89,43 @@ async def capture_and_validate_image(cam: Camera) -> tuple[Image.Image, bool]:
             print("Please enter 'y' or 'n'")
 
 
-async def collect_calibration_images(cam: Camera, num_images: int = 10) -> list[str]:
-    """Collect calibration images with user validation.
-    
+def load_images_from_dir(image_dir: Path) -> list[str]:
+    """Load previously saved calibration images from a directory.
+
     Args:
-        cam: Camera component to capture from
-        num_images: Number of images to collect
-        
+        image_dir: Directory containing JPEG images
+
     Returns:
         List of base64 encoded image strings
     """
+    image_files = sorted(image_dir.glob("*.jpg"))
+    if not image_files:
+        raise Exception(f"No .jpg images found in {image_dir}")
+
     base64_images = []
-    
+    for path in image_files:
+        with open(path, 'rb') as f:
+            base64_images.append(base64.b64encode(f.read()).decode('utf-8'))
+
+    print(f"Loaded {len(base64_images)} images from {image_dir}")
+    return base64_images
+
+
+async def collect_calibration_images(cam: Camera, num_images: int = 10) -> tuple[list[str], Path]:
+    """Collect calibration images with user validation, saving each to disk.
+
+    Args:
+        cam: Camera component to capture from
+        num_images: Number of images to collect
+
+    Returns:
+        Tuple of (list of base64 encoded image strings, save directory path)
+    """
+    save_dir = Path(f"calibration_images_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    base64_images = []
+
     print(f"\n{'='*60}")
     print(f"Camera Calibration - Collecting {num_images} Images")
     print(f"{'='*60}")
@@ -105,37 +134,41 @@ async def collect_calibration_images(cam: Camera, num_images: int = 10) -> list[
     print("- Cover different areas of the camera's field of view")
     print("- Ensure good lighting and focus")
     print("- Each captured image will be shown for your approval")
+    print(f"Images will be saved to: {save_dir.resolve()}")
     print(f"{'='*60}\n")
-    
+
     while len(base64_images) < num_images:
         current_count = len(base64_images) + 1
         print(f"\nCapturing image {current_count}/{num_images}...")
         print("Position the chessboard and press Enter when ready...")
         input()
-        
+
         # Keep trying until user accepts an image
         accepted = False
         while not accepted:
             pil_image, accepted = await capture_and_validate_image(cam)
-            
+
             if pil_image is None:
                 print("Failed to capture image. Retrying...")
                 await asyncio.sleep(1)
                 continue
-            
+
             if accepted:
-                # Convert to base64 and add to collection
                 base64_img = pil_image_to_base64(pil_image)
                 base64_images.append(base64_img)
-                print(f"Image {current_count}/{num_images} accepted and saved!")
+                # Save to disk immediately so images are never lost on failure
+                img_path = save_dir / f"image_{current_count:03d}.jpg"
+                pil_image.save(img_path, format='JPEG', quality=JPEG_QUALITY)
+                print(f"Image {current_count}/{num_images} accepted and saved to {img_path}")
             else:
                 print("Image rejected. Retaking...")
-    
+
     print(f"\n{'='*60}")
     print(f"Successfully collected all {num_images} images!")
+    print(f"Saved to: {save_dir.resolve()}")
     print(f"{'='*60}\n")
-    
-    return base64_images
+
+    return base64_images, save_dir
 
 
 async def run_calibration(camera_cal: Generic, base64_images: list[str]):
@@ -174,6 +207,19 @@ async def run_calibration(camera_cal: Generic, base64_images: list[str]):
         print(f"  p1: {dc['p1']:.6f}")
         print(f"  p2: {dc['p2']:.6f}")
         print(f"  k3: {dc['k3']:.6f}")
+
+        per_image = response.get('per_image_errors')
+        if per_image:
+            mean_err = response['reprojection_error']
+            outlier_threshold = max(2 * mean_err, mean_err + 0.5)
+            sorted_errors = sorted(per_image, key=lambda e: e['rms_error'], reverse=True)
+            print(f"\nPer-Image RMS Reprojection Error (sorted worst-first):")
+            print(f"  Outlier threshold: {outlier_threshold:.4f}px (2x mean or mean+0.5, whichever is larger)")
+            for entry in sorted_errors:
+                idx = int(entry['image_index'])
+                err = entry['rms_error']
+                flag = "  <-- OUTLIER" if err > outlier_threshold else ""
+                print(f"  image_{idx:03d}: {err:.4f}px{flag}")
     else:
         print(f"Calibration failed: {response.get('error', 'Unknown error. Error not present in response')}")
     
@@ -188,10 +234,10 @@ async def main():
     parser.add_argument('--camera-name', type=str, required=True, help='Name of the camera component')
     parser.add_argument('--service-name', type=str, required=True, help='Name of the camera calibration service')
     parser.add_argument('--num-images', type=int, default=10, help='Number of images to collect (default: 10, minimum: 3)')
+    parser.add_argument('--from-dir', type=str, default=None, help='Load images from a previously saved directory instead of capturing new ones')
     args = parser.parse_args()
 
-    # Validate num_images
-    if args.num_images < 3:
+    if args.from_dir is None and args.num_images < 3:
         print("Error: num_images must be at least 3")
         sys.exit(1)
 
@@ -205,13 +251,13 @@ async def main():
         # Get camera component
         cam = Camera.from_robot(machine, args.camera_name)
 
-        resp = await cam.do_command({"get_camera_params": ""})  
-        
+        resp = await cam.do_command({"get_camera_params": ""})
+
         # Display camera parameters prettily
         print(f"\n{'='*60}")
         print("Color Camera Parameters")
         print(f"{'='*60}")
-        
+
         params = resp["Color"]
         if 'intrinsics' in params:
             intrinsics = params['intrinsics']
@@ -222,7 +268,7 @@ async def main():
             print(f"  cy: {intrinsics.get('cy', 'N/A'):.6f}")
             print(f"  width: {intrinsics.get('width', 'N/A')}")
             print(f"  height: {intrinsics.get('height', 'N/A')}")
-        
+
         if 'distortion' in params:
             distortion = params['distortion']
             print("\nDistortion:")
@@ -234,18 +280,20 @@ async def main():
             print(f"  k6: {distortion.get('k6', 0.0):.6f}")
             print(f"  p1: {distortion.get('p1', 0.0):.6f}")
             print(f"  p2: {distortion.get('p2', 0.0):.6f}")
-        
+
         print(f"\n{'='*60}\n")
 
         # Get camera calibration service
         camera_cal = Generic.from_robot(machine, args.service_name)
 
-        # Collect calibration images with user validation
-        base64_images = await collect_calibration_images(cam, args.num_images)
+        if args.from_dir:
+            base64_images = load_images_from_dir(Path(args.from_dir))
+        else:
+            base64_images, _ = await collect_calibration_images(cam, args.num_images)
 
         # Run calibration
-        result = await run_calibration(camera_cal, base64_images)
-        
+        await run_calibration(camera_cal, base64_images)
+
     except Exception as e:
         print(f"Error: {e}")
         import traceback
