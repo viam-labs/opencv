@@ -18,6 +18,12 @@ from viam.utils import struct_to_dict, ValueTypes
 
 from utils.utils import call_go_ov2mat, call_go_mat2ov
 
+try:
+    from diagnostics.pose_diversity import compute_pose_diversity
+except ModuleNotFoundError:
+    # when running as local module with run.sh
+    from ..diagnostics.pose_diversity import compute_pose_diversity
+
 CALIBS = ["eye-in-hand", "eye-to-hand"]
 METHODS = [
     "CALIB_HAND_EYE_TSAI",
@@ -545,6 +551,60 @@ class HandEyeCalibration(Generic, EasyResource):
                     resp["move_arm_to_position"] = len(tracked_poses)
                 case "auto_calibrate":
                     raise NotImplementedError("This is not yet implemented")
+                case "compute_pose_diversity":
+                    poses_input = None
+                    if isinstance(value, dict):
+                        poses_input = value.get("poses")
+
+                    if poses_input is not None:
+                        poses_for_diag = []
+                        for p in poses_input:
+                            poses_for_diag.append(Pose(
+                                x=p.get("x", 0),
+                                y=p.get("y", 0),
+                                z=p.get("z", 0),
+                                o_x=p.get("o_x", 0),
+                                o_y=p.get("o_y", 0),
+                                o_z=p.get("o_z", 1),
+                                theta=p.get("theta", 0),
+                            ))
+                    else:
+                        poses_for_diag = self.poses
+
+                    if not poses_for_diag:
+                        resp["compute_pose_diversity"] = {
+                            "error": (
+                                f"no poses available. Configure '{POSES_ATTR}' on the service "
+                                f"or pass {{'poses': [...]}} in the command. "
+                                f"Joint-position-only configurations are not supported by "
+                                f"the diagnostic — convert to cartesian poses first."
+                            ),
+                        }
+                        break
+
+                    transforms = []
+                    convert_failed = False
+                    for pose in poses_for_diag:
+                        R = call_go_ov2mat(pose.o_x, pose.o_y, pose.o_z, pose.theta)
+                        if R is None:
+                            convert_failed = True
+                            break
+                        T = np.eye(4)
+                        T[:3, :3] = R
+                        T[:3, 3] = [pose.x, pose.y, pose.z]
+                        transforms.append(T)
+
+                    if convert_failed:
+                        resp["compute_pose_diversity"] = {
+                            "error": "could not convert orientation vector to rotation matrix",
+                        }
+                        break
+
+                    diversity = compute_pose_diversity(transforms)
+                    self.logger.info(f"pose-set diagnostics: {diversity['feedback']}")
+                    for w in diversity.get("warnings", []):
+                        self.logger.warning(f"pose-set diagnostics: {w}")
+                    resp["compute_pose_diversity"] = diversity
                 case _:
                     resp[key] = "unsupported key"
 
