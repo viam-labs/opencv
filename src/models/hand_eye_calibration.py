@@ -378,10 +378,15 @@ class HandEyeCalibration(Generic, EasyResource):
                 self.logger.info(f"successfully collected calibration data for position {i+1}/{total_positions}")
 
             except Exception as e:
-                error_msg = f"Could not find calibration values for position {i+1}/{total_positions}: {e}"
-                self.logger.error(error_msg)
-                raise Exception(error_msg)
-        
+                self.logger.warning(
+                    f"skipping position {i+1}/{total_positions}: could not collect calibration data: {e}"
+                )
+                continue
+
+        self.logger.info(
+            f"collected calibration data for {len(R_gripper2base_list)}/{total_positions} positions"
+        )
+
         return R_gripper2base_list, t_gripper2base_list, R_target2cam_list, t_target2cam_list
 
     async def do_command(
