@@ -202,6 +202,126 @@ def test_generate_pose_set_n_zero_raises():
         )
 
 
+def test_anchored_roll_reference_keeps_x_consistent_across_target():
+    """With an anchored roll reference and roll=0, two positions on opposite
+    sides of the target should produce gripper X axes pointing in the same
+    world direction (not 180° apart as the per-pose reference would).
+    """
+    target = np.array([400.0, 0.0, 0.0])
+    ref = np.array([1.0, 0.0, 0.0])
+
+    R_west = look_at_rotation(np.array([300.0, 0.0, 400.0]), target, 0.0, roll_reference=ref)
+    R_east = look_at_rotation(np.array([500.0, 0.0, 400.0]), target, 0.0, roll_reference=ref)
+
+    x_west = R_west[:, 0]
+    x_east = R_east[:, 0]
+    # Both should point predominantly in the +X direction (positive dot
+    # product with the reference) — the anchored reference does not flip.
+    assert float(np.dot(x_west, ref)) > 0.5
+    assert float(np.dot(x_east, ref)) > 0.5
+
+
+def test_per_pose_reference_flips_across_target():
+    """Sanity counterpart: the default (per-pose) reference DOES flip
+    when the position crosses to the other side of the target. Documents
+    the behavior that anchored mode fixes.
+    """
+    target = np.array([400.0, 0.0, 0.0])
+    R_west = look_at_rotation(np.array([300.0, 0.0, 400.0]), target, 0.0)
+    R_east = look_at_rotation(np.array([500.0, 0.0, 400.0]), target, 0.0)
+    # Per-pose x_ref = world_up × z. Crossing the target along X flips
+    # the sign of the horizontal projection of z, which flips x_ref.
+    assert float(np.dot(R_west[:, 0], R_east[:, 0])) < -0.5
+
+
+def test_anchored_roll_reference_parallel_raises():
+    """If the reference is parallel to the optical axis, the projection
+    is ill-defined and look_at_rotation raises ValueError.
+    """
+    target = np.array([0.0, 0.0, 0.0])
+    position = np.array([100.0, 0.0, 0.0])
+    # Optical axis = (-1, 0, 0). Reference along the same direction.
+    with pytest.raises(ValueError, match="parallel to the optical axis"):
+        look_at_rotation(position, target, 0.0, roll_reference=np.array([1.0, 0.0, 0.0]))
+
+
+def test_anchored_roll_reference_zero_vector_raises():
+    target = np.array([400.0, 0.0, 0.0])
+    position = np.array([300.0, 0.0, 400.0])
+    with pytest.raises(ValueError, match="non-zero vector"):
+        look_at_rotation(position, target, 0.0, roll_reference=np.array([0.0, 0.0, 0.0]))
+
+
+def test_sample_transform_rejects_parallel_reference_and_retries():
+    """If some sampled positions produce optical axes parallel to the
+    reference, sample_transform should skip them and still return a
+    valid pose when the workspace contains enough non-parallel positions.
+
+    With target at origin, reference=+X, and a workspace centered along +X
+    but with substantial Y/Z spread, positions near the X axis produce
+    optical axes parallel to the reference and get rejected; positions
+    away from the axis succeed.
+    """
+    bounds = {
+        "x": {"min": 600.0, "max": 700.0},
+        "y": {"min": -100.0, "max": 100.0},
+        "z": {"min": -100.0, "max": 100.0},
+    }
+    target = [0.0, 0.0, 0.0]
+    rng = np.random.default_rng(0)
+    T = sample_transform(
+        bounds,
+        target,
+        rng=rng,
+        roll_reference=np.array([1.0, 0.0, 0.0]),
+        max_retries=200,
+    )
+    assert T.shape == (4, 4)
+    # And generating a whole set should also work.
+    transforms = generate_pose_set(
+        n_poses=5,
+        workspace_bounds=bounds,
+        look_at_point=target,
+        rng=np.random.default_rng(1),
+        roll_reference=np.array([1.0, 0.0, 0.0]),
+    )
+    assert len(transforms) == 5
+
+
+def test_anchored_roll_range_is_respected():
+    """With an anchored reference and a restricted roll range, the actual
+    roll angles (measured against the projected reference) stay within the
+    configured range.
+    """
+    target = np.array([400.0, 0.0, 0.0])
+    ref = np.array([1.0, 0.0, 0.0])
+    bounds = {
+        "x": {"min": 200.0, "max": 600.0},
+        "y": {"min": -200.0, "max": 200.0},
+        "z": {"min": 200.0, "max": 500.0},
+    }
+    roll_lo_deg, roll_hi_deg = -30.0, 30.0
+    roll_range_rad = (np.deg2rad(roll_lo_deg), np.deg2rad(roll_hi_deg))
+
+    rng = np.random.default_rng(0)
+    for _ in range(15):
+        T = sample_transform(
+            bounds, target, roll_range_rad, rng=rng, roll_reference=ref
+        )
+        position = T[:3, 3]
+        z = target - position
+        z = z / np.linalg.norm(z)
+        x_ref_expected = ref - float(np.dot(ref, z)) * z
+        x_ref_expected = x_ref_expected / np.linalg.norm(x_ref_expected)
+        y_ref_expected = np.cross(z, x_ref_expected)
+
+        x_actual = T[:3, 0]
+        sin_r = float(np.dot(x_actual, y_ref_expected))
+        cos_r = float(np.dot(x_actual, x_ref_expected))
+        actual_deg = np.degrees(np.arctan2(sin_r, cos_r))
+        assert roll_lo_deg - 0.01 <= actual_deg <= roll_hi_deg + 0.01
+
+
 def test_sample_transform_deterministic_with_seed():
     bounds = {
         "x": {"min": 100.0, "max": 200.0},

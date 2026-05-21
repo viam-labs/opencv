@@ -41,10 +41,14 @@ def _validate_workspace_bounds(workspace_bounds: WorkspaceBounds) -> None:
             )
 
 
+_ROLL_REFERENCE_PARALLEL_TOL = 0.99
+
+
 def look_at_rotation(
     position: np.ndarray,
     target: np.ndarray,
     roll_rad: float,
+    roll_reference: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Build a 3x3 rotation whose third column is the unit vector from
     ``position`` to ``target``, with the rotation about that axis
@@ -54,7 +58,20 @@ def look_at_rotation(
     expressed in the base frame (i.e., R takes vectors in end-effector
     coordinates and produces vectors in base coordinates).
 
-    Raises ``ValueError`` if ``position`` and ``target`` coincide.
+    The ``roll_reference`` argument controls what ``roll_rad = 0`` means:
+
+    - ``None`` (default): per-pose reference. ``x_ref = world_up × z``,
+      flipping ``world_up`` to world +X if ``z`` is nearly vertical. This
+      reference depends on ``z`` and can flip 180° as the position crosses
+      the look-at point along the horizontal plane.
+    - A length-3 vector: anchored reference. ``x_ref`` is the component of
+      that vector perpendicular to ``z``, normalized. ``roll = 0`` then
+      means "gripper X axis points roughly in this world direction" — the
+      reference does not flip with position.
+
+    Raises ``ValueError`` if ``position`` coincides with ``target`` or if
+    an anchored ``roll_reference`` is too parallel to the look-at axis (in
+    which case the perpendicular projection has near-zero length).
     """
     position = np.asarray(position, dtype=np.float64).reshape(3)
     target = np.asarray(target, dtype=np.float64).reshape(3)
@@ -65,12 +82,26 @@ def look_at_rotation(
         raise ValueError("sampled position coincides with look-at target")
     z = z / z_norm
 
-    # Reference up vector. Fall back if z is nearly parallel to world +Z.
-    world_up = np.array([0.0, 0.0, 1.0])
-    if abs(float(np.dot(z, world_up))) > 0.99:
-        world_up = np.array([1.0, 0.0, 0.0])
+    if roll_reference is None:
+        # Per-pose reference. Fall back if z is nearly parallel to world +Z.
+        world_up = np.array([0.0, 0.0, 1.0])
+        if abs(float(np.dot(z, world_up))) > _ROLL_REFERENCE_PARALLEL_TOL:
+            world_up = np.array([1.0, 0.0, 0.0])
+        x_ref = np.cross(world_up, z)
+    else:
+        ref = np.asarray(roll_reference, dtype=np.float64).reshape(3)
+        ref_norm = float(np.linalg.norm(ref))
+        if ref_norm < 1e-9:
+            raise ValueError("roll_reference must be a non-zero vector")
+        ref = ref / ref_norm
+        if abs(float(np.dot(ref, z))) > _ROLL_REFERENCE_PARALLEL_TOL:
+            raise ValueError(
+                "roll_reference is too parallel to the optical axis at this "
+                "position; the perpendicular projection is ill-defined"
+            )
+        # Project ref onto the plane perpendicular to z.
+        x_ref = ref - float(np.dot(ref, z)) * z
 
-    x_ref = np.cross(world_up, z)
     x_ref = x_ref / np.linalg.norm(x_ref)
     y_ref = np.cross(z, x_ref)
 
@@ -87,14 +118,20 @@ def sample_transform(
     roll_range_rad: Tuple[float, float] = (-np.pi, np.pi),
     rng: Optional[np.random.Generator] = None,
     max_retries: int = 32,
+    roll_reference: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Sample a single 4x4 SE(3) transform.
 
     Position is uniform in ``workspace_bounds``; orientation is built by
     :func:`look_at_rotation` with a roll uniform in ``roll_range_rad``.
 
-    If a sampled position coincides with ``look_at_point`` (degenerate
-    look-at), retries up to ``max_retries`` times before raising.
+    If ``roll_reference`` is provided, the "roll = 0" axis is anchored to
+    that world-frame direction; positions where the reference is too
+    parallel to the look-at axis are rejected and resampled (counted
+    against ``max_retries``).
+
+    Raises ``RuntimeError`` if no non-degenerate sample is found within
+    ``max_retries``.
     """
     _validate_workspace_bounds(workspace_bounds)
     if rng is None:
@@ -116,7 +153,12 @@ def sample_transform(
         if np.linalg.norm(position - target) < 1e-6:
             continue
         roll = rng.uniform(roll_lo, roll_hi)
-        R = look_at_rotation(position, target, roll)
+        try:
+            R = look_at_rotation(position, target, roll, roll_reference=roll_reference)
+        except ValueError:
+            # roll_reference parallel to optical axis at this position;
+            # reject and resample.
+            continue
         T = np.eye(4)
         T[:3, :3] = R
         T[:3, 3] = position
@@ -124,7 +166,8 @@ def sample_transform(
 
     raise RuntimeError(
         f"could not sample non-degenerate pose after {max_retries} attempts; "
-        "look_at_point may be inside the workspace_bounds and the volume is small"
+        "either look_at_point is inside a small workspace_bounds or "
+        "roll_reference is parallel to most of the optical axes in the volume"
     )
 
 
@@ -134,6 +177,7 @@ def generate_pose_set(
     look_at_point: Sequence[float],
     roll_range_rad: Tuple[float, float] = (-np.pi, np.pi),
     rng: Optional[np.random.Generator] = None,
+    roll_reference: Optional[np.ndarray] = None,
 ) -> List[np.ndarray]:
     """Generate ``n_poses`` independent sample transforms."""
     if n_poses < 1:
@@ -141,6 +185,12 @@ def generate_pose_set(
     if rng is None:
         rng = np.random.default_rng()
     return [
-        sample_transform(workspace_bounds, look_at_point, roll_range_rad, rng)
+        sample_transform(
+            workspace_bounds,
+            look_at_point,
+            roll_range_rad,
+            rng,
+            roll_reference=roll_reference,
+        )
         for _ in range(n_poses)
     ]

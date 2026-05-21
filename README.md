@@ -28,11 +28,11 @@ The following attribute template can be used to configure this model:
 
 The following attributes are available for this model:
 
-| Name                | Type   | Inclusion | Description                                             |
-|---------------------|--------|-----------|---------------------------------------------------------|
-| `camera_name`       | string | Required  | Name of the camera used for checking pose of chessboard.|
-| `pattern_size`      | list   | Required  | Dimensions of the chessboard pattern (rows x columns of inner corner squares).|
-| `square_size_mm`    | int    | Required  | Physical size of a square in the chessboard pattern, in mm.|
+| Name                | Type   | Inclusion | Description                                                                                                                                                                                                       |
+|---------------------|--------|-----------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `camera_name`       | string | Required  | Name of the camera used for checking pose of chessboard.                                                                                                                                                          |
+| `pattern_size`      | list   | Required  | Dimensions of the chessboard pattern (rows x columns of inner corner squares).                                                                                                                                    |
+| `square_size_mm`    | int    | Required  | Physical size of a square in the chessboard pattern, in mm.                                                                                                                                                       |
 | `camera_intrinsics` | dict   | Optional  | Override the camera's intrinsics rather than fetching them from `camera.do_command({"get_camera_params": None})`. Requires both `K` (with `fx`, `fy`, `cx`, `cy`) and `dist` (with `k1`, `k2`, `k3`, `p1`, `p2`). |
 
 #### Pose Tracker Example Configuration
@@ -112,6 +112,7 @@ The following attribute template can be used to configure this model:
     "n_poses": <int>,
     "max_attempts": <int>,
     "roll_range_deg": [<float>, <float>],
+    "roll_reference": [<float>, <float>, <float>],
     "seed": <int>
   },
   "pose_tracker": <string>,
@@ -177,7 +178,17 @@ After moving to each candidate the service verifies the chessboard is actually d
 | `n_poses`                      | int     | no       | Number of successful poses to collect. Defaults to 20. |
 | `max_attempts`                 | int     | no       | Cap on total sample attempts (including skips). Defaults to 60. |
 | `roll_range_deg`               | `[lo, hi]` | no    | Range for the random roll about the optical axis, in degrees. Defaults to `[-180, 180]`. |
+| `roll_reference`               | `[x, y, z]` | no   | World-frame vector that anchors what `roll = 0` means. See *Roll reference* below. Omit for the default per-pose reference. |
 | `seed`                         | int     | no       | Optional seed for reproducible sampling. |
+
+##### Roll reference
+
+The `roll_range_deg` restriction is measured relative to a "roll = 0" X-axis that the sampler picks at each pose. There are two ways to pick it:
+
+- **Per-pose (default)** — `roll_reference` omitted. The sampler computes `x_ref = world_up × z / ||…||` at each pose. This reference depends on the look-at direction `z`, so it can flip 180° in world frame when the position crosses to the other side of the look-at point. The numeric roll bound is still respected, but the *world-frame* orientation of the gripper can jump between consecutive poses.
+- **Anchored** — `roll_reference` set to a world-frame vector (e.g., `[1, 0, 0]`). The sampler takes that vector, projects it onto the plane perpendicular to `z`, and uses that as `x_ref`. The reference no longer depends on which side of the look-at point you sampled, so a tight `roll_range_deg` actually means a tight bound on wrist twist in world coordinates.
+
+Edge case for anchored mode: when the optical axis becomes (nearly) parallel to `roll_reference`, the perpendicular projection has near-zero length and the orientation is ill-defined. The sampler rejects those positions and resamples. If `roll_reference` is nearly parallel to most of your workspace's look-at directions, the sampler can exhaust `max_attempts` — pick a reference that's mostly perpendicular to the dominant look-at direction.
 
 #### Hand Eye Calibration Example Configurations
 

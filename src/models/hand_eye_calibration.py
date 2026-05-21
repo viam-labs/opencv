@@ -109,6 +109,17 @@ def _validate_sampling_attrs(sampling: dict) -> None:
         if float(roll[0]) > float(roll[1]):
             raise Exception("'pose_sampling.roll_range_deg' must have min <= max.")
 
+    ref = sampling.get("roll_reference")
+    if ref is not None:
+        if not isinstance(ref, (list, tuple)) or len(ref) != 3:
+            raise Exception(
+                "'pose_sampling.roll_reference' must be a length-3 vector "
+                "[x, y, z] in robot base frame."
+            )
+        ref_vec = np.array([float(v) for v in ref], dtype=np.float64)
+        if float(np.linalg.norm(ref_vec)) < 1e-9:
+            raise Exception("'pose_sampling.roll_reference' must be a non-zero vector.")
+
 
 def _parse_sampling_attrs(sampling: dict) -> dict:
     """Convert a validated ``pose_sampling`` dict into the kwargs the sampler
@@ -124,6 +135,10 @@ def _parse_sampling_attrs(sampling: dict) -> dict:
     n_poses = int(sampling.get("n_poses", DEFAULT_AUTO_N_POSES))
     max_attempts = int(sampling.get("max_attempts", DEFAULT_AUTO_MAX_ATTEMPTS))
     seed = sampling.get("seed")
+    ref = sampling.get("roll_reference")
+    roll_reference = (
+        np.array([float(v) for v in ref], dtype=np.float64) if ref is not None else None
+    )
     return {
         "workspace_bounds": workspace,
         "look_at_point": look_at,
@@ -131,6 +146,7 @@ def _parse_sampling_attrs(sampling: dict) -> dict:
         "n_poses": n_poses,
         "max_attempts": max_attempts,
         "seed": int(seed) if seed is not None else None,
+        "roll_reference": roll_reference,
     }
 
 
@@ -399,6 +415,7 @@ class HandEyeCalibration(Generic, EasyResource):
                     look_at_point=sampling["look_at_point"],
                     roll_range_rad=sampling["roll_range_rad"],
                     rng=rng,
+                    roll_reference=sampling.get("roll_reference"),
                 )
                 candidate = self._transform_to_viam_pose(T)
             except Exception as e:
@@ -495,7 +512,7 @@ class HandEyeCalibration(Generic, EasyResource):
             )
             if not success:
                 raise Exception(f"Could not move to pose {position_index+1}/{total_positions}")
-            self.logger.debug(f"Moved arm to pose using motion planning")
+            self.logger.debug(f"Moved arm to pose: {pif} using motion planning")
         elif is_pose:
             # Direct pose control using arm.move_to_position
             try:
@@ -1049,6 +1066,7 @@ class HandEyeCalibration(Generic, EasyResource):
                         look_at_point=parsed["look_at_point"],
                         roll_range_rad=parsed["roll_range_rad"],
                         rng=rng,
+                        roll_reference=parsed["roll_reference"],
                     )
 
                     pose_dicts = []
