@@ -21,10 +21,12 @@ from utils.utils import call_go_ov2mat, call_go_mat2ov
 try:
     from diagnostics.pose_diversity import compute_pose_diversity
     from solvers.reprojection_solver import refine_handeye
+    from active_calibration.pose_sampler import generate_pose_set, sample_transform
 except ModuleNotFoundError:
     # when running as local module with run.sh
     from ..diagnostics.pose_diversity import compute_pose_diversity
     from ..solvers.reprojection_solver import refine_handeye
+    from ..active_calibration.pose_sampler import generate_pose_set, sample_transform
 
 CALIBS = ["eye-in-hand", "eye-to-hand"]
 METHODS = [
@@ -47,6 +49,8 @@ POSE_TRACKER_ATTR = "pose_tracker"
 SLEEP_ATTR = "sleep_seconds"
 SOLVER_ATTR = "solver"
 USE_MOTION_SERVICE_FOR_POSES_ATTR = "use_motion_service_for_poses"
+POSE_SELECTION_ATTR = "pose_selection"
+POSE_SAMPLING_ATTR = "pose_sampling"
 
 # Solver options
 SOLVER_OPENCV = "opencv"
@@ -54,11 +58,80 @@ SOLVER_HYBRID = "hybrid"
 SOLVER_REPROJECTION = "reprojection"
 SOLVERS = [SOLVER_OPENCV, SOLVER_HYBRID, SOLVER_REPROJECTION]
 
+# Pose-selection options
+POSE_SELECTION_MANUAL = "manual"
+POSE_SELECTION_AUTO = "auto"
+POSE_SELECTIONS = [POSE_SELECTION_MANUAL, POSE_SELECTION_AUTO]
+
 # Default config attribute values
 DEFAULT_SLEEP_SECONDS = 2.0
 DEFAULT_METHOD = "CALIB_HAND_EYE_TSAI"
 DEFAULT_SOLVER = SOLVER_OPENCV
 DEFAULT_USE_MOTION_SERVICE_FOR_POSES = False
+DEFAULT_POSE_SELECTION = POSE_SELECTION_MANUAL
+DEFAULT_AUTO_N_POSES = 20
+DEFAULT_AUTO_MAX_ATTEMPTS = 60
+DEFAULT_AUTO_ROLL_RANGE_DEG = (-180.0, 180.0)
+
+
+def _validate_sampling_attrs(sampling: dict) -> None:
+    """Validate a ``pose_sampling`` config block (used by both the
+    ``pose_selection='auto'`` mode and the ``generate_poses`` do_command)."""
+    bounds = sampling.get("workspace_bounds")
+    if not isinstance(bounds, dict):
+        raise Exception("'pose_sampling.workspace_bounds' must be a dict with x/y/z keys.")
+    for axis in ("x", "y", "z"):
+        if axis not in bounds:
+            raise Exception(f"'pose_sampling.workspace_bounds' missing '{axis}' axis.")
+        axis_bounds = bounds[axis]
+        if not isinstance(axis_bounds, dict) or "min" not in axis_bounds or "max" not in axis_bounds:
+            raise Exception(
+                f"'pose_sampling.workspace_bounds[{axis!r}]' must be a dict with "
+                f"'min' and 'max' keys."
+            )
+        lo, hi = float(axis_bounds["min"]), float(axis_bounds["max"])
+        if lo >= hi:
+            raise Exception(
+                f"'pose_sampling.workspace_bounds[{axis!r}]' must have min < max."
+            )
+
+    look_at = sampling.get("look_at_point")
+    if not isinstance(look_at, (list, tuple)) or len(look_at) != 3:
+        raise Exception(
+            "'pose_sampling.look_at_point' must be a length-3 list [x, y, z] "
+            "(the chessboard's position in the robot base frame, in mm)."
+        )
+
+    roll = sampling.get("roll_range_deg")
+    if roll is not None:
+        if not isinstance(roll, (list, tuple)) or len(roll) != 2:
+            raise Exception("'pose_sampling.roll_range_deg' must be [min_deg, max_deg].")
+        if float(roll[0]) > float(roll[1]):
+            raise Exception("'pose_sampling.roll_range_deg' must have min <= max.")
+
+
+def _parse_sampling_attrs(sampling: dict) -> dict:
+    """Convert a validated ``pose_sampling`` dict into the kwargs the sampler
+    expects (radians, native types)."""
+    bounds = sampling["workspace_bounds"]
+    workspace = {
+        axis: {"min": float(bounds[axis]["min"]), "max": float(bounds[axis]["max"])}
+        for axis in ("x", "y", "z")
+    }
+    look_at = [float(v) for v in sampling["look_at_point"]]
+    roll_deg = sampling.get("roll_range_deg", DEFAULT_AUTO_ROLL_RANGE_DEG)
+    roll_rad = (np.deg2rad(float(roll_deg[0])), np.deg2rad(float(roll_deg[1])))
+    n_poses = int(sampling.get("n_poses", DEFAULT_AUTO_N_POSES))
+    max_attempts = int(sampling.get("max_attempts", DEFAULT_AUTO_MAX_ATTEMPTS))
+    seed = sampling.get("seed")
+    return {
+        "workspace_bounds": workspace,
+        "look_at_point": look_at,
+        "roll_range_rad": roll_rad,
+        "n_poses": n_poses,
+        "max_attempts": max_attempts,
+        "seed": int(seed) if seed is not None else None,
+    }
 
 
 class HandEyeCalibration(Generic, EasyResource):
@@ -105,11 +178,30 @@ class HandEyeCalibration(Generic, EasyResource):
         if arm is None:
             raise Exception(f"Missing required {ARM_ATTR} attribute.")
 
-        # Either joint_positions or poses must be provided
-        joint_positions = attrs.get(JOINT_POSITIONS_ATTR)
-        poses = attrs.get(POSES_ATTR)
-        if joint_positions is None and poses is None:
-            raise Exception(f"Must provide either {JOINT_POSITIONS_ATTR} or {POSES_ATTR} attribute.")
+        pose_selection = attrs.get(POSE_SELECTION_ATTR, DEFAULT_POSE_SELECTION)
+        if pose_selection not in POSE_SELECTIONS:
+            raise Exception(
+                f"'{pose_selection}' is not a valid {POSE_SELECTION_ATTR}; "
+                f"must be one of {POSE_SELECTIONS}."
+            )
+
+        if pose_selection == POSE_SELECTION_AUTO:
+            sampling = attrs.get(POSE_SAMPLING_ATTR)
+            if not isinstance(sampling, dict):
+                raise Exception(
+                    f"'{POSE_SAMPLING_ATTR}' must be provided as a dict when "
+                    f"{POSE_SELECTION_ATTR}='{POSE_SELECTION_AUTO}'."
+                )
+            _validate_sampling_attrs(sampling)
+        else:
+            # manual mode: either joint_positions or poses must be provided
+            joint_positions = attrs.get(JOINT_POSITIONS_ATTR)
+            poses = attrs.get(POSES_ATTR)
+            if joint_positions is None and poses is None:
+                raise Exception(
+                    f"Must provide either {JOINT_POSITIONS_ATTR} or {POSES_ATTR} attribute "
+                    f"(or set {POSE_SELECTION_ATTR}='{POSE_SELECTION_AUTO}')."
+                )
 
         pose_tracker = attrs.get(POSE_TRACKER_ATTR)
         if pose_tracker is None:
@@ -143,6 +235,12 @@ class HandEyeCalibration(Generic, EasyResource):
         use_motion_service_for_poses = attrs.get(USE_MOTION_SERVICE_FOR_POSES_ATTR, DEFAULT_USE_MOTION_SERVICE_FOR_POSES)
         if use_motion_service_for_poses and motion is None:
             raise Exception(f"'{USE_MOTION_SERVICE_FOR_POSES_ATTR}' is set to true but '{MOTION_ATTR}' is not configured. Either set '{USE_MOTION_SERVICE_FOR_POSES_ATTR}' to false or provide a '{MOTION_ATTR}' service name.")
+
+        if pose_selection == POSE_SELECTION_AUTO and motion is None:
+            raise Exception(
+                f"'{POSE_SELECTION_ATTR}=\"{POSE_SELECTION_AUTO}\"' requires a "
+                f"'{MOTION_ATTR}' service for reachability validation."
+            )
 
         return [str(arm), str(pose_tracker)], optional_deps
 
@@ -195,6 +293,10 @@ class HandEyeCalibration(Generic, EasyResource):
         self.body_names = [attrs.get(BODY_NAME_ATTR)] if attrs.get(BODY_NAME_ATTR) is not None else []
         self.use_motion_service_for_poses = attrs.get(USE_MOTION_SERVICE_FOR_POSES_ATTR, DEFAULT_USE_MOTION_SERVICE_FOR_POSES)
 
+        self.pose_selection = attrs.get(POSE_SELECTION_ATTR, DEFAULT_POSE_SELECTION)
+        sampling = attrs.get(POSE_SAMPLING_ATTR)
+        self.pose_sampling = _parse_sampling_attrs(sampling) if isinstance(sampling, dict) else None
+
         return super().reconfigure(config, dependencies)
     
     async def get_calibration_values(self):
@@ -246,6 +348,130 @@ class HandEyeCalibration(Generic, EasyResource):
         t_cam2target = np.array([[tracked_pose.x], [tracked_pose.y], [tracked_pose.z]], dtype=np.float64)
 
         return R_base2gripper, t_base2gripper, R_cam2target, t_cam2target
+
+    def _transform_to_viam_pose(self, T: np.ndarray) -> Pose:
+        """Convert a 4x4 gripper-in-base transform (columns of T[:3,:3] are
+        gripper axes in base) to a Viam ``Pose``.
+
+        ``call_go_mat2ov`` expects body-from-parent (R_eb), which is the
+        transpose of the gripper-in-base rotation produced by the sampler.
+        """
+        R_base_from_gripper = T[:3, :3]
+        R_eb = R_base_from_gripper.T
+        ov = call_go_mat2ov(R_eb)
+        if ov is None:
+            raise Exception("failed to convert rotation matrix to orientation vector")
+        ox, oy, oz, theta = ov
+        return Pose(
+            x=float(T[0, 3]),
+            y=float(T[1, 3]),
+            z=float(T[2, 3]),
+            o_x=float(ox),
+            o_y=float(oy),
+            o_z=float(oz),
+            theta=float(theta),
+        )
+
+    async def _sample_and_move_loop(self, sampling: dict) -> list:
+        """For ``pose_selection='auto'``: sample candidate poses, attempt to
+        move the arm, and record the actually-achieved arm pose on success.
+
+        Returns a list of Viam ``Pose`` objects (the *measured* end-effector
+        pose after each successful move, not the sampled candidate — the
+        achieved pose is what the calibration math needs).
+        """
+        if self.motion is None:
+            raise Exception(
+                f"{POSE_SELECTION_ATTR}='{POSE_SELECTION_AUTO}' requires a motion service"
+            )
+
+        rng = np.random.default_rng(sampling["seed"])
+        n_target = sampling["n_poses"]
+        max_attempts = sampling["max_attempts"]
+
+        achieved: list = []
+        attempts = 0
+        while len(achieved) < n_target and attempts < max_attempts:
+            attempts += 1
+            try:
+                T = sample_transform(
+                    workspace_bounds=sampling["workspace_bounds"],
+                    look_at_point=sampling["look_at_point"],
+                    roll_range_rad=sampling["roll_range_rad"],
+                    rng=rng,
+                )
+                candidate = self._transform_to_viam_pose(T)
+            except Exception as e:
+                self.logger.warning(f"attempt {attempts}: sampler error: {e}")
+                continue
+
+            try:
+                await self._move_arm_to_position(
+                    candidate, len(achieved), n_target
+                )
+                await asyncio.sleep(self.sleep_seconds)
+            except Exception as e:
+                self.logger.info(
+                    f"attempt {attempts}: candidate unreachable ({e}); resampling"
+                )
+                continue
+
+            # Verify the calibration target is visible from this pose. A pose
+            # that's reachable but doesn't see the chessboard would just fail
+            # later during data collection — drop it here instead.
+            try:
+                tracked = await self.pose_tracker.get_poses(body_names=self.body_names)
+            except Exception as e:
+                self.logger.info(
+                    f"attempt {attempts}: pose tracker error ({e}); resampling"
+                )
+                continue
+            if not tracked:
+                self.logger.info(
+                    f"attempt {attempts}: chessboard not visible from this pose; resampling"
+                )
+                continue
+            if len(tracked) > 1 and not self.body_names:
+                self.logger.warning(
+                    f"attempt {attempts}: multiple bodies detected ({list(tracked.keys())}); "
+                    "set 'body_name' to disambiguate. Resampling."
+                )
+                continue
+
+            try:
+                if self.use_motion_service_for_poses and self.motion is not None:
+                    arm_pose_in_frame = await self.motion.get_pose(
+                        component_name=self.arm_name,
+                        destination_frame=self.arm_name + "_origin",
+                    )
+                    measured = arm_pose_in_frame.pose
+                else:
+                    measured = await self.arm.get_end_position()
+            except Exception as e:
+                self.logger.warning(
+                    f"attempt {attempts}: could not read achieved pose ({e}); skipping"
+                )
+                continue
+
+            achieved.append(measured)
+            self.logger.info(
+                f"auto pose {len(achieved)}/{n_target} captured after {attempts} attempts "
+                "(chessboard visible)"
+            )
+
+        if len(achieved) < n_target:
+            self.logger.warning(
+                f"auto sampling stopped after {attempts} attempts with only "
+                f"{len(achieved)}/{n_target} reachable poses"
+            )
+
+        if len(achieved) < 3:
+            raise Exception(
+                f"auto sampling collected only {len(achieved)} reachable poses "
+                f"(need >= 3). Widen workspace_bounds or check look_at_point."
+            )
+
+        return achieved
 
     async def _move_arm_to_position(self, position_data, position_index, total_positions):
         """Move arm to specified position using joint control, direct pose control, or motion planning.
@@ -503,6 +729,23 @@ class HandEyeCalibration(Generic, EasyResource):
             match key:
                 case "run_calibration":
                     refinement_info = None
+                    auto_info = None
+                    if self.pose_selection == POSE_SELECTION_AUTO:
+                        if self.pose_sampling is None:
+                            raise Exception(
+                                f"{POSE_SELECTION_ATTR}='{POSE_SELECTION_AUTO}' but "
+                                f"'{POSE_SAMPLING_ATTR}' is not configured."
+                            )
+                        self.logger.info(
+                            f"pose_selection=auto: sampling up to {self.pose_sampling['n_poses']} "
+                            f"poses (max {self.pose_sampling['max_attempts']} attempts)"
+                        )
+                        self.poses = await self._sample_and_move_loop(self.pose_sampling)
+                        self.joint_positions = []
+                        auto_info = {
+                            "requested_n_poses": self.pose_sampling["n_poses"],
+                            "captured_n_poses": len(self.poses),
+                        }
                     if self.solver == SOLVER_OPENCV:
                         R_gripper2base_list, t_gripper2base_list, R_target2cam_list, t_target2cam_list = await self._collect_calibration_data()
 
@@ -658,6 +901,8 @@ class HandEyeCalibration(Generic, EasyResource):
                     }
                     if refinement_info is not None:
                         response["refinement"] = refinement_info
+                    if auto_info is not None:
+                        response["auto_sampling"] = auto_info
                     resp["run_calibration"] = response
                 case "move_arm": 
                     raise NotImplementedError("This is not yet implemented")
@@ -778,6 +1023,54 @@ class HandEyeCalibration(Generic, EasyResource):
                     for w in diversity.get("warnings", []):
                         self.logger.warning(f"pose-set diagnostics: {w}")
                     resp["compute_pose_diversity"] = diversity
+                case "generate_poses":
+                    # Standalone sampler: returns poses without moving the arm.
+                    # Useful for previewing what auto-mode would generate and
+                    # pasting the result into config.
+                    if not isinstance(value, dict):
+                        resp["generate_poses"] = {
+                            "error": (
+                                "expected a dict with 'workspace_bounds' and "
+                                "'look_at_point' (see pose_sampling config schema)"
+                            ),
+                        }
+                        break
+                    try:
+                        _validate_sampling_attrs(value)
+                        parsed = _parse_sampling_attrs(value)
+                    except Exception as e:
+                        resp["generate_poses"] = {"error": str(e)}
+                        break
+
+                    rng = np.random.default_rng(parsed["seed"])
+                    transforms = generate_pose_set(
+                        n_poses=parsed["n_poses"],
+                        workspace_bounds=parsed["workspace_bounds"],
+                        look_at_point=parsed["look_at_point"],
+                        roll_range_rad=parsed["roll_range_rad"],
+                        rng=rng,
+                    )
+
+                    pose_dicts = []
+                    for T in transforms:
+                        p = self._transform_to_viam_pose(T)
+                        pose_dicts.append({
+                            "x": p.x, "y": p.y, "z": p.z,
+                            "o_x": p.o_x, "o_y": p.o_y, "o_z": p.o_z,
+                            "theta": p.theta,
+                        })
+
+                    diversity = compute_pose_diversity(transforms)
+                    self.logger.info(
+                        f"generated {len(pose_dicts)} poses; diversity: {diversity['feedback']}"
+                    )
+                    for w in diversity.get("warnings", []):
+                        self.logger.warning(f"generate_poses diagnostics: {w}")
+
+                    resp["generate_poses"] = {
+                        "poses": pose_dicts,
+                        "diversity": diversity,
+                    }
                 case _:
                     resp[key] = "unsupported key"
 

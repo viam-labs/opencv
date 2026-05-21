@@ -3,7 +3,7 @@
   "module_id": "viam:opencv",
   "visibility": "public",
   "url": "https://github.com/viam-labs/opencv",
-  "description": "Modular pose_tracker component: chessboard",
+  "description": "OpenCV-based pose tracker, hand-eye calibration, and camera calibration for Viam robots",
   "models": [
     {
       "api": "rdk:component:pose_tracker",
@@ -15,13 +15,13 @@
       "api": "rdk:service:generic",
       "model": "viam:opencv:hand_eye_calibration",
       "short_description": "OpenCV-based hand-eye calibration service",
-      "markdown_link": "README.md#model-viamopencvhandeyecalibration"
+      "markdown_link": "README.md#model-viamopencvhand_eye_calibration"
     },
     {
       "api": "rdk:service:generic",
       "model": "viam:opencv:camera_calibration",
       "short_description": "OpenCV-based camera calibration service",
-      "markdown_link": "README.md#model-viamopencvcamera-calibration"
+      "markdown_link": "README.md#model-viamopencvcamera_calibration"
     }
   ],
   "applications": null,

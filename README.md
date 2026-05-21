@@ -6,15 +6,21 @@ A Viam module that provides OpenCV-based computer vision components for robotics
 
 A pose tracker component that detects and tracks the pose of chessboard calibration patterns in camera images. This model uses OpenCV's chessboard detection algorithms to provide accurate 6-DOF pose estimation of chessboard targets, making it ideal for camera calibration and pose tracking applications.
 
-### Post Tracker Configuration
+Each inner corner of the chessboard is exposed as a separate tracked body named `corner_0`, `corner_1`, … through `corner_{n-1}` (numbered left-to-right, top-to-bottom in pattern order), with the chessboard's reported pose (used by hand-eye calibration) at `corner_0`.
+
+### Pose Tracker Configuration
 
 The following attribute template can be used to configure this model:
 
 ```json
 {
-"camera_name": <string>,
-"pattern_size": <list>,
-"square_size_mm": <int>
+  "camera_name": <string>,
+  "pattern_size": <list>,
+  "square_size_mm": <int>,
+  "camera_intrinsics": {
+    "K":    {"fx": <float>, "fy": <float>, "cx": <float>, "cy": <float>},
+    "dist": {"k1": <float>, "k2": <float>, "k3": <float>, "p1": <float>, "p2": <float>}
+  }
 }
 ```
 
@@ -22,11 +28,12 @@ The following attribute template can be used to configure this model:
 
 The following attributes are available for this model:
 
-| Name             | Type   | Inclusion | Description                                             |
-|------------------|--------|-----------|---------------------------------------------------------|
-| `camera_name`    | string | Required  | Name of the camera used for checking pose of chessboard.|
-| `pattern_size`   | list   | Required  | Dimensions of the chessboard pattern (rows x columns of inner corner squares).|
-| `square_size_mm` | int    | Required  | Physical size of a square in the chessboard pattern.    |
+| Name                | Type   | Inclusion | Description                                             |
+|---------------------|--------|-----------|---------------------------------------------------------|
+| `camera_name`       | string | Required  | Name of the camera used for checking pose of chessboard.|
+| `pattern_size`      | list   | Required  | Dimensions of the chessboard pattern (rows x columns of inner corner squares).|
+| `square_size_mm`    | int    | Required  | Physical size of a square in the chessboard pattern, in mm.|
+| `camera_intrinsics` | dict   | Optional  | Override the camera's intrinsics rather than fetching them from `camera.do_command({"get_camera_params": None})`. Requires both `K` (with `fx`, `fy`, `cx`, `cy`) and `dist` (with `k1`, `k2`, `k3`, `p1`, `p2`). |
 
 #### Pose Tracker Example Configuration
 
@@ -38,15 +45,48 @@ The following attributes are available for this model:
 }
 ```
 
-## Model viam:opencv:handeyecalibration
+### Pose Tracker Commands
 
-A calibration service that performs hand-eye calibration for robotic arms with mounted or fixed cameras. This service automates the process of determining the transformation between the robot's end-effector and camera coordinate frames by moving the arm through predefined positions while tracking bodies. The resulting calibration enables accurate coordination between robot motion and visual perception.
+#### `get_chessboard_observation`
 
-This service supports three operation modes:
+Returns the raw chessboard observation at the current camera frame: detected 2D corner pixels, 3D corner coordinates in the board frame, camera intrinsics, and the board's pose-in-camera estimate (`rvec`, `tvec`) from `cv2.solvePnP`. This is what the hand-eye calibration service consumes when running its reprojection-based solver.
 
-1. **Joint Position Mode**: Uses direct joint control to move the arm through predefined joint positions
-2. **Direct Pose Mode**: Uses `arm.move_to_position` to move the arm through predefined poses without motion planning, assuming the arm implements that method.
-3. **Motion Planning Mode**: Uses the motion service to move the arm through predefined poses with obstacle avoidance and motion planning
+**Example:**
+
+```python
+result = await pose_tracker.do_command({"get_chessboard_observation": True})
+obs = result["get_chessboard_observation"]
+# obs["corners_2d"]:   (N, 2) pixel coordinates
+# obs["corners_3d"]:   (N, 3) board-frame points
+# obs["K"], obs["dist"]: intrinsics
+# obs["rvec"], obs["tvec"]: board pose in camera frame
+# obs["pattern_size"], obs["square_size_mm"]
+```
+
+## Model viam:opencv:hand_eye_calibration
+
+A calibration service that performs hand-eye calibration for robotic arms with mounted or fixed cameras. This service automates the process of determining the transformation between the robot's end-effector and camera coordinate frames by moving the arm through positions while tracking bodies. The resulting calibration enables accurate coordination between robot motion and visual perception.
+
+### Operation modes
+
+The service composes two orthogonal choices:
+
+**How poses are produced** (`pose_selection`):
+
+1. **Manual** (default): you supply the pose list yourself via `joint_positions` or `poses`.
+2. **Auto**: the service randomly samples poses inside a rectangular workspace volume, aims the end-effector at a `look_at_point`, and rolls about the optical axis. Each candidate is filtered by reachability (the motion plan succeeds) and by chessboard visibility (the pose tracker actually detects the target). See `pose_sampling` below.
+
+**How poses are reached** (only relevant in manual mode):
+
+1. **Joint Position Mode**: direct joint control via `arm.move_to_joint_positions` (when `joint_positions` is configured).
+2. **Direct Pose Mode**: `arm.move_to_position` (when `poses` is configured without a motion service). Requires the arm driver to implement `move_to_position`.
+3. **Motion Planning Mode**: the motion service plans collision-aware paths to each pose (when `poses` is configured *with* `motion`). Auto mode always uses motion planning and so requires a motion service.
+
+**Which calibration solver runs** (`solver`):
+
+1. **`opencv`** (default): the original behavior — `cv2.calibrateHandEye` with the chosen `method`.
+2. **`hybrid`**: bootstraps with `cv2.calibrateHandEye(method=…)`, then refines the result by minimizing per-corner pixel reprojection error with a Levenberg–Marquardt + Huber solver. More accurate on noisy real-world data; reports per-pose pixel RMSE so you can spot outlier observations. Requires the `viam:opencv:chessboard` pose tracker (the corner observations come from it).
+3. **`reprojection`**: same refinement step as `hybrid` but without the OpenCV bootstrap exposed in the response. In practice, prefer `hybrid`.
 
 ### Hand Eye Calibration Configuration
 
@@ -54,16 +94,30 @@ The following attribute template can be used to configure this model:
 
 ```json
 {
-"arm_name": <string>,
-"body_name": <string>,
-"calibration_type": <string>,
-"joint_positions": <list>,
-"poses": <list>,
-"method": <string>,
-"pose_tracker": <string>,
-"motion": <string>,
-"sleep_seconds": <float>,
-"use_motion_service_for_poses": <bool>
+  "arm_name": <string>,
+  "body_name": <string>,
+  "calibration_type": <string>,
+  "method": <string>,
+  "solver": <string>,
+  "joint_positions": <list>,
+  "poses": <list>,
+  "pose_selection": <string>,
+  "pose_sampling": {
+    "workspace_bounds": {
+      "x": {"min": <float>, "max": <float>},
+      "y": {"min": <float>, "max": <float>},
+      "z": {"min": <float>, "max": <float>}
+    },
+    "look_at_point": [<float>, <float>, <float>],
+    "n_poses": <int>,
+    "max_attempts": <int>,
+    "roll_range_deg": [<float>, <float>],
+    "seed": <int>
+  },
+  "pose_tracker": <string>,
+  "motion": <string>,
+  "sleep_seconds": <float>,
+  "use_motion_service_for_poses": <bool>
 }
 ```
 
@@ -71,25 +125,28 @@ The following attribute template can be used to configure this model:
 
 The following attributes are available for this model:
 
-| Name              | Type     | Inclusion  | Description                                                                        |
-|-------------------|----------|------------|------------------------------------------------------------------------------------|
-| `arm_name`        | `string` | `Required` | Name of the arm component used for calibration.                                    |
-| `calibration_type`| `string` | `Required` | Type of calibration to perform (see available calibrations below).                 |
-| `joint_positions` | `list`   | `Required*` | List of joint positions (in radians) for calibration poses. Required if `poses` is not provided. |
-| `poses`           | `list`   | `Required*` | List of poses (with x, y, z, o_x, o_y, o_z, theta) for calibration. Required if `joint_positions` is not provided. Can be used with or without the `motion` service. If both `joint_positions` and `poses` are provided, `poses` will be used. |
-| `method`          | `string` | `Required` | Calibration method to use (see available methods below).                           |
-| `pose_tracker`    | `string` | `Required` | Name of the pose tracker component to detect tracked bodies.                       |
-| `motion`          | `string` | `Optional` | Name of the motion service for motion planning with obstacle avoidance. When provided with `poses`, uses motion planning. When not provided with `poses`, uses direct `arm.move_to_position`. |
-| `sleep_seconds`   | `float`  | `Optional` | Sleep time between movements to allow for arm to settle (defaults to 2.0 seconds). |
-| `use_motion_service_for_poses` | `bool` | `Optional` | Whether to use the motion service's `get_pose()` method to retrieve arm poses during calibration (defaults to false). When true, uses `motion.get_pose()` with the arm's origin frame. When false, uses `arm.get_end_position()`. Requires `motion` service to be configured when true. |
-| `body_name`       | `string` | `Optional` | Name of the specific tracked body to use (e.g., AprilTag ID like "tag36h11:0" or chessboard corner like "corner_0"). Calibration expects exactly one pose, so if the pose tracker's `get_poses` returns more than one pose, this attribute will be necessary to specify. **Important**: When using chessboard corners, ensure the chessboard maintains consistent orientation across all calibration poses to ensure the same corner is tracked. |
+| Name              | Type     | Inclusion   | Description |
+|-------------------|----------|-------------|-------------|
+| `arm_name`        | `string` | `Required`  | Name of the arm component used for calibration. |
+| `calibration_type`| `string` | `Required`  | Type of calibration to perform (see available calibrations below). |
+| `method`          | `string` | `Required`  | OpenCV calibration method (see available methods below). In `hybrid`/`reprojection` solver modes this is used to bootstrap the iterative solver. |
+| `pose_tracker`    | `string` | `Required`  | Name of the pose tracker component to detect tracked bodies. The `hybrid` and `reprojection` solvers additionally require this be the `viam:opencv:chessboard` model. |
+| `joint_positions` | `list`   | `Required*` | List of joint positions (in radians) for calibration poses. Required when `pose_selection` is `"manual"` and `poses` is not provided. |
+| `poses`           | `list`   | `Required*` | List of poses (with `x`, `y`, `z`, `o_x`, `o_y`, `o_z`, `theta`) for calibration. Required when `pose_selection` is `"manual"` and `joint_positions` is not provided. If both are present, `poses` wins. |
+| `solver`          | `string` | `Optional`  | Which calibration solver to run: `"opencv"` (default), `"hybrid"`, or `"reprojection"`. See *Operation modes* above. |
+| `pose_selection`  | `string` | `Optional`  | `"manual"` (default — use the configured `joint_positions` / `poses`) or `"auto"` (sample poses inside `pose_sampling.workspace_bounds`). |
+| `pose_sampling`   | `dict`   | `Required**`| Configuration for the auto pose sampler. Required when `pose_selection="auto"`. See *Auto pose sampling* below. |
+| `motion`          | `string` | `Optional`  | Name of the motion service used for motion planning. Required when `pose_selection="auto"`. When used in manual mode with `poses`, enables motion planning; when omitted, manual `poses` use `arm.move_to_position` directly. |
+| `sleep_seconds`   | `float`  | `Optional`  | Sleep time between movements to allow the arm to settle (defaults to 2.0 seconds). |
+| `use_motion_service_for_poses` | `bool` | `Optional` | Use `motion.get_pose()` (with the arm's origin frame) instead of `arm.get_end_position()` to read the achieved end-effector pose. Defaults to false. Requires `motion` when true. |
+| `body_name`       | `string` | `Optional`  | Name of the specific tracked body to use (e.g., AprilTag ID like `"tag36h11:0"` or chessboard corner like `"corner_0"`). Calibration expects exactly one tracked pose; set this when the pose tracker returns multiple. **Important**: when using chessboard corners, ensure the board's orientation is stable across all poses so the same corner is tracked. |
 
-**Note**: Either `joint_positions` or `poses` must be provided. If both are provided, `poses` will take precedence.
+**Note**: in `pose_selection="manual"` mode, either `joint_positions` or `poses` must be provided. In `pose_selection="auto"` mode, both are ignored and `pose_sampling` is required.
 
 Available calibrations are:
 
 - "eye-in-hand"
-- "eye-to-hand"
+- "eye-to-hand" *(not yet implemented end-to-end; the new corner-based solvers and auto sampler currently assume eye-in-hand)*
 
 Available methods are:
 
@@ -98,6 +155,29 @@ Available methods are:
 - "CALIB_HAND_EYE_HORAUD"
 - "CALIB_HAND_EYE_ANDREFF"
 - "CALIB_HAND_EYE_DANIILIDIS"
+
+#### Auto pose sampling
+
+When `pose_selection` is `"auto"`, the service randomly generates and visits poses inside a rectangular workspace volume. Each candidate has:
+
+- a position drawn uniformly from `workspace_bounds`,
+- an orientation that aims the end-effector's +Z axis at `look_at_point`,
+- a random *roll* about that axis drawn from `roll_range_deg`.
+
+The roll randomization is what gives the resulting pose set good rotation-axis diversity. Pure look-at without roll would cluster rotation axes in a plane and produce ill-conditioned calibrations (see `compute_pose_diversity` below).
+
+After moving to each candidate the service verifies the chessboard is actually detected before counting the pose; unreachable poses, planning failures, and poses where the board is out of view are silently skipped and resampled, up to `max_attempts` total attempts.
+
+**Assumption**: the camera's optical axis is roughly aligned with the end-effector +Z. The chessboard tracker is forgiving as long as corners are in frame, but if your mount is at a wild angle you may need to widen `workspace_bounds` so enough candidates land with the target in view.
+
+| Field                          | Type    | Required | Description |
+|--------------------------------|---------|----------|-------------|
+| `workspace_bounds.x.min/max`   | float   | yes      | Sampling range for end-effector position along base-frame X, in mm. (Likewise `y`, `z`.) |
+| `look_at_point`                | `[x,y,z]` | yes    | Chessboard center in robot base frame, in mm. Easiest way to find: touch the board with the TCP and read `arm.get_end_position()`. |
+| `n_poses`                      | int     | no       | Number of successful poses to collect. Defaults to 20. |
+| `max_attempts`                 | int     | no       | Cap on total sample attempts (including skips). Defaults to 60. |
+| `roll_range_deg`               | `[lo, hi]` | no    | Range for the random roll about the optical axis, in degrees. Defaults to `[-180, 180]`. |
+| `seed`                         | int     | no       | Optional seed for reproducible sampling. |
 
 #### Hand Eye Calibration Example Configurations
 
@@ -151,26 +231,131 @@ Available methods are:
 }
 ```
 
+**Reprojection-refined Solver (`hybrid`):**
+
+```json
+{
+  "arm_name": "my_arm",
+  "body_name": "corner_0",
+  "calibration_type": "eye-in-hand",
+  "poses": [
+    {"x": 100, "y": 200, "z": 300, "o_x": 0, "o_y": 0, "o_z": 1, "theta": 0},
+    {"x": 150, "y": 200, "z": 350, "o_x": 0, "o_y": 0, "o_z": 1, "theta": 45}
+  ],
+  "method": "CALIB_HAND_EYE_TSAI",
+  "solver": "hybrid",
+  "pose_tracker": "pose_tracker_opencv",
+  "motion": "motion"
+}
+```
+
+The response gains a `refinement` block with `rmse_pixels`, `per_pose_rmse_pixels`, and solver diagnostics. Per-pose RMSEs greater than 3× the median are flagged in logs as probable outliers.
+
+**Auto Pose Generation Mode:**
+
+```json
+{
+  "arm_name": "my_arm",
+  "body_name": "corner_0",
+  "calibration_type": "eye-in-hand",
+  "method": "CALIB_HAND_EYE_TSAI",
+  "solver": "hybrid",
+  "pose_tracker": "pose_tracker_opencv",
+  "motion": "motion",
+  "pose_selection": "auto",
+  "pose_sampling": {
+    "workspace_bounds": {
+      "x": {"min": 200, "max": 600},
+      "y": {"min": -300, "max": 300},
+      "z": {"min": 200, "max": 500}
+    },
+    "look_at_point": [400, 0, 0],
+    "n_poses": 20,
+    "max_attempts": 80,
+    "roll_range_deg": [-180, 180]
+  }
+}
+```
+
+No `joint_positions` or `poses` are needed in auto mode. The response includes an `auto_sampling` block reporting `requested_n_poses` vs `captured_n_poses`.
+
 ### Available Commands
 
 The hand-eye calibration service provides the following commands via `do_command`:
 
 #### `run_calibration`
 
-Runs the hand-eye calibration procedure by moving the arm through all configured positions and computing the camera-to-gripper transformation.
+Runs the hand-eye calibration procedure. In manual mode, moves the arm through all configured positions; in auto mode, samples and visits poses until `n_poses` reachable observations are collected. Then runs the chosen `solver` and computes the camera-to-gripper transformation.
 
 **Example:**
+
 ```python
 result = await hand_eye_service.do_command({"run_calibration": True})
 ```
 
-**Returns:** The calibration result in frame system compatible format.
+**Returns** a dict with the following keys:
+
+| Key             | Present when      | Contents |
+|-----------------|-------------------|----------|
+| `frame`         | always            | Frame-system-compatible transform (`translation`, `orientation`, `parent`). |
+| `residuals`     | always            | Per-pose translation/rotation residuals against the mean board pose in base frame, plus summary stats. Lets you spot outlier poses without re-running calibration. |
+| `solver`        | always            | The solver that ran (`"opencv"`, `"hybrid"`, or `"reprojection"`). |
+| `refinement`    | `hybrid`/`reprojection` only | Reprojection solver diagnostics: `rmse_pixels`, `per_pose_rmse_pixels`, `iterations`, `success`, `message`. |
+| `auto_sampling` | `pose_selection="auto"` only | `requested_n_poses` and `captured_n_poses`. |
+
+#### `compute_pose_diversity`
+
+Computes diagnostics on a pose set without moving the arm: pairwise Tsai-rule scores, the translation condition number `c_t` (Horn et al. 2023), rotation-axis density on the unit sphere, and an actionable feedback string. Catches ill-conditioned pose sets (e.g., rotation axes clustered along one direction) before running calibration.
+
+By default operates on the service's configured `poses`. You can also pass an explicit pose list to diagnose a hypothetical set:
+
+```python
+# Diagnose the configured pose set
+result = await hand_eye_service.do_command({"compute_pose_diversity": True})
+
+# Diagnose an arbitrary pose set
+result = await hand_eye_service.do_command({
+    "compute_pose_diversity": {
+        "poses": [
+            {"x": 100, "y": 200, "z": 300, "o_x": 0, "o_y": 0, "o_z": 1, "theta": 0},
+            ...
+        ]
+    }
+})
+```
+
+Returns a dict with `n_poses`, `n_pairs`, `mean_rotation_angle_deg`, `translation_condition_number`, `clustered_axis_direction`, `axis_density_ratio`, `warnings`, and a `feedback` string. `c_t` values close to 1 are well-conditioned; values above ~100 indicate clustered rotation axes.
+
+#### `generate_poses`
+
+Standalone pose sampler — returns a list of poses without moving the arm. Same sampling logic as `pose_selection="auto"` but useful as a preview: paste the result into your `poses` config and run a manual calibration, or just sanity-check the diversity numbers before kicking off an auto run.
+
+**Example:**
+
+```python
+result = await hand_eye_service.do_command({
+    "generate_poses": {
+        "workspace_bounds": {
+            "x": {"min": 200, "max": 600},
+            "y": {"min": -300, "max": 300},
+            "z": {"min": 200, "max": 500}
+        },
+        "look_at_point": [400, 0, 0],
+        "n_poses": 12,
+        "roll_range_deg": [-180, 180],
+        "seed": 42
+    }
+})
+# result["generate_poses"]["poses"]      -> list of pose dicts (paste-ready)
+# result["generate_poses"]["diversity"]  -> compute_pose_diversity report on the generated set
+```
 
 #### `get_current_arm_pose`
 
-Returns the current end-effector pose of the arm. Use this to build up a list of poses for the configuration.
+Returns the current end-effector pose of the arm. Use this to build up a list of poses for the configuration, or to find a `look_at_point` (point the TCP at the chessboard center, then read the pose).
 
 **Example:**
+
 ```python
 pose = await hand_eye_service.do_command({"get_current_arm_pose": True})
 # Returns: {"x": 100, "y": 200, "z": 300, "o_x": 0, "o_y": 0, "o_z": 1, "theta": 0}
@@ -179,14 +364,17 @@ pose = await hand_eye_service.do_command({"get_current_arm_pose": True})
 #### `move_arm_to_position`
 
 Moves the arm to a configured position by index. Automatically uses the appropriate mode based on configuration:
+
 - **Joint Position Mode**: Uses `arm.move_to_joint_positions`
 - **Direct Pose Mode**: Uses `arm.move_to_position` (when poses are provided without motion service)
 - **Motion Planning Mode**: Uses motion planning (when poses are provided with motion service)
 
 **Parameters:**
+
 - `index`: Index of the position to move to.
 
 **Example:**
+
 ```python
 result = await hand_eye_service.do_command({"move_arm_to_position": 0})
 ```
@@ -196,11 +384,12 @@ result = await hand_eye_service.do_command({"move_arm_to_position": 0})
 Checks how many tracked bodies are currently visible to the pose tracker.
 
 **Example:**
+
 ```python
 result = await hand_eye_service.do_command({"check_bodies": True})
 ```
 
-## Model viam:opencv:camera-calibration
+## Model viam:opencv:camera_calibration
 
 A generic service that provides camera calibration functionality through the `do_command` interface. This service uses chessboard patterns to determine camera intrinsic parameters (focal lengths, principal point, and distortion coefficients) from multiple images. Unlike the chessboard pose tracker, this service is dedicated solely to calibration and does not track poses.
 
