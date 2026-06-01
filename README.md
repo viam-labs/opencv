@@ -60,7 +60,79 @@ obs = result["get_chessboard_observation"]
 # obs["corners_3d"]:   (N, 3) board-frame points
 # obs["K"], obs["dist"]: intrinsics
 # obs["rvec"], obs["tvec"]: board pose in camera frame
+# obs["ids"]: per-corner stable ids (0..N-1 for a chessboard)
 # obs["pattern_size"], obs["square_size_mm"]
+```
+
+## Model viam:opencv:charuco
+
+A pose tracker component that detects and tracks the pose of [ChArUco boards](https://docs.opencv.org/4.x/df/d4a/tutorial_charuco_detection.html) (a chessboard with ArUco markers in the white squares). Compared to the plain `chessboard` model it tolerates **partial views** (the board need not be fully in frame), is immune to the chessboard's 180° orientation ambiguity, and still measures high-accuracy chessboard saddle corners — making it the recommended target for hand-eye calibration.
+
+Each detected interior corner is exposed as a tracked body named `corner_{id}`, where `id` is the corner's stable index on the board. Because the ids come from the ArUco markers, a given corner keeps the same name across frames even when only part of the board is visible.
+
+### Pose Tracker Configuration
+
+The following attribute template can be used to configure this model:
+
+```json
+{
+  "camera_name": <string>,
+  "squares_x": <int>,
+  "squares_y": <int>,
+  "square_size_mm": <float>,
+  "marker_size_mm": <float>,
+  "dictionary": <string>,
+  "camera_intrinsics": {
+    "K":    {"fx": <float>, "fy": <float>, "cx": <float>, "cy": <float>},
+    "dist": {"k1": <float>, "k2": <float>, "k3": <float>, "p1": <float>, "p2": <float>}
+  }
+}
+```
+
+#### Pose Tracker Attributes
+
+The following attributes are available for this model:
+
+| Name                | Type   | Inclusion | Description                                                                                                                                                                                                       |
+|---------------------|--------|-----------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `camera_name`       | string | Required  | Name of the camera used for checking pose of the ChArUco board.                                                                                                                                                   |
+| `squares_x`         | int    | Required  | Number of chessboard squares along the X axis (columns).                                                                                                                                                          |
+| `squares_y`         | int    | Required  | Number of chessboard squares along the Y axis (rows).                                                                                                                                                             |
+| `square_size_mm`    | float  | Required  | Physical side length of a chessboard square, in mm.                                                                                                                                                               |
+| `marker_size_mm`    | float  | Required  | Physical side length of an ArUco marker, in mm. Must be smaller than `square_size_mm`.                                                                                                                             |
+| `dictionary`        | string | Optional  | Predefined ArUco dictionary used by the board (e.g. `DICT_4X4_50`, `DICT_5X5_100`). Defaults to `DICT_4X4_50`. Must match the dictionary your printed/manufactured board uses.                                     |
+| `camera_intrinsics` | dict   | Optional  | Override the camera's intrinsics rather than fetching them from `camera.do_command({"get_camera_params": None})`. Requires both `K` (with `fx`, `fy`, `cx`, `cy`) and `dist` (with `k1`, `k2`, `k3`, `p1`, `p2`). |
+
+#### Pose Tracker Example Configuration
+
+```json
+{
+  "camera_name": "cam",
+  "squares_x": 9,
+  "squares_y": 13,
+  "square_size_mm": 30.0,
+  "marker_size_mm": 22.0,
+  "dictionary": "DICT_4X4_50"
+}
+```
+
+### Pose Tracker Commands
+
+#### `get_charuco_observation`
+
+Returns the raw ChArUco observation at the current camera frame, in the same shape as the chessboard model's `get_chessboard_observation` so the hand-eye calibration service consumes either interchangeably. Because the board may be partially visible, the returned corner set is a subset of the full board and varies frame to frame — `ids` identifies which corners were detected.
+
+**Example:**
+
+```python
+result = await pose_tracker.do_command({"get_charuco_observation": True})
+obs = result["get_charuco_observation"]
+# obs["corners_2d"]:   (N, 2) pixel coordinates
+# obs["corners_3d"]:   (N, 3) board-frame points
+# obs["ids"]:          (N,) stable corner ids for the detected subset
+# obs["K"], obs["dist"]: intrinsics
+# obs["rvec"], obs["tvec"]: board pose in camera frame
+# obs["squares_x"], obs["squares_y"], obs["square_size_mm"], obs["marker_size_mm"], obs["dictionary"]
 ```
 
 ## Model viam:opencv:hand_eye_calibration
@@ -85,7 +157,7 @@ The service composes two orthogonal choices:
 **Which calibration solver runs** (`solver`):
 
 1. **`opencv`** (default): the original behavior — `cv2.calibrateHandEye` with the chosen `method`.
-2. **`hybrid`**: bootstraps with `cv2.calibrateHandEye(method=…)`, then refines the result by minimizing per-corner pixel reprojection error with a Levenberg–Marquardt + Huber solver. More accurate on noisy real-world data; reports per-pose pixel RMSE so you can spot outlier observations. Requires the `viam:opencv:chessboard` pose tracker (the corner observations come from it).
+2. **`hybrid`**: bootstraps with `cv2.calibrateHandEye(method=…)`, then refines the result by minimizing per-corner pixel reprojection error with a Levenberg–Marquardt + Huber solver. More accurate on noisy real-world data; reports per-pose pixel RMSE so you can spot outlier observations. Requires a corner-observation pose tracker — either `viam:opencv:chessboard` or `viam:opencv:charuco` (the corner observations come from it).
 3. **`reprojection`**: same refinement step as `hybrid` but without the OpenCV bootstrap exposed in the response. In practice, prefer `hybrid`.
 
 ### Hand Eye Calibration Configuration
@@ -131,7 +203,7 @@ The following attributes are available for this model:
 | `arm_name`        | `string` | `Required`  | Name of the arm component used for calibration. |
 | `calibration_type`| `string` | `Required`  | Type of calibration to perform (see available calibrations below). |
 | `method`          | `string` | `Required`  | OpenCV calibration method (see available methods below). In `hybrid`/`reprojection` solver modes this is used to bootstrap the iterative solver. |
-| `pose_tracker`    | `string` | `Required`  | Name of the pose tracker component to detect tracked bodies. The `hybrid` and `reprojection` solvers additionally require this be the `viam:opencv:chessboard` model. |
+| `pose_tracker`    | `string` | `Required`  | Name of the pose tracker component to detect tracked bodies. The `hybrid` and `reprojection` solvers additionally require this be a corner-observation model — `viam:opencv:chessboard` or `viam:opencv:charuco`. |
 | `joint_positions` | `list`   | `Required*` | List of joint positions (in radians) for calibration poses. Required when `pose_selection` is `"manual"` and `poses` is not provided. |
 | `poses`           | `list`   | `Required*` | List of poses (with `x`, `y`, `z`, `o_x`, `o_y`, `o_z`, `theta`) for calibration. Required when `pose_selection` is `"manual"` and `joint_positions` is not provided. If both are present, `poses` wins. |
 | `solver`          | `string` | `Optional`  | Which calibration solver to run: `"opencv"` (default), `"hybrid"`, or `"reprojection"`. See *Operation modes* above. |
@@ -402,7 +474,9 @@ result = await hand_eye_service.do_command({"check_bodies": True})
 
 ## Model viam:opencv:camera_calibration
 
-A generic service that provides camera calibration functionality through the `do_command` interface. This service uses chessboard patterns to determine camera intrinsic parameters (focal lengths, principal point, and distortion coefficients) from multiple images. Unlike the chessboard pose tracker, this service is dedicated solely to calibration and does not track poses.
+A generic service that provides camera calibration functionality through the `do_command` interface. This service uses a chessboard or ChArUco target to determine camera intrinsic parameters (focal lengths, principal point, and distortion coefficients) from multiple images. Unlike the pose trackers, this service is dedicated solely to calibration and does not track poses.
+
+Select the target with the `target_type` attribute (defaults to `chessboard`). A ChArUco target is recommended: images in which the board is only partially visible still contribute their detected corners, so more of your captures are usable.
 
 ### Camera Calibration Configuration
 
@@ -410,8 +484,13 @@ The following attribute template can be used to configure this model:
 
 ```json
 {
+  "target_type": <string>,
   "pattern_size": <list>,
-  "square_size_mm": <int>
+  "square_size_mm": <float>,
+  "squares_x": <int>,
+  "squares_y": <int>,
+  "marker_size_mm": <float>,
+  "dictionary": <string>
 }
 ```
 
@@ -419,17 +498,37 @@ The following attribute template can be used to configure this model:
 
 The following attributes are available for this model:
 
-| Name             | Type   | Inclusion | Description                                             |
-|------------------|--------|-----------|---------------------------------------------------------|
-| `pattern_size`   | list   | Required  | Dimensions of the chessboard pattern (rows x columns of inner corner squares).|
-| `square_size_mm` | int    | Required  | Physical size of a square in the chessboard pattern in millimeters.|
+| Name             | Type   | Inclusion              | Description                                             |
+|------------------|--------|------------------------|---------------------------------------------------------|
+| `target_type`    | string | Optional               | `chessboard` (default) or `charuco`. Selects which attributes below are required. |
+| `pattern_size`   | list   | Required (chessboard)  | Dimensions of the chessboard pattern (rows x columns of inner corner squares). |
+| `square_size_mm` | float  | Required               | Physical side length of a square, in mm (both target types). |
+| `squares_x`      | int    | Required (charuco)     | Number of chessboard squares along the X axis (columns). |
+| `squares_y`      | int    | Required (charuco)     | Number of chessboard squares along the Y axis (rows). |
+| `marker_size_mm` | float  | Required (charuco)     | Physical side length of an ArUco marker, in mm. Must be smaller than `square_size_mm`. |
+| `dictionary`     | string | Optional (charuco)     | Predefined ArUco dictionary (e.g. `DICT_4X4_50`). Defaults to `DICT_4X4_50`. Must match your board. |
 
-#### Camera Calibration Example Configuration
+#### Camera Calibration Example Configurations
+
+Chessboard:
 
 ```json
 {
   "pattern_size": [9, 6],
   "square_size_mm": 21
+}
+```
+
+ChArUco:
+
+```json
+{
+  "target_type": "charuco",
+  "squares_x": 9,
+  "squares_y": 13,
+  "square_size_mm": 30.0,
+  "marker_size_mm": 22.0,
+  "dictionary": "DICT_4X4_50"
 }
 ```
 
@@ -440,7 +539,7 @@ Use the `calibrate_camera` command via `do_command` to compute camera intrinsics
 See `src/scripts/camera_calibration_script.py` for the Python script to do so.
 
 **Parameters:**
-- `images` (required): List of base64 encoded image strings containing chessboard patterns
+- `images` (required): List of base64 encoded image strings containing the configured target (chessboard or ChArUco)
 
 **Returns:**
 The command returns a dictionary with the following structure:

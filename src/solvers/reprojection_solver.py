@@ -22,7 +22,7 @@ corner directly. As a side benefit it produces a Jacobian — useful for later
 phases that pick poses to maximize information gain.
 """
 
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Union
 
 import cv2
 import numpy as np
@@ -63,7 +63,7 @@ def _residual_fn(
     params: np.ndarray,
     T_be_list: List[np.ndarray],
     corners_2d_list: List[np.ndarray],
-    corners_3d: np.ndarray,
+    corners_3d_list: List[np.ndarray],
     K: np.ndarray,
     dist: np.ndarray,
 ) -> np.ndarray:
@@ -72,10 +72,10 @@ def _residual_fn(
     T_ce = _se3_inverse(T_ec)
 
     residuals: List[np.ndarray] = []
-    for T_be, corners_obs in zip(T_be_list, corners_2d_list):
+    for T_be, corners_obs, P_w in zip(T_be_list, corners_2d_list, corners_3d_list):
         T_eb = _se3_inverse(T_be)
         M = T_ce @ T_eb @ T_bw
-        u_pred = _project(corners_3d, M[:3, :3], M[:3, 3], K, dist)
+        u_pred = _project(P_w, M[:3, :3], M[:3, 3], K, dist)
         residuals.append((corners_obs - u_pred).reshape(-1))
     return np.concatenate(residuals)
 
@@ -97,7 +97,7 @@ def bootstrap_T_bw(
 def refine_handeye(
     T_be_list: Sequence[np.ndarray],
     corners_2d_list: Sequence[np.ndarray],
-    corners_3d: np.ndarray,
+    corners_3d: Union[np.ndarray, Sequence[np.ndarray]],
     K: np.ndarray,
     dist: np.ndarray,
     X_init: np.ndarray,
@@ -110,9 +110,13 @@ def refine_handeye(
 
     Args:
         T_be_list: list of 4x4 end-effector-in-base transforms, one per station.
-        corners_2d_list: list of (N, 2) detected corner pixel arrays, one per
-            station. N must be the same across stations and match corners_3d.
-        corners_3d: (N, 3) board corner positions in board frame.
+        corners_2d_list: list of (N_k, 2) detected corner pixel arrays, one per
+            station. Each station's N_k must match its entry in corners_3d.
+        corners_3d: board corner positions in board frame. Either a single
+            (N, 3) array shared by every station (a fully-visible target such
+            as a chessboard), or a per-station sequence of (N_k, 3) arrays (a
+            partially-visible target such as a ChArUco board, where each
+            station detects a different subset of corners).
         K: (3, 3) camera intrinsic matrix.
         dist: (5,) distortion coefficients in the (k1, k2, p1, p2, k3) order
             expected by ``cv2.projectPoints``.
@@ -139,15 +143,25 @@ def refine_handeye(
 
     T_be_arr = [np.asarray(T, dtype=np.float64) for T in T_be_list]
     corners_2d_arr = [np.asarray(c, dtype=np.float64).reshape(-1, 2) for c in corners_2d_list]
-    corners_3d_arr = np.asarray(corners_3d, dtype=np.float64).reshape(-1, 3)
     K_arr = np.asarray(K, dtype=np.float64)
     dist_arr = np.asarray(dist, dtype=np.float64).reshape(-1)
 
-    n_corners = corners_3d_arr.shape[0]
-    for i, c in enumerate(corners_2d_arr):
-        if c.shape[0] != n_corners:
+    # corners_3d may be a single (N, 3) array shared by every station, or a
+    # per-station sequence of (N_k, 3) arrays (partial views). Normalize to a
+    # per-station list either way.
+    if isinstance(corners_3d, np.ndarray) and corners_3d.ndim == 2:
+        corners_3d_arr = [corners_3d.astype(np.float64).reshape(-1, 3)] * n_stations
+    else:
+        corners_3d_arr = [np.asarray(c, dtype=np.float64).reshape(-1, 3) for c in corners_3d]
+        if len(corners_3d_arr) != n_stations:
             raise ValueError(
-                f"station {i} has {c.shape[0]} corners but corners_3d has {n_corners}"
+                f"corners_3d has {len(corners_3d_arr)} stations but T_be_list has {n_stations}"
+            )
+
+    for i, (c2d, c3d) in enumerate(zip(corners_2d_arr, corners_3d_arr)):
+        if c2d.shape[0] != c3d.shape[0]:
+            raise ValueError(
+                f"station {i} has {c2d.shape[0]} 2d corners but {c3d.shape[0]} 3d corners"
             )
 
     if Y_init is None:
@@ -163,7 +177,7 @@ def refine_handeye(
     result = least_squares(
         fun=_residual_fn,
         x0=x0,
-        args=(T_be_arr, corners_2d_arr, corners_3d_arr, K_arr, dist_arr),
+        args=(T_be_arr, corners_2d_arr, corners_3d_arr, K_arr, dist_arr),  # corners_3d_arr is per-station
         method="trf",
         loss="huber",
         f_scale=huber_pixels,
@@ -176,10 +190,15 @@ def refine_handeye(
     residuals = result.fun
     rmse_pixels = float(np.sqrt(np.mean(residuals ** 2)))
 
+    # Per-station corner counts can vary (partial views), so split the flat
+    # residual vector by each station's 2*N_k length rather than reshaping.
     per_pose_rmse: List[float] = []
-    residuals_per_station = residuals.reshape(n_stations, n_corners, 2)
-    for k in range(n_stations):
-        per_pose_rmse.append(float(np.sqrt(np.mean(residuals_per_station[k] ** 2))))
+    offset = 0
+    for c2d in corners_2d_arr:
+        seg_len = 2 * c2d.shape[0]
+        seg = residuals[offset:offset + seg_len]
+        per_pose_rmse.append(float(np.sqrt(np.mean(seg ** 2))))
+        offset += seg_len
 
     return {
         "X_refined": X_refined,

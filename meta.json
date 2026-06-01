@@ -12,6 +12,12 @@
       "markdown_link": "README.md#model-viamopencvchessboard"
     },
     {
+      "api": "rdk:component:pose_tracker",
+      "model": "viam:opencv:charuco",
+      "short_description": "OpenCV-based pose tracker component for ChArUco boards",
+      "markdown_link": "README.md#model-viamopencvcharuco"
+    },
+    {
       "api": "rdk:service:generic",
       "model": "viam:opencv:hand_eye_calibration",
       "short_description": "OpenCV-based hand-eye calibration service",

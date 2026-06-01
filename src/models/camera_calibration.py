@@ -18,6 +18,13 @@ try:
         generate_object_points,
         decode_base64_image
     )
+    from utils.charuco_utils import (
+        SQUARE_SIZE_ATTR,
+        build_charuco_board_from_attrs,
+        detect_charuco_corners,
+        match_object_points,
+        validate_charuco_attrs,
+    )
 except ModuleNotFoundError:
     # when running as local module with run.sh
     from ..utils.chessboard_utils import (
@@ -25,9 +32,23 @@ except ModuleNotFoundError:
         generate_object_points,
         decode_base64_image
     )
+    from ..utils.charuco_utils import (
+        SQUARE_SIZE_ATTR,
+        build_charuco_board_from_attrs,
+        detect_charuco_corners,
+        match_object_points,
+        validate_charuco_attrs,
+    )
 
 
-# Required attributes
+# Target selection
+TARGET_TYPE_ATTR = "target_type"
+TARGET_CHESSBOARD = "chessboard"
+TARGET_CHARUCO = "charuco"
+TARGET_TYPES = [TARGET_CHESSBOARD, TARGET_CHARUCO]
+DEFAULT_TARGET_TYPE = TARGET_CHESSBOARD
+
+# Chessboard required attributes
 PATTERN_ATTR = "pattern_size"
 SQUARE_ATTR = "square_size_mm"
 
@@ -35,7 +56,8 @@ SQUARE_ATTR = "square_size_mm"
 class CameraCalibration(Generic, EasyResource):
     """Generic service that provides camera calibration functionality via do_command.
 
-    This service uses chessboard patterns to calibrate camera intrinsic parameters.
+    This service uses a chessboard or ChArUco target to calibrate camera
+    intrinsic parameters. Select the target via the ``target_type`` attribute.
     """
 
     MODEL: ClassVar[Model] = Model(ModelFamily("viam", "opencv"), "camera_calibration")
@@ -56,10 +78,18 @@ class CameraCalibration(Generic, EasyResource):
         """
         attrs = struct_to_dict(config.attributes)
 
-        if attrs.get(PATTERN_ATTR) is None:
-            raise Exception(f"Missing required {PATTERN_ATTR} attribute.")
-        if attrs.get(SQUARE_ATTR) is None:
-            raise Exception(f"Missing required {SQUARE_ATTR} attribute.")
+        target_type = attrs.get(TARGET_TYPE_ATTR, DEFAULT_TARGET_TYPE)
+        if target_type == TARGET_CHESSBOARD:
+            if attrs.get(PATTERN_ATTR) is None:
+                raise Exception(f"Missing required {PATTERN_ATTR} attribute.")
+            if attrs.get(SQUARE_ATTR) is None:
+                raise Exception(f"Missing required {SQUARE_ATTR} attribute.")
+        elif target_type == TARGET_CHARUCO:
+            validate_charuco_attrs(attrs)
+        else:
+            raise Exception(
+                f"Unknown {TARGET_TYPE_ATTR} '{target_type}'. Must be one of {TARGET_TYPES}."
+            )
 
         return [], []
 
@@ -74,14 +104,44 @@ class CameraCalibration(Generic, EasyResource):
         """
         attrs = struct_to_dict(config.attributes)
 
-        pattern_list: list = attrs.get(PATTERN_ATTR)
-        self.pattern_size = [int(x) for x in pattern_list]
-        self.square_size = attrs.get(SQUARE_ATTR)
+        self.target_type = attrs.get(TARGET_TYPE_ATTR, DEFAULT_TARGET_TYPE)
+        if self.target_type == TARGET_CHESSBOARD:
+            pattern_list: list = attrs.get(PATTERN_ATTR)
+            self.pattern_size = [int(x) for x in pattern_list]
+            self.square_size = attrs.get(SQUARE_ATTR)
+        else:  # TARGET_CHARUCO (validated in validate_config)
+            self.square_size = float(attrs.get(SQUARE_SIZE_ATTR))
+            self.board = build_charuco_board_from_attrs(attrs)
 
         return super().reconfigure(config, dependencies)
 
+    def _detect_target(self, image: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        """Detect the configured target in one image.
+
+        Returns ``(object_points, image_points)`` as float32 arrays paired for
+        ``cv2.calibrateCamera`` -- ``(N, 3)`` board-frame points and their
+        ``(N, ..., 2)`` pixel locations -- or ``None`` if the target was not
+        found. For a chessboard the full grid is returned every time; for a
+        ChArUco board the detected (possibly partial) subset is returned, which
+        ``calibrateCamera`` accepts as variable-length per-image point sets.
+        """
+        if self.target_type == TARGET_CHESSBOARD:
+            corners = detect_chessboard_corners(image, tuple(self.pattern_size))
+            if corners is None:
+                return None
+            objp = generate_object_points(tuple(self.pattern_size), self.square_size)
+            return objp.astype(np.float32), corners.astype(np.float32)
+
+        # TARGET_CHARUCO
+        detection = detect_charuco_corners(image, self.board)
+        if detection is None:
+            return None
+        charuco_corners, charuco_ids = detection
+        objp, imgp = match_object_points(self.board, charuco_corners, charuco_ids)
+        return objp.astype(np.float32), imgp.astype(np.float32)
+
     async def _calibrate_camera_from_images(self, base64_images: List[str]) -> Mapping[str, Any]:
-        """Calibrate camera using provided chessboard images.
+        """Calibrate camera using the provided target images.
 
         Args:
             base64_images: List of base64 encoded image strings
@@ -112,16 +172,17 @@ class CameraCalibration(Generic, EasyResource):
                 if image_size is None:
                     image_size = (image.shape[1], image.shape[0])  # (width, height)
 
-                # Detect chessboard corners
-                corners = detect_chessboard_corners(image, tuple(self.pattern_size))
+                # Detect the configured target
+                detected = self._detect_target(image)
 
-                if corners is None:
-                    self.logger.warning(f"Image {idx + 1}: Could not find chessboard pattern")
+                if detected is None:
+                    self.logger.warning(f"Image {idx + 1}: Could not find {self.target_type} target")
                     continue
 
                 # Add to calibration dataset
-                object_points.append(generate_object_points(tuple(self.pattern_size), self.square_size))
-                image_points.append(corners)
+                objp, imgp = detected
+                object_points.append(objp)
+                image_points.append(imgp)
                 used_image_indices.append(idx + 1)
                 successful_detections += 1
 
@@ -132,7 +193,7 @@ class CameraCalibration(Generic, EasyResource):
                 continue
 
         if successful_detections < 3:
-            raise Exception(f"Only found chessboard pattern in {successful_detections}/{num_images} images. Need at least 3 valid images for calibration.")
+            raise Exception(f"Only found {self.target_type} target in {successful_detections}/{num_images} images. Need at least 3 valid images for calibration.")
 
         # Perform camera calibration
         self.logger.info("Running camera calibration...")

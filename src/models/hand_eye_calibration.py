@@ -52,6 +52,12 @@ USE_MOTION_SERVICE_FOR_POSES_ATTR = "use_motion_service_for_poses"
 POSE_SELECTION_ATTR = "pose_selection"
 POSE_SAMPLING_ATTR = "pose_sampling"
 
+# do_command keys a viam:opencv pose tracker exposes a raw observation under.
+# A chessboard reports the full grid every frame; a ChArUco board may report a
+# different subset of corners per frame (partial views). We request all known
+# keys and use whichever the attached tracker actually answers.
+OBSERVATION_COMMAND_KEYS = ["get_chessboard_observation", "get_charuco_observation"]
+
 # Solver options
 SOLVER_OPENCV = "opencv"
 SOLVER_HYBRID = "hybrid"
@@ -606,13 +612,36 @@ class HandEyeCalibration(Generic, EasyResource):
 
         return residuals, summary
 
-    async def _collect_calibration_data_with_corners(self):
-        """Collect end-effector poses and chessboard corner observations.
+    async def _request_target_observation(self) -> dict:
+        """Fetch a raw corner observation from the attached pose tracker.
 
-        Used by the reprojection-based solver path. Returns data in the
+        Works with either the ``chessboard`` or ``charuco`` model: we ask for
+        every known observation key in one call and return whichever one the
+        tracker answers with a dict (unsupported keys come back as a string).
+        """
+        command = {key: True for key in OBSERVATION_COMMAND_KEYS}
+        resp = await self.pose_tracker.do_command(command)
+        for key in OBSERVATION_COMMAND_KEYS:
+            obs = resp.get(key)
+            if isinstance(obs, dict):
+                return obs
+        raise Exception(
+            "pose_tracker.do_command did not return a corner observation; "
+            "ensure the pose tracker is the viam:opencv:chessboard or "
+            "viam:opencv:charuco model"
+        )
+
+    async def _collect_calibration_data_with_corners(self):
+        """Collect end-effector poses and target corner observations.
+
+        Works with any viam:opencv pose tracker (chessboard or ChArUco). Used
+        by the reprojection-based solver path. Returns data in the
         OpenCV-standard convention:
             T_be: gripper-in-base (4x4)
             T_cw: target-in-camera (4x4) — board ≡ world for eye-in-hand
+            corners_2d_list / corners_3d_list: paired per-pose corner pixels
+                and board-frame points (a ChArUco board may detect a different
+                subset of corners per pose, so 3d points are kept per pose).
 
         Note: ``call_go_ov2mat`` returns body-from-parent (R_eb for an arm
         pose), so we transpose to get parent-from-body (R_be).
@@ -623,7 +652,7 @@ class HandEyeCalibration(Generic, EasyResource):
         T_be_list = []
         T_cw_list = []
         corners_2d_list = []
-        corners_3d = None
+        corners_3d_list = []
         K = None
         dist = None
 
@@ -648,19 +677,15 @@ class HandEyeCalibration(Generic, EasyResource):
                 T_be[:3, :3] = R_eb.T  # R_be: gripper-in-base
                 T_be[:3, 3] = [arm_pose.x, arm_pose.y, arm_pose.z]
 
-                obs_resp = await self.pose_tracker.do_command(
-                    {"get_chessboard_observation": True}
-                )
-                obs = obs_resp.get("get_chessboard_observation")
-                if obs is None or not isinstance(obs, dict):
-                    raise Exception(
-                        "pose_tracker.do_command did not return a chessboard observation; "
-                        "ensure the pose tracker is the viam:opencv:chessboard model"
-                    )
+                obs = await self._request_target_observation()
 
+                # corners_2d and corners_3d are paired per pose. For a
+                # chessboard this is the full grid every time; for a ChArUco
+                # board it may be a different subset of corners each pose, so
+                # the 3d points are collected per pose rather than once.
                 corners_2d = np.asarray(obs["corners_2d"], dtype=np.float64).reshape(-1, 2)
-                if corners_3d is None:
-                    corners_3d = np.asarray(obs["corners_3d"], dtype=np.float64).reshape(-1, 3)
+                corners_3d = np.asarray(obs["corners_3d"], dtype=np.float64).reshape(-1, 3)
+                if K is None:
                     K = np.asarray(obs["K"], dtype=np.float64)
                     dist = np.asarray(obs["dist"], dtype=np.float64).reshape(-1)
 
@@ -674,6 +699,7 @@ class HandEyeCalibration(Generic, EasyResource):
                 T_be_list.append(T_be)
                 T_cw_list.append(T_cw)
                 corners_2d_list.append(corners_2d)
+                corners_3d_list.append(corners_3d)
 
                 self.logger.info(
                     f"successfully collected corner observation for position {i+1}/{total_positions}"
@@ -685,7 +711,7 @@ class HandEyeCalibration(Generic, EasyResource):
                 self.logger.error(error_msg)
                 raise Exception(error_msg)
 
-        return T_be_list, T_cw_list, corners_2d_list, corners_3d, K, dist
+        return T_be_list, T_cw_list, corners_2d_list, corners_3d_list, K, dist
 
     async def _collect_calibration_data(self):
         """Collect calibration data for all joint positions or poses."""
@@ -784,7 +810,7 @@ class HandEyeCalibration(Generic, EasyResource):
                     else:
                         # Reprojection-based path: collect corner observations and use
                         # OpenCV-standard conventions throughout.
-                        T_be_list, T_cw_list, corners_2d_list, corners_3d, K, dist = (
+                        T_be_list, T_cw_list, corners_2d_list, corners_3d_list, K, dist = (
                             await self._collect_calibration_data_with_corners()
                         )
                         if len(T_be_list) < 3:
@@ -813,7 +839,7 @@ class HandEyeCalibration(Generic, EasyResource):
                         refinement = refine_handeye(
                             T_be_list,
                             corners_2d_list,
-                            corners_3d,
+                            corners_3d_list,
                             K,
                             dist,
                             X_init=X_init,
