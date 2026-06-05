@@ -1,7 +1,7 @@
 import asyncio
 import cv2
 import numpy as np
-from typing import ClassVar, Dict, Mapping, Optional, Sequence, Tuple
+from typing import Awaitable, Callable, ClassVar, Dict, Mapping, Optional, Sequence, Tuple, TypeVar
 
 from typing_extensions import Self
 from viam.components.arm import Arm, JointPositions
@@ -47,6 +47,8 @@ METHOD_ATTR = "method"
 MOTION_ATTR = "motion"
 POSE_TRACKER_ATTR = "pose_tracker"
 SLEEP_ATTR = "sleep_seconds"
+CAMERA_RETRY_ATTEMPTS_ATTR = "camera_retry_attempts"
+CAMERA_RETRY_SLEEP_ATTR = "camera_retry_sleep_seconds"
 SOLVER_ATTR = "solver"
 USE_MOTION_SERVICE_FOR_POSES_ATTR = "use_motion_service_for_poses"
 POSE_SELECTION_ATTR = "pose_selection"
@@ -65,6 +67,10 @@ POSE_SELECTIONS = [POSE_SELECTION_MANUAL, POSE_SELECTION_AUTO]
 
 # Default config attribute values
 DEFAULT_SLEEP_SECONDS = 2.0
+DEFAULT_CAMERA_RETRY_ATTEMPTS = 5
+DEFAULT_CAMERA_RETRY_SLEEP_SECONDS = 1.0
+
+T = TypeVar("T")
 DEFAULT_METHOD = "CALIB_HAND_EYE_TSAI"
 DEFAULT_SOLVER = SOLVER_OPENCV
 DEFAULT_USE_MOTION_SERVICE_FOR_POSES = False
@@ -306,6 +312,12 @@ class HandEyeCalibration(Generic, EasyResource):
         self.method = attrs.get(METHOD_ATTR, DEFAULT_METHOD)
         self.solver = attrs.get(SOLVER_ATTR, DEFAULT_SOLVER)
         self.sleep_seconds = attrs.get(SLEEP_ATTR, DEFAULT_SLEEP_SECONDS)
+        self.camera_retry_attempts = int(
+            attrs.get(CAMERA_RETRY_ATTEMPTS_ATTR, DEFAULT_CAMERA_RETRY_ATTEMPTS)
+        )
+        self.camera_retry_sleep_seconds = float(
+            attrs.get(CAMERA_RETRY_SLEEP_ATTR, DEFAULT_CAMERA_RETRY_SLEEP_SECONDS)
+        )
         self.body_names = [attrs.get(BODY_NAME_ATTR)] if attrs.get(BODY_NAME_ATTR) is not None else []
         self.use_motion_service_for_poses = attrs.get(USE_MOTION_SERVICE_FOR_POSES_ATTR, DEFAULT_USE_MOTION_SERVICE_FOR_POSES)
 
@@ -314,6 +326,28 @@ class HandEyeCalibration(Generic, EasyResource):
         self.pose_sampling = _parse_sampling_attrs(sampling) if isinstance(sampling, dict) else None
 
         return super().reconfigure(config, dependencies)
+
+    async def _with_camera_retry(
+        self,
+        operation_name: str,
+        coro_fn: Callable[[], Awaitable[T]],
+    ) -> T:
+        """Retry transient camera/pose-tracker failures (e.g. USB disconnect during arm motion)."""
+        last_error: Optional[Exception] = None
+        for attempt in range(1, self.camera_retry_attempts + 1):
+            try:
+                return await coro_fn()
+            except Exception as e:
+                last_error = e
+                if attempt >= self.camera_retry_attempts:
+                    break
+                self.logger.warning(
+                    f"{operation_name} failed on attempt {attempt}/"
+                    f"{self.camera_retry_attempts}: {e}; "
+                    f"retrying in {self.camera_retry_sleep_seconds}s"
+                )
+                await asyncio.sleep(self.camera_retry_sleep_seconds)
+        raise last_error  # type: ignore[misc]
     
     async def get_calibration_values(self):
         if self.use_motion_service_for_poses and self.motion is not None:
@@ -337,7 +371,10 @@ class HandEyeCalibration(Generic, EasyResource):
         t_base2gripper = np.array([[arm_pose.x], [arm_pose.y], [arm_pose.z]], dtype=np.float64)
 
         # Get pose from the tracker (AprilTag, chessboard corner, etc.)
-        tracked_poses: Dict[str, PoseInFrame] = await self.pose_tracker.get_poses(body_names=self.body_names)
+        tracked_poses: Dict[str, PoseInFrame] = await self._with_camera_retry(
+            "pose tracker get_poses",
+            lambda: self.pose_tracker.get_poses(body_names=self.body_names),
+        )
         if tracked_poses is None or len(tracked_poses) == 0:
             no_bodies_error_msg = "could not find any tracked bodies in camera frame"
             if self.body_names:
@@ -437,7 +474,10 @@ class HandEyeCalibration(Generic, EasyResource):
             # that's reachable but doesn't see the chessboard would just fail
             # later during data collection — drop it here instead.
             try:
-                tracked = await self.pose_tracker.get_poses(body_names=self.body_names)
+                tracked = await self._with_camera_retry(
+                    "pose tracker get_poses",
+                    lambda: self.pose_tracker.get_poses(body_names=self.body_names),
+                )
             except Exception as e:
                 self.logger.info(
                     f"attempt {attempts}: pose tracker error ({e}); resampling"
@@ -648,8 +688,11 @@ class HandEyeCalibration(Generic, EasyResource):
                 T_be[:3, :3] = R_eb.T  # R_be: gripper-in-base
                 T_be[:3, 3] = [arm_pose.x, arm_pose.y, arm_pose.z]
 
-                obs_resp = await self.pose_tracker.do_command(
-                    {"get_chessboard_observation": True}
+                obs_resp = await self._with_camera_retry(
+                    "chessboard observation",
+                    lambda: self.pose_tracker.do_command(
+                        {"get_chessboard_observation": True}
+                    ),
                 )
                 obs = obs_resp.get("get_chessboard_observation")
                 if obs is None or not isinstance(obs, dict):
