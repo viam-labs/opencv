@@ -9,7 +9,9 @@ from viam.resource.types import Model, ModelFamily
 try:
     from utils.charuco_utils import (
         DEFAULT_DICTIONARY,
+        DEFAULT_LEGACY_PATTERN,
         DICTIONARY_ATTR,
+        LEGACY_PATTERN_ATTR,
         MARKER_SIZE_ATTR,
         SQUARES_X_ATTR,
         SQUARES_Y_ATTR,
@@ -24,7 +26,9 @@ except ModuleNotFoundError:
     # when running as local module with run.sh
     from ..utils.charuco_utils import (
         DEFAULT_DICTIONARY,
+        DEFAULT_LEGACY_PATTERN,
         DICTIONARY_ATTR,
+        LEGACY_PATTERN_ATTR,
         MARKER_SIZE_ATTR,
         SQUARES_X_ATTR,
         SQUARES_Y_ATTR,
@@ -64,6 +68,7 @@ class Charuco(BaseTargetTracker, PoseTracker, EasyResource):
         self.square_size = float(attrs.get(SQUARE_SIZE_ATTR))
         self.marker_size = float(attrs.get(MARKER_SIZE_ATTR))
         self.dictionary = str(attrs.get(DICTIONARY_ATTR, DEFAULT_DICTIONARY))
+        self.legacy_pattern = bool(attrs.get(LEGACY_PATTERN_ATTR, DEFAULT_LEGACY_PATTERN))
         self.board = build_charuco_board_from_attrs(attrs)
 
     def _observation_metadata(self) -> Dict[str, Any]:
@@ -73,6 +78,7 @@ class Charuco(BaseTargetTracker, PoseTracker, EasyResource):
             "square_size_mm": self.square_size,
             "marker_size_mm": self.marker_size,
             "dictionary": self.dictionary,
+            "legacy_pattern": self.legacy_pattern,
         }
 
     async def _detect_observation(self) -> TargetObservation:

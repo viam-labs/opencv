@@ -27,7 +27,9 @@ SQUARES_Y_ATTR = "squares_y"          # number of chessboard squares along Y
 SQUARE_SIZE_ATTR = "square_size_mm"   # chessboard square side length
 MARKER_SIZE_ATTR = "marker_size_mm"   # ArUco marker side length (< square)
 DICTIONARY_ATTR = "dictionary"        # predefined ArUco dictionary name (optional)
+LEGACY_PATTERN_ATTR = "legacy_pattern"  # use pre-4.6 marker layout (e.g. calib.io boards)
 DEFAULT_DICTIONARY = "DICT_4X4_50"
+DEFAULT_LEGACY_PATTERN = False
 
 
 def validate_charuco_attrs(attrs: Mapping[str, Any]) -> None:
@@ -43,8 +45,24 @@ def validate_charuco_attrs(attrs: Mapping[str, Any]) -> None:
     if float(attrs.get(MARKER_SIZE_ATTR)) >= float(attrs.get(SQUARE_SIZE_ATTR)):
         raise Exception(f"{MARKER_SIZE_ATTR} must be smaller than {SQUARE_SIZE_ATTR}.")
     dictionary = attrs.get(DICTIONARY_ATTR, DEFAULT_DICTIONARY)
-    if getattr(cv2.aruco, str(dictionary), None) is None:
+    dict_id = getattr(cv2.aruco, str(dictionary), None)
+    if dict_id is None:
         raise Exception(f"Unknown ArUco {DICTIONARY_ATTR} '{dictionary}'.")
+
+    # A ChArUco board places a marker in every other square, so it needs
+    # ceil(squares_x * squares_y / 2) unique marker ids. If the chosen
+    # dictionary is too small the board references ids that don't exist and
+    # detection silently fails -- catch it here with an actionable message.
+    squares_x = int(attrs.get(SQUARES_X_ATTR))
+    squares_y = int(attrs.get(SQUARES_Y_ATTR))
+    markers_needed = (squares_x * squares_y) // 2
+    dict_size = cv2.aruco.getPredefinedDictionary(dict_id).bytesList.shape[0]
+    if markers_needed > dict_size:
+        raise Exception(
+            f"A {squares_x}x{squares_y} ChArUco board needs {markers_needed} "
+            f"markers but {DICTIONARY_ATTR} '{dictionary}' only has {dict_size}. "
+            f"Use a larger dictionary (e.g. one ending in a bigger number)."
+        )
 
 
 def build_charuco_board_from_attrs(attrs: Mapping[str, Any]) -> "cv2.aruco.CharucoBoard":
@@ -55,6 +73,7 @@ def build_charuco_board_from_attrs(attrs: Mapping[str, Any]) -> "cv2.aruco.Charu
         float(attrs.get(SQUARE_SIZE_ATTR)),
         float(attrs.get(MARKER_SIZE_ATTR)),
         str(attrs.get(DICTIONARY_ATTR, DEFAULT_DICTIONARY)),
+        bool(attrs.get(LEGACY_PATTERN_ATTR, DEFAULT_LEGACY_PATTERN)),
     )
 
 
@@ -64,6 +83,7 @@ def build_charuco_board(
     square_size: float,
     marker_size: float,
     dictionary_name: str = "DICT_4X4_50",
+    legacy_pattern: bool = False,
 ) -> "cv2.aruco.CharucoBoard":
     """Construct a ChArUco board definition.
 
@@ -73,6 +93,10 @@ def build_charuco_board(
         square_size: Side length of a chessboard square (mm or other unit).
         marker_size: Side length of an ArUco marker (same unit, < square_size).
         dictionary_name: Predefined ArUco dictionary, e.g. ``"DICT_4X4_50"``.
+        legacy_pattern: Use the pre-4.6 ChArUco marker layout. Boards generated
+            by older OpenCV or by third-party tools such as calib.io use this
+            layout; OpenCV >= 4.6 defaults to a new layout, so detecting a
+            legacy board without this flag silently fails.
 
     Returns:
         A ``cv2.aruco.CharucoBoard``. Object points are in the same unit as
@@ -87,9 +111,12 @@ def build_charuco_board(
         raise ValueError(f"Unknown ArUco dictionary '{dictionary_name}'")
 
     dictionary = cv2.aruco.getPredefinedDictionary(dict_id)
-    return cv2.aruco.CharucoBoard(
+    board = cv2.aruco.CharucoBoard(
         (squares_x, squares_y), square_size, marker_size, dictionary
     )
+    if legacy_pattern:
+        board.setLegacyPattern(True)
+    return board
 
 
 def detect_charuco_corners(
