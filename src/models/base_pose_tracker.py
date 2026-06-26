@@ -155,26 +155,33 @@ class BaseTargetTracker(abc.ABC):
     async def get_camera_intrinsics(self) -> tuple:
         """Get camera intrinsic parameters as ``(K, dist)`` numpy arrays."""
         if self.camera_intrinsics is None:
-            camera_params = await self.camera.do_command({"get_camera_params": None})
-            intrinsics = camera_params["Color"]["intrinsics"]
-            dist_params = camera_params["Color"]["distortion"]
+            props = await self.camera.get_properties()
+            intrinsics = props.intrinsic_parameters
+            dist_params = props.distortion_parameters
+
+            K = np.array([
+                [intrinsics.focal_x_px, 0, intrinsics.center_x_px],
+                [0, intrinsics.focal_y_px, intrinsics.center_y_px],
+                [0, 0, 1]
+            ], dtype=np.float32)
+            dist = np.array(list(dist_params.parameters), dtype=np.float32)
         else:
             intrinsics = self.camera_intrinsics["K"]
             dist_params = self.camera_intrinsics["dist"]
 
-        K = np.array([
-            [intrinsics["fx"], 0, intrinsics["cx"]],
-            [0, intrinsics["fy"], intrinsics["cy"]],
-            [0, 0, 1]
-        ], dtype=np.float32)
+            K = np.array([
+                [intrinsics["fx"], 0, intrinsics["cx"]],
+                [0, intrinsics["fy"], intrinsics["cy"]],
+                [0, 0, 1]
+            ], dtype=np.float32)
 
-        dist = np.array([
-            dist_params["k1"],
-            dist_params["k2"],
-            dist_params["p1"],
-            dist_params["p2"],
-            dist_params["k3"]
-        ], dtype=np.float32)
+            dist = np.array([
+                dist_params["k1"],
+                dist_params["k2"],
+                dist_params["p1"],
+                dist_params["p2"],
+                dist_params["k3"]
+            ], dtype=np.float32)
 
         self.logger.debug(f"Camera intrinsics: K shape={K.shape}, dist shape={dist.shape}")
         self.logger.debug(f"Distortion coefficients: {dist}")
