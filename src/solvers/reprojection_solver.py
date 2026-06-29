@@ -181,6 +181,15 @@ def refine_handeye(
         method="trf",
         loss="huber",
         f_scale=huber_pixels,
+        # The 12 optimization variables mix rotation (radians, magnitude ~1) with
+        # translation (mm, magnitude ~10^2-10^3). Without per-variable scaling,
+        # trf takes wildly oversized steps along the translation axes and can
+        # drive board points onto/behind the camera plane, where projectPoints
+        # explodes and the solve diverges (rmse -> 1e6+). This stays masked for a
+        # full chessboard (strong, well-conditioned Jacobian) but bites hard on
+        # partial targets like ChArUco. 'jac' rescales variables by the Jacobian
+        # column norms each iteration, which conditions the problem and converges.
+        x_scale="jac",
         max_nfev=max_nfev,
     )
 
