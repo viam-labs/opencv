@@ -94,10 +94,25 @@ class Charuco(BaseTargetTracker, PoseTracker, EasyResource):
 
         objp, imgp = match_object_points(self.board, charuco_corners, charuco_ids)
 
-        success, rvec, tvec = cv2.solvePnP(objp, imgp, K, dist)
-        if not success:
+        # ChArUco corners are coplanar (z=0 in the board frame). For a planar
+        # target the default SOLVEPNP_ITERATIVE solver is prone to the two-fold
+        # pose ambiguity: on oblique or partial views it can return the
+        # mirror-flipped pose (board normal reversed, ~180° off), which poisons
+        # downstream hand-eye calibration. SOLVEPNP_IPPE is purpose-built for
+        # coplanar points and returns both candidates sorted by reprojection
+        # error, so we take the best (first) branch. This matters far more for
+        # ChArUco than for a fully-visible chessboard, whose well-conditioned
+        # full-grid homography rarely flips.
+        n_solutions, rvecs, tvecs, reproj_errs = cv2.solvePnPGeneric(
+            objp, imgp, K, dist, flags=cv2.SOLVEPNP_IPPE
+        )
+        if n_solutions < 1:
             raise Exception("Could not solve PnP for ChArUco board")
-        self.logger.debug(f"Solved PnP rvec={rvec.flatten()} tvec={tvec.flatten()}")
+        rvec, tvec = rvecs[0], tvecs[0]
+        self.logger.debug(
+            f"Solved PnP ({n_solutions} candidate(s), best reproj_err="
+            f"{float(reproj_errs[0]):.3f}px) rvec={rvec.flatten()} tvec={tvec.flatten()}"
+        )
 
         R, _ = cv2.Rodrigues(rvec)
         return TargetObservation(
