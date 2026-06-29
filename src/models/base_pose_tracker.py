@@ -152,8 +152,50 @@ class BaseTargetTracker(abc.ABC):
 
     # ---- shared helpers -------------------------------------------------
 
-    async def get_camera_intrinsics(self) -> tuple:
-        """Get camera intrinsic parameters as ``(K, dist)`` numpy arrays."""
+    def _scale_K_to_image(self, K, intr_w, intr_h, img_w, img_h):
+        """Rescale a camera matrix whose intrinsics were computed at a
+        different resolution than the image actually returned by the camera.
+
+        This guards against a common failure with cameras that report
+        intrinsics for a subsampled/binned mode while streaming full
+        resolution (e.g. a Zivid reporting half-res intrinsics for a full
+        2448x2048 image). Using a mismatched K silently produces wrong PnP
+        poses -- low reprojection error on a planar target but a badly biased
+        pose -- which wrecks downstream hand-eye calibration.
+
+        Only a uniform rescale (same aspect ratio) can be corrected this way;
+        a cropped/letterboxed mismatch is raised loudly instead.
+        """
+        sx = img_w / intr_w
+        sy = img_h / intr_h
+        if abs(sx - sy) > 0.02 * max(sx, sy):
+            raise Exception(
+                f"camera intrinsics resolution {intr_w}x{intr_h} does not match "
+                f"image {img_w}x{img_h} and the scale is non-uniform "
+                f"(sx={sx:.3f}, sy={sy:.3f}); cannot safely rescale K. Configure "
+                f"the camera so get_properties and get_images use the same "
+                f"resolution."
+            )
+        K = K.copy()
+        K[0, 0] *= sx
+        K[0, 2] *= sx
+        K[1, 1] *= sy
+        K[1, 2] *= sy
+        self.logger.warning(
+            f"camera intrinsics are for {intr_w}x{intr_h} but the image is "
+            f"{img_w}x{img_h}; auto-scaling K by ({sx:.3f}, {sy:.3f}) as a "
+            f"stopgap. Configure the camera to report intrinsics matching the "
+            f"streamed image resolution to silence this."
+        )
+        return K
+
+    async def get_camera_intrinsics(self, image_shape: Optional[tuple] = None) -> tuple:
+        """Get camera intrinsic parameters as ``(K, dist)`` numpy arrays.
+
+        If ``image_shape`` (the captured image's ``(H, W, ...)``) is provided
+        and the camera reports an intrinsics resolution that differs from it,
+        ``K`` is rescaled to the image (see :meth:`_scale_K_to_image`).
+        """
         if self.camera_intrinsics is None:
             props = await self.camera.get_properties()
             intrinsics = props.intrinsic_parameters
@@ -165,6 +207,14 @@ class BaseTargetTracker(abc.ABC):
                 [0, 0, 1]
             ], dtype=np.float32)
             dist = np.array(list(dist_params.parameters), dtype=np.float32)
+
+            if (image_shape is not None
+                    and intrinsics.width_px and intrinsics.height_px):
+                img_h, img_w = int(image_shape[0]), int(image_shape[1])
+                if (int(intrinsics.width_px), int(intrinsics.height_px)) != (img_w, img_h):
+                    K = self._scale_K_to_image(
+                        K, int(intrinsics.width_px), int(intrinsics.height_px),
+                        img_w, img_h)
         else:
             intrinsics = self.camera_intrinsics["K"]
             dist_params = self.camera_intrinsics["dist"]

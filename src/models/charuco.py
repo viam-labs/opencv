@@ -84,7 +84,7 @@ class Charuco(BaseTargetTracker, PoseTracker, EasyResource):
     async def _detect_observation(self) -> TargetObservation:
         """Capture an image and run ChArUco corner detection + PnP."""
         image = await self._capture_image()
-        K, dist = await self.get_camera_intrinsics()
+        K, dist = await self.get_camera_intrinsics(image.shape)
 
         detection = detect_charuco_corners(image, self.board)
         if detection is None:

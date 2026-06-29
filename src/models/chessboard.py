@@ -55,7 +55,7 @@ class Chessboard(BaseTargetTracker, PoseTracker, EasyResource):
     async def _detect_observation(self) -> TargetObservation:
         """Capture an image and run corner detection + PnP."""
         image = await self._capture_image()
-        K, dist = await self.get_camera_intrinsics()
+        K, dist = await self.get_camera_intrinsics(image.shape)
 
         corners = detect_chessboard_corners(image, tuple(self.pattern_size))
         if corners is None:
