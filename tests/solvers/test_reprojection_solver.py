@@ -156,6 +156,57 @@ def test_noise_free_recovery():
     assert out["success"]
 
 
+def test_partial_views_per_station_corners_recovery():
+    """ChArUco-style partial views: each station detects a different subset of
+    corners, so corners_3d is passed as a per-station list with varying N_k.
+    The refiner should still recover X.
+    """
+    data = _build_synthetic_dataset(noise_pixels=0.0)
+    full_3d = data["corners_3d"]
+    n_total = full_3d.shape[0]
+    rng = np.random.default_rng(7)
+
+    corners_2d_partial = []
+    corners_3d_partial = []
+    for k, c2d in enumerate(data["corners_2d_list"]):
+        # Keep a different ~70% subset of corners at each station.
+        keep = np.sort(rng.choice(n_total, size=int(n_total * 0.7), replace=False))
+        corners_2d_partial.append(c2d[keep])
+        corners_3d_partial.append(full_3d[keep])
+
+    X_init = data["X_true"] @ _euler_xyz_se3(2.0, -1.5, 1.0, [3.0, -2.0, 4.0])
+    out = refine_handeye(
+        data["T_be_list"],
+        corners_2d_partial,
+        corners_3d_partial,  # per-station list, variable N_k
+        data["K"],
+        data["dist"],
+        X_init=X_init,
+        T_cw_list=data["T_cw_list"],
+    )
+    trans_err, rot_err = _se3_diff(out["X_refined"], data["X_true"])
+    assert trans_err < 0.1, f"translation error {trans_err:.4f} mm too high"
+    assert rot_err < 0.05, f"rotation error {rot_err:.4f} deg too high"
+    assert len(out["per_pose_rmse_pixels"]) == len(data["T_be_list"])
+    assert out["success"]
+
+
+def test_mismatched_2d_3d_corner_counts_raises():
+    data = _build_synthetic_dataset(noise_pixels=0.0)
+    bad_3d = [data["corners_3d"][:-1] for _ in data["T_be_list"]]  # drop one 3d point
+    X_init = data["X_true"]
+    with pytest.raises(ValueError):
+        refine_handeye(
+            data["T_be_list"],
+            data["corners_2d_list"],
+            bad_3d,
+            data["K"],
+            data["dist"],
+            X_init=X_init,
+            T_cw_list=data["T_cw_list"],
+        )
+
+
 def test_jacobian_shape():
     data = _build_synthetic_dataset(noise_pixels=0.0)
     X_init = data["X_true"] @ _euler_xyz_se3(2.0, -1.5, 1.0, [3.0, -2.0, 4.0])
