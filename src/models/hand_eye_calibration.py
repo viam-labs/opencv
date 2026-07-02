@@ -355,17 +355,28 @@ class HandEyeCalibration(Generic, EasyResource):
                 await asyncio.sleep(self.camera_retry_sleep_seconds)
         raise last_error  # type: ignore[misc]
     
-    async def get_calibration_values(self):
+    async def _read_arm_pose(self) -> Pose:
+        """Read the current end-effector pose, via the motion service when configured."""
         if self.use_motion_service_for_poses and self.motion is not None:
             arm_pose_in_frame = await self.motion.get_pose(
                 component_name=self.arm_name,
                 destination_frame=self.arm_name + "_origin"
             )
-            arm_pose = arm_pose_in_frame.pose
-            self.logger.debug(f"Found end of arm pose from motion service: {arm_pose}")
-        else:
-            arm_pose = await self.arm.get_end_position()
-            self.logger.debug(f"Found end of arm pose from arm.get_end_position: {arm_pose}")
+            self.logger.debug(f"Found end of arm pose from motion service: {arm_pose_in_frame.pose}")
+            return arm_pose_in_frame.pose
+        arm_pose = await self.arm.get_end_position()
+        self.logger.debug(f"Found end of arm pose from arm.get_end_position: {arm_pose}")
+        return arm_pose
+
+    async def _capture_opencv_measurement(self) -> dict:
+        """Capture one hand-eye measurement at the current arm position for the
+        OpenCV solver path: gripper-in-base from the arm, target-in-camera from
+        the pose tracker. Raises if the tracker does not resolve exactly one body.
+
+        OpenCV calibrateHandEye expects transposed rotations but original
+        translation vectors, so only the rotation matrices are inverted here.
+        """
+        arm_pose = await self._read_arm_pose()
 
         # Get rotation matrix: base -> gripper
         R_base2gripper = call_go_ov2mat(
@@ -406,7 +417,65 @@ class HandEyeCalibration(Generic, EasyResource):
         )
         t_cam2target = np.array([[tracked_pose.x], [tracked_pose.y], [tracked_pose.z]], dtype=np.float64)
 
-        return R_base2gripper, t_base2gripper, R_cam2target, t_cam2target
+        # TODO: Implement eye-to-hand. This should just be changing the
+        # order/in-frame values
+        return {
+            "arm_pose": arm_pose,
+            "R_gripper2base": R_base2gripper.T,
+            "t_gripper2base": t_base2gripper,
+            "R_target2cam": R_cam2target.T,
+            "t_target2cam": t_cam2target,
+        }
+
+    async def _capture_corner_measurement(self) -> dict:
+        """Capture one hand-eye measurement at the current arm position for the
+        reprojection solver path, in the OpenCV-standard convention:
+            T_be: gripper-in-base (4x4)
+            T_cw: target-in-camera (4x4) — board ≡ world for eye-in-hand
+            corners_2d / corners_3d: paired corner pixels and board-frame
+                points (a ChArUco board may detect a different subset of
+                corners per pose, so 3d points are kept per pose).
+        Raises if the target is not detected.
+
+        Note: ``call_go_ov2mat`` returns body-from-parent (R_eb for an arm
+        pose), so we transpose to get parent-from-body (R_be).
+        """
+        arm_pose = await self._read_arm_pose()
+
+        R_eb = call_go_ov2mat(arm_pose.o_x, arm_pose.o_y, arm_pose.o_z, arm_pose.theta)
+        if R_eb is None:
+            raise Exception("could not convert arm orientation to rotation matrix")
+        T_be = np.eye(4)
+        T_be[:3, :3] = R_eb.T  # R_be: gripper-in-base
+        T_be[:3, 3] = [arm_pose.x, arm_pose.y, arm_pose.z]
+
+        obs = await self._request_target_observation()
+
+        corners_2d = np.asarray(obs["corners_2d"], dtype=np.float64).reshape(-1, 2)
+        corners_3d = np.asarray(obs["corners_3d"], dtype=np.float64).reshape(-1, 3)
+
+        rvec = np.asarray(obs["rvec"], dtype=np.float64).reshape(3, 1)
+        tvec = np.asarray(obs["tvec"], dtype=np.float64).reshape(3)
+        R_ct, _ = cv2.Rodrigues(rvec)
+        T_cw = np.eye(4)
+        T_cw[:3, :3] = R_ct
+        T_cw[:3, 3] = tvec
+
+        return {
+            "arm_pose": arm_pose,
+            "T_be": T_be,
+            "T_cw": T_cw,
+            "corners_2d": corners_2d,
+            "corners_3d": corners_3d,
+            "K": np.asarray(obs["K"], dtype=np.float64),
+            "dist": np.asarray(obs["dist"], dtype=np.float64).reshape(-1),
+        }
+
+    async def _capture_measurement(self) -> dict:
+        """Capture the solver-appropriate measurement at the current arm position."""
+        if self.solver == SOLVER_OPENCV:
+            return await self._capture_opencv_measurement()
+        return await self._capture_corner_measurement()
 
     def _transform_to_viam_pose(self, T: np.ndarray) -> Pose:
         """Convert a 4x4 gripper-in-base transform (columns of T[:3,:3] are
@@ -431,13 +500,16 @@ class HandEyeCalibration(Generic, EasyResource):
             theta=float(theta),
         )
 
-    async def _sample_and_move_loop(self, sampling: dict) -> list:
+    async def _sample_and_move_loop(self, sampling: dict) -> Tuple[list, list]:
         """For ``pose_selection='auto'``: sample candidate poses, attempt to
-        move the arm, and record the actually-achieved arm pose on success.
+        move the arm, and capture the calibration measurement right there when
+        the target is detected — sampling and data collection are a single
+        pass, so the arm never re-visits poses.
 
-        Returns a list of Viam ``Pose`` objects (the *measured* end-effector
-        pose after each successful move, not the sampled candidate — the
-        achieved pose is what the calibration math needs).
+        Returns ``(poses, measurements)``: the *measured* end-effector pose
+        after each successful move (not the sampled candidate — the achieved
+        pose is what the calibration math needs), paired with the measurement
+        captured at it.
         """
         if self.motion is None:
             raise Exception(
@@ -449,6 +521,7 @@ class HandEyeCalibration(Generic, EasyResource):
         max_attempts = sampling["max_attempts"]
 
         achieved: list = []
+        measurements: list = []
         attempts = 0
         while len(achieved) < n_target and attempts < max_attempts:
             attempts += 1
@@ -476,65 +549,39 @@ class HandEyeCalibration(Generic, EasyResource):
                 )
                 continue
 
-            # Verify the calibration target is visible from this pose. A pose
-            # that's reachable but doesn't see the chessboard would just fail
-            # later during data collection — drop it here instead.
+            # Capture the calibration measurement from this pose. The capture
+            # doubles as the visibility check: a pose that's reachable but
+            # doesn't see the target fails detection and gets resampled, and a
+            # success means this pose's data is already collected — no second
+            # visit needed.
             try:
-                tracked = await self._with_camera_retry(
-                    "pose tracker get_poses",
-                    lambda: self.pose_tracker.get_poses(body_names=self.body_names),
-                )
+                measurement = await self._capture_measurement()
             except Exception as e:
                 self.logger.info(
-                    f"attempt {attempts}: pose tracker error ({e}); resampling"
-                )
-                continue
-            if not tracked:
-                self.logger.info(
-                    f"attempt {attempts}: chessboard not visible from this pose; resampling"
-                )
-                continue
-            if len(tracked) > 1 and not self.body_names:
-                self.logger.warning(
-                    f"attempt {attempts}: multiple bodies detected ({list(tracked.keys())}); "
-                    "set 'body_name' to disambiguate. Resampling."
+                    f"attempt {attempts}: could not capture measurement ({e}); resampling"
                 )
                 continue
 
-            try:
-                if self.use_motion_service_for_poses and self.motion is not None:
-                    arm_pose_in_frame = await self.motion.get_pose(
-                        component_name=self.arm_name,
-                        destination_frame=self.arm_name + "_origin",
-                    )
-                    measured = arm_pose_in_frame.pose
-                else:
-                    measured = await self.arm.get_end_position()
-            except Exception as e:
-                self.logger.warning(
-                    f"attempt {attempts}: could not read achieved pose ({e}); skipping"
-                )
-                continue
-
-            achieved.append(measured)
+            achieved.append(measurement["arm_pose"])
+            measurements.append(measurement)
             self.logger.info(
                 f"auto pose {len(achieved)}/{n_target} captured after {attempts} attempts "
-                "(chessboard visible)"
+                "(measurement collected)"
             )
 
         if len(achieved) < n_target:
             self.logger.warning(
                 f"auto sampling stopped after {attempts} attempts with only "
-                f"{len(achieved)}/{n_target} reachable poses"
+                f"{len(achieved)}/{n_target} valid measurements"
             )
 
         if len(achieved) < 3:
             raise Exception(
-                f"auto sampling collected only {len(achieved)} reachable poses "
+                f"auto sampling collected only {len(achieved)} valid measurements "
                 f"(need >= 3). Widen workspace_bounds or check look_at_point."
             )
 
-        return achieved
+        return achieved, measurements
 
     async def _move_arm_to_position(self, position_data, position_index, total_positions):
         """Move arm to specified position using joint control, direct pose control, or motion planning.
@@ -674,134 +721,43 @@ class HandEyeCalibration(Generic, EasyResource):
             "viam:opencv:charuco model"
         )
 
-    async def _collect_calibration_data_with_corners(self):
-        """Collect end-effector poses and target corner observations.
+    async def _collect_calibration_data(self) -> list:
+        """Visit each configured pose / joint position and capture the
+        solver-appropriate measurement there. Used by manual pose selection;
+        auto mode captures measurements during the sampling pass instead.
 
-        Works with any viam:opencv pose tracker (chessboard or ChArUco). Used
-        by the reprojection-based solver path. Returns data in the
-        OpenCV-standard convention:
-            T_be: gripper-in-base (4x4)
-            T_cw: target-in-camera (4x4) — board ≡ world for eye-in-hand
-            corners_2d_list / corners_3d_list: paired per-pose corner pixels
-                and board-frame points (a ChArUco board may detect a different
-                subset of corners per pose, so 3d points are kept per pose).
-
-        Note: ``call_go_ov2mat`` returns body-from-parent (R_eb for an arm
-        pose), so we transpose to get parent-from-body (R_be).
+        The OpenCV solver path skips positions that fail (calibrateHandEye can
+        work with whatever subset succeeds); the reprojection path aborts,
+        since a partial corner set silently degrades the refinement.
         """
+        # Use poses if available (motion planning mode), otherwise use joint positions
         positions = self.poses if self.poses else self.joint_positions
         total_positions = len(positions)
 
-        T_be_list = []
-        T_cw_list = []
-        corners_2d_list = []
-        corners_3d_list = []
-        K = None
-        dist = None
-
+        measurements = []
         for i, position in enumerate(positions):
             try:
                 await self._move_arm_to_position(position, i, total_positions)
                 await asyncio.sleep(self.sleep_seconds)
-
-                if self.use_motion_service_for_poses and self.motion is not None:
-                    arm_pose_in_frame = await self.motion.get_pose(
-                        component_name=self.arm_name,
-                        destination_frame=self.arm_name + "_origin",
-                    )
-                    arm_pose = arm_pose_in_frame.pose
-                else:
-                    arm_pose = await self.arm.get_end_position()
-
-                R_eb = call_go_ov2mat(arm_pose.o_x, arm_pose.o_y, arm_pose.o_z, arm_pose.theta)
-                if R_eb is None:
-                    raise Exception("could not convert arm orientation to rotation matrix")
-                T_be = np.eye(4)
-                T_be[:3, :3] = R_eb.T  # R_be: gripper-in-base
-                T_be[:3, 3] = [arm_pose.x, arm_pose.y, arm_pose.z]
-
-                obs = await self._request_target_observation()
-
-                # corners_2d and corners_3d are paired per pose. For a
-                # chessboard this is the full grid every time; for a ChArUco
-                # board it may be a different subset of corners each pose, so
-                # the 3d points are collected per pose rather than once.
-                corners_2d = np.asarray(obs["corners_2d"], dtype=np.float64).reshape(-1, 2)
-                corners_3d = np.asarray(obs["corners_3d"], dtype=np.float64).reshape(-1, 3)
-                if K is None:
-                    K = np.asarray(obs["K"], dtype=np.float64)
-                    dist = np.asarray(obs["dist"], dtype=np.float64).reshape(-1)
-
-                rvec = np.asarray(obs["rvec"], dtype=np.float64).reshape(3, 1)
-                tvec = np.asarray(obs["tvec"], dtype=np.float64).reshape(3)
-                R_ct, _ = cv2.Rodrigues(rvec)
-                T_cw = np.eye(4)
-                T_cw[:3, :3] = R_ct
-                T_cw[:3, 3] = tvec
-
-                T_be_list.append(T_be)
-                T_cw_list.append(T_cw)
-                corners_2d_list.append(corners_2d)
-                corners_3d_list.append(corners_3d)
-
-                self.logger.info(
-                    f"successfully collected corner observation for position {i+1}/{total_positions}"
-                )
+                measurements.append(await self._capture_measurement())
+                self.logger.info(f"successfully collected calibration data for position {i+1}/{total_positions}")
             except Exception as e:
+                if self.solver == SOLVER_OPENCV:
+                    self.logger.warning(
+                        f"skipping position {i+1}/{total_positions}: could not collect calibration data: {e}"
+                    )
+                    continue
                 error_msg = (
                     f"could not collect data for position {i+1}/{total_positions}: {e}"
                 )
                 self.logger.error(error_msg)
                 raise Exception(error_msg)
 
-        return T_be_list, T_cw_list, corners_2d_list, corners_3d_list, K, dist
-
-    async def _collect_calibration_data(self):
-        """Collect calibration data for all joint positions or poses."""
-        R_gripper2base_list = []
-        t_gripper2base_list = []
-        R_target2cam_list = []
-        t_target2cam_list = []
-
-        # Use poses if available (motion planning mode), otherwise use joint positions
-        positions = self.poses if self.poses else self.joint_positions
-        total_positions = len(positions)
-
-        for i, position in enumerate(positions):
-            try:
-                await self._move_arm_to_position(position, i, total_positions)
-                await asyncio.sleep(self.sleep_seconds)
-
-                R_base2gripper, t_base2gripper, R_cam2target, t_cam2target = await self.get_calibration_values()
-
-                # TODO: Implement eye-to-hand. This should just be changing the
-                # order/in-frame values
-
-                # OpenCV calibrateHandEye expects transposed rotations but original translation vectors
-                # Only invert rotation matrices, keep translation vectors as-is
-                R_gripper2base = R_base2gripper.T
-                t_gripper2base = t_base2gripper
-                R_target2cam = R_cam2target.T
-                t_target2cam = t_cam2target
-
-                R_gripper2base_list.append(R_gripper2base)
-                t_gripper2base_list.append(t_gripper2base)
-                R_target2cam_list.append(R_target2cam)
-                t_target2cam_list.append(t_target2cam)
-
-                self.logger.info(f"successfully collected calibration data for position {i+1}/{total_positions}")
-
-            except Exception as e:
-                self.logger.warning(
-                    f"skipping position {i+1}/{total_positions}: could not collect calibration data: {e}"
-                )
-                continue
-
         self.logger.info(
-            f"collected calibration data for {len(R_gripper2base_list)}/{total_positions} positions"
+            f"collected calibration data for {len(measurements)}/{total_positions} positions"
         )
 
-        return R_gripper2base_list, t_gripper2base_list, R_target2cam_list, t_target2cam_list
+        return measurements
 
     async def do_command(
         self,
@@ -824,22 +780,29 @@ class HandEyeCalibration(Generic, EasyResource):
                             )
                         self.logger.info(
                             f"pose_selection=auto: sampling up to {self.pose_sampling['n_poses']} "
-                            f"poses (max {self.pose_sampling['max_attempts']} attempts)"
+                            f"poses (max {self.pose_sampling['max_attempts']} attempts) "
+                            "and capturing measurements in the same pass"
                         )
-                        self.poses = await self._sample_and_move_loop(self.pose_sampling)
+                        self.poses, measurements = await self._sample_and_move_loop(self.pose_sampling)
                         self.joint_positions = []
                         auto_info = {
                             "requested_n_poses": self.pose_sampling["n_poses"],
                             "captured_n_poses": len(self.poses),
                         }
+                    else:
+                        measurements = await self._collect_calibration_data()
+
+                    # Check if we have enough measurements
+                    if len(measurements) < 3:
+                        raise Exception(f"not enough valid measurements collected. Got {len(measurements)}, need at least 3. Make sure the pose tracker can see exactly one target in each calibration position.")
+
                     if self.solver == SOLVER_OPENCV:
-                        R_gripper2base_list, t_gripper2base_list, R_target2cam_list, t_target2cam_list = await self._collect_calibration_data()
+                        R_gripper2base_list = [m["R_gripper2base"] for m in measurements]
+                        t_gripper2base_list = [m["t_gripper2base"] for m in measurements]
+                        R_target2cam_list = [m["R_target2cam"] for m in measurements]
+                        t_target2cam_list = [m["t_target2cam"] for m in measurements]
 
-                        # Check if we have enough measurements
-                        if len(R_gripper2base_list) < 3:
-                            raise Exception(f"not enough valid measurements collected. Got {len(R_gripper2base_list)}, need at least 3. Make sure the pose tracker can see exactly one target in each calibration position.")
-
-                        self.logger.info(f"collected {len(R_gripper2base_list)} measurements, running calibration...")
+                        self.logger.info(f"collected {len(measurements)} measurements, running calibration...")
 
                         R_cam2gripper, t_cam2gripper = cv2.calibrateHandEye(
                             R_gripper2base=R_gripper2base_list,
@@ -851,15 +814,14 @@ class HandEyeCalibration(Generic, EasyResource):
                         if R_cam2gripper is None or t_cam2gripper is None:
                             raise Exception("could not solve calibration")
                     else:
-                        # Reprojection-based path: collect corner observations and use
+                        # Reprojection-based path: corner observations in
                         # OpenCV-standard conventions throughout.
-                        T_be_list, T_cw_list, corners_2d_list, corners_3d_list, K, dist = (
-                            await self._collect_calibration_data_with_corners()
-                        )
-                        if len(T_be_list) < 3:
-                            raise Exception(
-                                f"not enough valid measurements collected. Got {len(T_be_list)}, need at least 3."
-                            )
+                        T_be_list = [m["T_be"] for m in measurements]
+                        T_cw_list = [m["T_cw"] for m in measurements]
+                        corners_2d_list = [m["corners_2d"] for m in measurements]
+                        corners_3d_list = [m["corners_3d"] for m in measurements]
+                        K = measurements[0]["K"]
+                        dist = measurements[0]["dist"]
                         self.logger.info(
                             f"collected {len(T_be_list)} corner observations, "
                             f"bootstrapping with cv2.calibrateHandEye({self.method})"

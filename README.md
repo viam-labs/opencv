@@ -239,7 +239,7 @@ When `pose_selection` is `"auto"`, the service randomly generates and visits pos
 
 The roll randomization is what gives the resulting pose set good rotation-axis diversity. Pure look-at without roll would cluster rotation axes in a plane and produce ill-conditioned calibrations (see `compute_pose_diversity` below).
 
-After moving to each candidate the service verifies the chessboard is actually detected before counting the pose; unreachable poses, planning failures, and poses where the board is out of view are silently skipped and resampled, up to `max_attempts` total attempts.
+After moving to each candidate the service captures the calibration measurement (arm pose + board observation) right there — sampling and data collection are a single pass, so the arm never re-visits poses. Unreachable poses, planning failures, and poses where the board is out of view are silently skipped and resampled, up to `max_attempts` total attempts.
 
 **Assumption**: the camera's optical axis is roughly aligned with the end-effector +Z. The chessboard tracker is forgiving as long as corners are in frame, but if your mount is at a wild angle you may need to widen `workspace_bounds` so enough candidates land with the target in view.
 
