@@ -375,13 +375,13 @@ class HandEyeCalibration(Generic, EasyResource):
         """
         arm_pose = await self._read_arm_pose()
 
-        R_gripper_in_base = call_go_ov2mat(
+        R_base2gripper = call_go_ov2mat(
             arm_pose.o_x,
             arm_pose.o_y,
             arm_pose.o_z,
             arm_pose.theta
         )
-        t_gripper_in_base = np.array([[arm_pose.x], [arm_pose.y], [arm_pose.z]], dtype=np.float64)
+        t_base2gripper = np.array([[arm_pose.x], [arm_pose.y], [arm_pose.z]], dtype=np.float64)
 
         # Get pose from the tracker (AprilTag, chessboard corner, etc.)
         tracked_poses: Dict[str, PoseInFrame] = await self._with_camera_retry(
@@ -404,22 +404,22 @@ class HandEyeCalibration(Generic, EasyResource):
             self.logger.warning(multiple_bodies_error_msg)
             raise Exception(multiple_bodies_error_msg)
         tracked_pose: Pose = list(tracked_poses.values())[0].pose
-        R_target_in_cam = call_go_ov2mat(
+        R_cam2target = call_go_ov2mat(
             tracked_pose.o_x,
             tracked_pose.o_y,
             tracked_pose.o_z,
             tracked_pose.theta
         )
-        t_target_in_cam = np.array([[tracked_pose.x], [tracked_pose.y], [tracked_pose.z]], dtype=np.float64)
+        t_cam2target = np.array([[tracked_pose.x], [tracked_pose.y], [tracked_pose.z]], dtype=np.float64)
 
         # TODO: Implement eye-to-hand. This should just be changing the
         # order/in-frame values
         return {
             "arm_pose": arm_pose,
-            "R_gripper2base": R_gripper_in_base,
-            "t_gripper2base": t_gripper_in_base,
-            "R_target2cam": R_target_in_cam,
-            "t_target2cam": t_target_in_cam,
+            "R_gripper2base": R_base2gripper,
+            "t_gripper2base": t_base2gripper,
+            "R_target2cam": R_cam2target,
+            "t_target2cam": t_cam2target,
         }
 
     async def _capture_corner_measurement(self) -> dict:
@@ -434,11 +434,11 @@ class HandEyeCalibration(Generic, EasyResource):
         """
         arm_pose = await self._read_arm_pose()
 
-        R_gripper_in_base = call_go_ov2mat(arm_pose.o_x, arm_pose.o_y, arm_pose.o_z, arm_pose.theta)
-        if R_gripper_in_base is None:
+        R_eb = call_go_ov2mat(arm_pose.o_x, arm_pose.o_y, arm_pose.o_z, arm_pose.theta)
+        if R_eb is None:
             raise Exception("could not convert arm orientation to rotation matrix")
         T_be = np.eye(4)
-        T_be[:3, :3] = R_gripper_in_base
+        T_be[:3, :3] = R_eb
         T_be[:3, 3] = [arm_pose.x, arm_pose.y, arm_pose.z]
 
         obs = await self._request_target_observation()
@@ -893,16 +893,16 @@ class HandEyeCalibration(Generic, EasyResource):
                     # cv2.calibrateHandEye returns (R_cam2gripper, t_cam2gripper), i.e. the
                     # camera's mounting orientation and position in the gripper frame — which
                     # is exactly what the Viam frame system wants.
-                    t_cam_in_gripper = t_cam2gripper.reshape(3, 1)
+                    t_gripper2cam = t_cam2gripper.reshape(3, 1)
 
                     orientation_result = call_go_mat2ov(R_cam2gripper)
                     if orientation_result is None:
                         raise Exception("failed to convert rotation matrix to orientation vector")
                     ox, oy, oz, theta = orientation_result
 
-                    x = float(t_cam_in_gripper[0][0])
-                    y = float(t_cam_in_gripper[1][0])
-                    z = float(t_cam_in_gripper[2][0])
+                    x = float(t_gripper2cam[0][0])
+                    y = float(t_gripper2cam[1][0])
+                    z = float(t_gripper2cam[2][0])
 
                     viam_pose = Pose(x=x, y=y, z=z, o_x=ox, o_y=oy, o_z=oz, theta=theta)
 
