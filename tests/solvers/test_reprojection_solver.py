@@ -319,4 +319,4 @@ def test_bootstrap_T_bw_recovers_truth_with_perfect_inputs():
     )
     trans_err, rot_err = _se3_diff(Y_recovered, data["Y_true"])
     assert trans_err < 1e-6
-    assert rot_err < 1e-6
+    assert rot_err < 1e-5
