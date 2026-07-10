@@ -264,10 +264,8 @@ class BaseTargetTracker(abc.ABC):
     ) -> Dict[str, PoseInFrame]:
         obs = await self._detect_observation()
 
-        # Transpose needed due to frame convention mismatch:
-        # OpenCV solvePnP returns object -> camera transform, but Viam expects camera -> object transform.
-        # All corners share the same orientation (they're on the same rigid planar board)
-        ox, oy, oz, theta = call_go_mat2ov(obs.R.T)
+        # obs.R = R_cam_from_target from solvePnP; the corners share this orientation.
+        ox, oy, oz, theta = call_go_mat2ov(obs.R)
         self.logger.debug(f"Translated rotation matrix to orientation vector with values ox={ox}, oy={oy}, oz={oz}, theta={theta}")
 
         corner_poses = {}

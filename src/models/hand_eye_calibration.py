@@ -372,13 +372,9 @@ class HandEyeCalibration(Generic, EasyResource):
         """Capture one hand-eye measurement at the current arm position for the
         OpenCV solver path: gripper-in-base from the arm, target-in-camera from
         the pose tracker. Raises if the tracker does not resolve exactly one body.
-
-        OpenCV calibrateHandEye expects transposed rotations but original
-        translation vectors, so only the rotation matrices are inverted here.
         """
         arm_pose = await self._read_arm_pose()
 
-        # Get rotation matrix: base -> gripper
         R_base2gripper = call_go_ov2mat(
             arm_pose.o_x,
             arm_pose.o_y,
@@ -407,7 +403,6 @@ class HandEyeCalibration(Generic, EasyResource):
             )
             self.logger.warning(multiple_bodies_error_msg)
             raise Exception(multiple_bodies_error_msg)
-        # Get rotation matrix: camera -> target
         tracked_pose: Pose = list(tracked_poses.values())[0].pose
         R_cam2target = call_go_ov2mat(
             tracked_pose.o_x,
@@ -421,9 +416,9 @@ class HandEyeCalibration(Generic, EasyResource):
         # order/in-frame values
         return {
             "arm_pose": arm_pose,
-            "R_gripper2base": R_base2gripper.T,
+            "R_gripper2base": R_base2gripper,
             "t_gripper2base": t_base2gripper,
-            "R_target2cam": R_cam2target.T,
+            "R_target2cam": R_cam2target,
             "t_target2cam": t_cam2target,
         }
 
@@ -436,9 +431,6 @@ class HandEyeCalibration(Generic, EasyResource):
                 points (a ChArUco board may detect a different subset of
                 corners per pose, so 3d points are kept per pose).
         Raises if the target is not detected.
-
-        Note: ``call_go_ov2mat`` returns body-from-parent (R_eb for an arm
-        pose), so we transpose to get parent-from-body (R_be).
         """
         arm_pose = await self._read_arm_pose()
 
@@ -446,7 +438,7 @@ class HandEyeCalibration(Generic, EasyResource):
         if R_eb is None:
             raise Exception("could not convert arm orientation to rotation matrix")
         T_be = np.eye(4)
-        T_be[:3, :3] = R_eb.T  # R_be: gripper-in-base
+        T_be[:3, :3] = R_eb
         T_be[:3, 3] = [arm_pose.x, arm_pose.y, arm_pose.z]
 
         obs = await self._request_target_observation()
@@ -480,13 +472,8 @@ class HandEyeCalibration(Generic, EasyResource):
     def _transform_to_viam_pose(self, T: np.ndarray) -> Pose:
         """Convert a 4x4 gripper-in-base transform (columns of T[:3,:3] are
         gripper axes in base) to a Viam ``Pose``.
-
-        ``call_go_mat2ov`` expects body-from-parent (R_eb), which is the
-        transpose of the gripper-in-base rotation produced by the sampler.
         """
-        R_base_from_gripper = T[:3, :3]
-        R_eb = R_base_from_gripper.T
-        ov = call_go_mat2ov(R_eb)
+        ov = call_go_mat2ov(T[:3, :3])
         if ov is None:
             raise Exception("failed to convert rotation matrix to orientation vector")
         ox, oy, oz, theta = ov
@@ -902,18 +889,17 @@ class HandEyeCalibration(Generic, EasyResource):
                             f"r_resid={r['rotation_residual_deg']:.3f}deg"
                         )
 
-                    # Convert OpenCV output to frame system format
-                    # Transpose rotation but keep translation as-is (consistent with input handling)
-                    R_gripper2cam = R_cam2gripper.T
+                    # Convert OpenCV output to frame system format.
+                    # cv2.calibrateHandEye returns (R_cam2gripper, t_cam2gripper), i.e. the
+                    # camera's mounting orientation and position in the gripper frame — which
+                    # is exactly what the Viam frame system wants.
                     t_gripper2cam = t_cam2gripper.reshape(3, 1)
-                    
-                    # Rotation matrix to orientation vector
-                    orientation_result = call_go_mat2ov(R_gripper2cam)
+
+                    orientation_result = call_go_mat2ov(R_cam2gripper)
                     if orientation_result is None:
                         raise Exception("failed to convert rotation matrix to orientation vector")
                     ox, oy, oz, theta = orientation_result
-                    
-                    # Translation
+
                     x = float(t_gripper2cam[0][0])
                     y = float(t_gripper2cam[1][0])
                     z = float(t_gripper2cam[2][0])
