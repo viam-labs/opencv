@@ -21,11 +21,13 @@ from utils.utils import call_go_ov2mat, call_go_mat2ov
 try:
     from diagnostics.pose_diversity import compute_pose_diversity
     from solvers.reprojection_solver import refine_handeye
+    from solvers.robust_init import robust_bootstrap_handeye
     from active_calibration.pose_sampler import generate_pose_set, sample_transform
 except ModuleNotFoundError:
     # when running as local module with run.sh
     from ..diagnostics.pose_diversity import compute_pose_diversity
     from ..solvers.reprojection_solver import refine_handeye
+    from ..solvers.robust_init import robust_bootstrap_handeye
     from ..active_calibration.pose_sampler import generate_pose_set, sample_transform
 
 CALIBS = ["eye-in-hand", "eye-to-hand"]
@@ -454,17 +456,40 @@ class HandEyeCalibration(Generic, EasyResource):
         corners_2d = np.asarray(obs["corners_2d"], dtype=np.float64).reshape(-1, 2)
         corners_3d = np.asarray(obs["corners_3d"], dtype=np.float64).reshape(-1, 3)
 
-        rvec = np.asarray(obs["rvec"], dtype=np.float64).reshape(3, 1)
-        tvec = np.asarray(obs["tvec"], dtype=np.float64).reshape(3)
-        R_ct, _ = cv2.Rodrigues(rvec)
-        T_cw = np.eye(4)
-        T_cw[:3, :3] = R_ct
-        T_cw[:3, 3] = tvec
+        def to_T_cw(rvec_raw, tvec_raw) -> np.ndarray:
+            rvec = np.asarray(rvec_raw, dtype=np.float64).reshape(3, 1)
+            tvec = np.asarray(tvec_raw, dtype=np.float64).reshape(3)
+            R_ct, _ = cv2.Rodrigues(rvec)
+            T = np.eye(4)
+            T[:3, :3] = R_ct
+            T[:3, 3] = tvec
+            return T
+
+        T_cw = to_T_cw(obs["rvec"], obs["tvec"])
+
+        # Planar PnP has a two-fold ambiguity; trackers report every candidate
+        # branch so the solve can pick the one consistent with the arm chain.
+        # Fall back to the single best pose for trackers that predate this.
+        rvec_cands = obs.get("rvec_candidates")
+        tvec_cands = obs.get("tvec_candidates")
+        if rvec_cands and tvec_cands and len(rvec_cands) == len(tvec_cands):
+            T_cw_candidates = [to_T_cw(r, t) for r, t in zip(rvec_cands, tvec_cands)]
+            reproj_errs = obs.get("reproj_err_candidates")
+            pnp_reproj_errs = (
+                [float(e) for e in reproj_errs]
+                if reproj_errs and len(reproj_errs) == len(T_cw_candidates)
+                else None
+            )
+        else:
+            T_cw_candidates = [T_cw]
+            pnp_reproj_errs = None
 
         return {
             "arm_pose": arm_pose,
             "T_be": T_be,
             "T_cw": T_cw,
+            "T_cw_candidates": T_cw_candidates,
+            "pnp_reproj_errs": pnp_reproj_errs,
             "corners_2d": corners_2d,
             "corners_3d": corners_3d,
             "K": np.asarray(obs["K"], dtype=np.float64),
@@ -771,6 +796,7 @@ class HandEyeCalibration(Generic, EasyResource):
             match key:
                 case "run_calibration":
                     refinement_info = None
+                    bootstrap_info = None
                     auto_info = None
                     if self.pose_selection == POSE_SELECTION_AUTO:
                         if self.pose_sampling is None:
@@ -802,6 +828,8 @@ class HandEyeCalibration(Generic, EasyResource):
                         R_target2cam_list = [m["R_target2cam"] for m in measurements]
                         t_target2cam_list = [m["t_target2cam"] for m in measurements]
 
+                        station_numbers = list(range(1, len(measurements) + 1))
+
                         self.logger.info(f"collected {len(measurements)} measurements, running calibration...")
 
                         R_cam2gripper, t_cam2gripper = cv2.calibrateHandEye(
@@ -817,30 +845,74 @@ class HandEyeCalibration(Generic, EasyResource):
                         # Reprojection-based path: corner observations in
                         # OpenCV-standard conventions throughout.
                         T_be_list = [m["T_be"] for m in measurements]
-                        T_cw_list = [m["T_cw"] for m in measurements]
                         corners_2d_list = [m["corners_2d"] for m in measurements]
                         corners_3d_list = [m["corners_3d"] for m in measurements]
                         K = measurements[0]["K"]
                         dist = measurements[0]["dist"]
                         self.logger.info(
                             f"collected {len(T_be_list)} corner observations, "
-                            f"bootstrapping with cv2.calibrateHandEye({self.method})"
+                            f"bootstrapping with cv2.calibrateHandEye({self.method}) "
+                            "+ robust branch selection"
                         )
 
-                        # Bootstrap with cv2.calibrateHandEye in standard convention.
-                        # R_be = T_be[:3,:3] (gripper-in-base), R_ct = T_cw[:3,:3] (target-in-cam).
-                        R_g2b = [T[:3, :3] for T in T_be_list]
-                        t_g2b = [T[:3, 3].reshape(3, 1) for T in T_be_list]
-                        R_t2c = [T[:3, :3] for T in T_cw_list]
-                        t_t2c = [T[:3, 3].reshape(3, 1) for T in T_cw_list]
-                        R_c2g_init, t_c2g_init = cv2.calibrateHandEye(
-                            R_g2b, t_g2b, R_t2c, t_t2c, method=getattr(cv2, self.method)
+                        # Bootstrap with PnP-branch disambiguation (planar
+                        # two-fold ambiguity) and station outlier rejection, so
+                        # a few flipped or bad stations can't poison X_init and
+                        # strand the refinement in the wrong basin.
+                        boot = robust_bootstrap_handeye(
+                            T_be_list,
+                            [m["T_cw_candidates"] for m in measurements],
+                            [m["pnp_reproj_errs"] for m in measurements],
+                            method=getattr(cv2, self.method),
                         )
-                        X_init = np.eye(4)
-                        X_init[:3, :3] = R_c2g_init
-                        X_init[:3, 3] = t_c2g_init.flatten()
+                        X_init = boot["X_init"]
 
-                        self.logger.info("refining with reprojection-error solver...")
+                        if boot["ambiguous_indices"]:
+                            self.logger.info(
+                                f"{len(boot['ambiguous_indices'])} station(s) had ambiguous PnP views "
+                                f"(poses {[i + 1 for i in boot['ambiguous_indices']]}); "
+                                "branches chosen by arm-chain consistency"
+                            )
+                        if boot["branch_corrections"]:
+                            self.logger.info(
+                                f"corrected flipped PnP branch on poses "
+                                f"{[i + 1 for i in boot['branch_corrections']]}"
+                            )
+                        for r in boot["rejected"]:
+                            self.logger.warning(
+                                f"pose {r['station'] + 1} rejected as outlier: "
+                                f"target-in-base deviates {r['translation_deviation_mm']:.1f}mm / "
+                                f"{r['rotation_deviation_deg']:.1f}deg from consensus"
+                            )
+
+                        kept = boot["kept_indices"]
+                        bootstrap_info = {
+                            "n_stations": len(T_be_list),
+                            "n_kept": len(kept),
+                            "ambiguous_poses": [i + 1 for i in boot["ambiguous_indices"]],
+                            "branch_corrections": [i + 1 for i in boot["branch_corrections"]],
+                            "rejected": [
+                                {
+                                    "pose_index": r["station"] + 1,
+                                    "translation_deviation_mm": r["translation_deviation_mm"],
+                                    "rotation_deviation_deg": r["rotation_deviation_deg"],
+                                }
+                                for r in boot["rejected"]
+                            ],
+                        }
+
+                        # Refine on the surviving stations only, seeding the
+                        # board pose from the bootstrap consensus rather than
+                        # blindly from station 0.
+                        T_cw_list = [boot["selected_T_cw"][i] for i in kept]
+                        T_be_list = [T_be_list[i] for i in kept]
+                        corners_2d_list = [corners_2d_list[i] for i in kept]
+                        corners_3d_list = [corners_3d_list[i] for i in kept]
+                        station_numbers = [i + 1 for i in kept]
+
+                        self.logger.info(
+                            f"refining with reprojection-error solver on {len(kept)} station(s)..."
+                        )
                         refinement = refine_handeye(
                             T_be_list,
                             corners_2d_list,
@@ -848,7 +920,7 @@ class HandEyeCalibration(Generic, EasyResource):
                             K,
                             dist,
                             X_init=X_init,
-                            T_cw_list=T_cw_list,
+                            Y_init=boot["Y_init"],
                         )
                         X_refined = refinement["X_refined"]
                         R_cam2gripper = X_refined[:3, :3]
@@ -856,6 +928,7 @@ class HandEyeCalibration(Generic, EasyResource):
                         refinement_info = {
                             "rmse_pixels": refinement["rmse_pixels"],
                             "per_pose_rmse_pixels": refinement["per_pose_rmse_pixels"],
+                            "pose_indices": station_numbers,
                             "iterations": refinement["n_iterations"],
                             "success": refinement["success"],
                             "message": refinement["message"],
@@ -869,15 +942,16 @@ class HandEyeCalibration(Generic, EasyResource):
                         for idx, r in enumerate(refinement["per_pose_rmse_pixels"]):
                             if median_rmse > 0 and r > 3.0 * median_rmse:
                                 self.logger.warning(
-                                    f"pose {idx+1}: per-pose rmse={r:.3f}px > 3× median ({median_rmse:.3f}px) — possible outlier"
+                                    f"pose {station_numbers[idx]}: per-pose rmse={r:.3f}px > 3× median ({median_rmse:.3f}px) — possible outlier"
                                 )
 
                         # For the legacy per-pose residual summary, reconstruct the
-                        # rotation/translation lists in the convention that helper expects.
-                        R_gripper2base_list = R_g2b
-                        t_gripper2base_list = t_g2b
-                        R_target2cam_list = R_t2c
-                        t_target2cam_list = t_t2c
+                        # rotation/translation lists (kept stations, chain-consistent
+                        # PnP branches) in the convention that helper expects.
+                        R_gripper2base_list = [T[:3, :3] for T in T_be_list]
+                        t_gripper2base_list = [T[:3, 3].reshape(3, 1) for T in T_be_list]
+                        R_target2cam_list = [T[:3, :3] for T in T_cw_list]
+                        t_target2cam_list = [T[:3, 3].reshape(3, 1) for T in T_cw_list]
 
                     # Per-pose residuals to identify outlier poses
                     per_pose_residuals, residual_summary = self._compute_per_pose_residuals(
@@ -888,6 +962,11 @@ class HandEyeCalibration(Generic, EasyResource):
                         R_cam2gripper,
                         t_cam2gripper,
                     )
+                    # Residuals are indexed by original capture order; on the
+                    # reprojection path rejected stations are gone, so relabel
+                    # each entry with its original pose number.
+                    for resid, pose_number in zip(per_pose_residuals, station_numbers):
+                        resid["pose_index"] = pose_number
 
                     self.logger.info(
                         f"Residual summary: translation mean={residual_summary['translation_mean_mm']:.3f}mm "
@@ -949,6 +1028,8 @@ class HandEyeCalibration(Generic, EasyResource):
                     }
                     if refinement_info is not None:
                         response["refinement"] = refinement_info
+                    if bootstrap_info is not None:
+                        response["bootstrap"] = bootstrap_info
                     if auto_info is not None:
                         response["auto_sampling"] = auto_info
                     resp["run_calibration"] = response

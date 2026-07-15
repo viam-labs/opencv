@@ -35,6 +35,18 @@ The following attributes are available for this model:
 | `square_size_mm`    | int    | Required  | Physical size of a square in the chessboard pattern, in mm.                                                                                                                                                       |
 | `camera_intrinsics` | dict   | Optional  | Override the camera's intrinsics rather than fetching them from `camera.do_command({"get_camera_params": None})`. Requires both `K` (with `fx`, `fy`, `cx`, `cy`) and `dist` (with `k1`, `k2`, `k3`, `p1`, `p2`). |
 
+> **Distortion parameter ordering.** Camera modules report distortion as an
+> unstructured `(model, parameters)` pair and do not agree on parameter order:
+> the rdk structs list radials first (`k1, k2, k3, p1, p2`), OpenCV interleaves
+> (`k1, k2, p1, p2, k3`), and third-party modules ship both. Because a wrong
+> ordering silently biases every PnP depth (a radial coefficient lands in a
+> tangential slot), the trackers verify the ordering empirically on the first
+> target detection — each plausible interpretation is scored by single-view
+> reprojection error and the winner is cached. A log line reports the verdict;
+> a warning means the camera module's ordering did not match its model name.
+> Config-supplied `camera_intrinsics` names each coefficient explicitly and is
+> always used as-is.
+
 #### Pose Tracker Example Configuration
 
 ```json

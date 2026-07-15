@@ -1,4 +1,5 @@
 import cv2
+import numpy as np
 
 from typing import (Any, ClassVar, Dict, Mapping)
 
@@ -94,6 +95,11 @@ class Charuco(BaseTargetTracker, PoseTracker, EasyResource):
 
         objp, imgp = match_object_points(self.board, charuco_corners, charuco_ids)
 
+        # Camera modules don't reliably order distortion parameters the way
+        # their model name implies; verify the ordering against this view's
+        # corners before trusting it (cached after the first verdict).
+        dist = self._resolve_distortion(K, dist, objp, imgp)
+
         # ChArUco corners are coplanar (z=0 in the board frame). For a planar
         # target the default SOLVEPNP_ITERATIVE solver is prone to the two-fold
         # pose ambiguity: on oblique or partial views it can return the
@@ -124,4 +130,7 @@ class Charuco(BaseTargetTracker, PoseTracker, EasyResource):
             rvec=rvec,
             tvec=tvec,
             R=R,
+            rvec_candidates=list(rvecs),
+            tvec_candidates=list(tvecs),
+            reproj_err_candidates=[float(e) for e in np.asarray(reproj_errs).flatten()],
         )

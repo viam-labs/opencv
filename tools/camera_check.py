@@ -150,11 +150,27 @@ async def main():
                 err = float(np.sqrt(np.mean((proj.reshape(-1, 2) - c2d) ** 2)))
                 print(f"\n[tracker] {c3d.shape[0]} corners, "
                       f"per-view PnP reprojection error = {err:.2f}px")
-                if err > 3:
+                # The tracker's dist is in OpenCV order: (k1, k2, p1, p2, k3, ...).
+                # Real tangential coefficients are ~1e-3; a value of ~0.1+ in a
+                # p slot almost always means a radial coefficient landed there
+                # via a parameter-ordering bug (Viam models list radials first).
+                if dist.size >= 4 and (abs(dist[2]) > 0.02 or abs(dist[3]) > 0.02):
+                    ok = False
+                    print(f"  [FAIL] implausibly large tangential distortion "
+                          f"(p1={dist[2]:.4f}, p2={dist[3]:.4f}) -> likely a "
+                          f"distortion parameter ORDERING bug between the "
+                          f"camera's model and OpenCV's (k1, k2, p1, p2, k3) "
+                          f"convention.")
+                if err > 1.5:
                     ok = False
                     print("  [FAIL] high single-view reprojection error -> the "
                           "image and intrinsics are inconsistent (camera issue), "
-                          "not the hand-eye math.")
+                          "not the hand-eye math. A healthy setup fits well "
+                          "under 0.5px.")
+                elif err > 0.75:
+                    print("  [warn] single-view reprojection error is above the "
+                          "~0.5px a healthy setup achieves; intrinsics or "
+                          "distortion handling may be slightly off.")
                 else:
                     print("  [ok] single view fits its own pose -> intrinsics & "
                           "corners are self-consistent for this frame.")

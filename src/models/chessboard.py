@@ -1,4 +1,5 @@
 import cv2
+import numpy as np
 
 from typing import (Any, ClassVar, Dict, Mapping)
 
@@ -64,10 +65,29 @@ class Chessboard(BaseTargetTracker, PoseTracker, EasyResource):
 
         objp = generate_object_points(tuple(self.pattern_size), self.square_size)
 
-        success, rvec, tvec = cv2.solvePnP(objp, corners, K, dist)
-        if not success:
+        # Camera modules don't reliably order distortion parameters the way
+        # their model name implies; verify the ordering against this view's
+        # corners before trusting it (cached after the first verdict).
+        dist = self._resolve_distortion(K, dist, objp, corners)
+
+        # Chessboard corners are coplanar (z=0 in the board frame), so the
+        # default SOLVEPNP_ITERATIVE solver is subject to the planar two-fold
+        # pose ambiguity and can return the mirror-flipped pose — especially on
+        # near-frontal views, where both branches fit the pixels almost equally
+        # well. SOLVEPNP_IPPE is purpose-built for coplanar points and returns
+        # both candidates sorted by reprojection error; we report the best one
+        # here and expose all candidates so downstream consumers (hand-eye
+        # calibration) can disambiguate using the arm chain.
+        n_solutions, rvecs, tvecs, reproj_errs = cv2.solvePnPGeneric(
+            objp, corners, K, dist, flags=cv2.SOLVEPNP_IPPE
+        )
+        if n_solutions < 1:
             raise Exception("Could not solve PnP for chessboard")
-        self.logger.debug(f"Solved PnP rvec={rvec.flatten()} tvec={tvec.flatten()}")
+        rvec, tvec = rvecs[0], tvecs[0]
+        self.logger.debug(
+            f"Solved PnP ({n_solutions} candidate(s), best reproj_err="
+            f"{float(reproj_errs[0]):.3f}px) rvec={rvec.flatten()} tvec={tvec.flatten()}"
+        )
 
         R, _ = cv2.Rodrigues(rvec)
         # A chessboard is always fully detected and ordered, so corner ids are 0..N-1.
@@ -80,4 +100,7 @@ class Chessboard(BaseTargetTracker, PoseTracker, EasyResource):
             rvec=rvec,
             tvec=tvec,
             R=R,
+            rvec_candidates=list(rvecs),
+            tvec_candidates=list(tvecs),
+            reproj_err_candidates=[float(e) for e in np.asarray(reproj_errs).flatten()],
         )
