@@ -5,6 +5,7 @@ run:
   deadline: 900s
   modules-download-mode: readonly
   tests: true
+  go: "1.26"
 linters:
   enable-all: true
   disable:
@@ -69,7 +70,6 @@ linters-settings:
       - default
       - prefix(github.com/viam-labs/opencv)
   gofumpt:
-    lang-version: "1.26"
     extra-rules: true
   govet:
     enable-all: true
