@@ -42,6 +42,7 @@ jobs:
         uses: golangci/golangci-lint-action@v6
         with:
           version: v1.62.2
+          install-mode: goinstall
           args: --config=./etc/golangci.yaml --timeout=10m
 
       - name: Test
