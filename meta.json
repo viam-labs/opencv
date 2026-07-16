@@ -32,7 +32,7 @@
   ],
   "applications": null,
   "markdown_link": "README.md",
-  "entrypoint": "dist/main",
+  "entrypoint": "bin/opencv-module",
   "first_run": "",
   "build": {
     "build": "./build.sh",

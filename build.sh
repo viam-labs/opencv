@@ -1,27 +1,22 @@
 #!/bin/sh
+set -e
 cd `dirname $0`
 
-# Create a virtual environment to run our code
 VENV_NAME="venv"
 PYTHON="$VENV_NAME/bin/python"
 
-if ! $PYTHON -m pip install pyinstaller -Uqq; then
-    exit 1
-fi
+$PYTHON -m pip install pyinstaller -Uqq
 
-# Build the Go binary
 echo "Building Go utils..."
-cd go_utils
-go build -o go_utils main.go
-if [ $? -ne 0 ]; then
-    echo "Failed to build Go binary"
-    exit 1
-fi
-cd ..
+(cd go_utils && go build -o go_utils main.go)
 
-# Copy the Go binary to a location where PyInstaller can find it
-mkdir -p dist
+mkdir -p dist bin
 cp go_utils/go_utils .
 
-$PYTHON -m PyInstaller --onefile --hidden-import="googleapiclient" --add-binary="./go_utils:." src/main.py
-tar -czvf dist/archive.tar.gz meta.json ./dist/main
+echo "Building Python auxiliary..."
+$PYTHON -m PyInstaller --onefile --name main --hidden-import="googleapiclient" --add-binary="./go_utils:." src/module_server.py
+
+echo "Building Go module entrypoint..."
+go build -o bin/opencv-module ./cmd/module
+
+tar -czvf dist/archive.tar.gz meta.json bin/opencv-module dist/main

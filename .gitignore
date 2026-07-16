@@ -172,6 +172,10 @@ reload-*/
 
 # Go binary
 go_utils/go_utils
+bin/
+
+# Local planning docs (not shipped upstream)
+/docs/
 
 # Images in script directory
 *.jpg
