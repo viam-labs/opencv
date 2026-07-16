@@ -15,13 +15,10 @@ import (
 	"go.viam.com/test"
 )
 
-// newTestEndpoint pairs two Endpoints with io.Pipe so tests can exercise
-// bidirectional traffic without a subprocess. Returns (local, remote, shutdown).
 func newTestEndpoint(t *testing.T) (*Endpoint, *Endpoint, func()) {
 	t.Helper()
-	// l2r: local writes → remote reads
+	// l2r: local writes → remote reads. r2l: reverse. Easy to invert by accident.
 	l2rReader, l2rWriter := io.Pipe()
-	// r2l: remote writes → local reads
 	r2lReader, r2lWriter := io.Pipe()
 
 	local := NewEndpoint(logging.NewTestLogger(t), r2lReader, l2rWriter, 0)
@@ -34,8 +31,6 @@ func newTestEndpoint(t *testing.T) (*Endpoint, *Endpoint, func()) {
 	return local, remote, shutdown
 }
 
-// serveFrom pairs an Endpoint with a bare-frame fake peer for tests where we
-// want direct control over what the "server" writes back.
 func serveFrom(t *testing.T, handle func(msg message) message) (*Endpoint, func()) {
 	t.Helper()
 	serverReadFromClient, clientWriteToServer := io.Pipe()
@@ -55,6 +50,8 @@ func serveFrom(t *testing.T, handle func(msg message) message) (*Endpoint, func(
 			if err := json.Unmarshal(body, &req); err != nil {
 				return
 			}
+			// Handler runs in its own goroutine so a blocking handler (e.g.
+			// simulating "server never responds") doesn't stall shutdown.
 			go func(req message) {
 				respCh := make(chan message, 1)
 				go func() { respCh <- handle(req) }()
@@ -122,6 +119,7 @@ func TestCallRoundTrip(t *testing.T) {
 }
 
 func TestCallConcurrentCorrelation(t *testing.T) {
+	// Delays are intentionally out of order to guarantee out-of-order responses.
 	client, shutdown := serveFrom(t, func(req message) message {
 		var p struct {
 			DelayMs int `json:"delay_ms"`
@@ -291,7 +289,6 @@ func TestBackpressureBoundsInflight(t *testing.T) {
 	cr, sw := io.Pipe()
 	client := NewEndpoint(logging.NewTestLogger(t), cr, cw, maxOut)
 
-	// Drain client writes but never respond, so calls stay pending.
 	go func() {
 		buf := make([]byte, 4096)
 		for {
@@ -301,14 +298,12 @@ func TestBackpressureBoundsInflight(t *testing.T) {
 		}
 	}()
 
-	// Fire maxOut calls that acquire the semaphore and block.
 	for i := 0; i < maxOut; i++ {
 		go func() { _, _ = client.Call(context.Background(), "block", nil) }()
 	}
-	// Let the acquires settle so the semaphore is full.
 	time.Sleep(50 * time.Millisecond)
 
-	// One more Call should fail its own context deadline while waiting for a slot.
+	// One more Call should hit its own deadline waiting for a semaphore slot.
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	_, err := client.Call(ctx, "extra", nil)

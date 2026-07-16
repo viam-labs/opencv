@@ -17,13 +17,10 @@ import (
 const (
 	jsonRPCVersion = "2.0"
 
-	// MaxFrameSize caps the size of an incoming JSON-RPC frame. Guards against
-	// a misbehaving peer advertising a huge Content-Length and OOMing us.
+	// MaxFrameSize caps incoming frames so a misbehaving peer advertising a
+	// huge Content-Length can't OOM us.
 	MaxFrameSize = 16 * 1024 * 1024
 
-	// DefaultMaxOutstanding is the default cap on in-flight outgoing calls per
-	// endpoint. Bounds the pending map so a slow or hung peer can't grow it
-	// without limit.
 	DefaultMaxOutstanding = 32
 )
 
@@ -36,8 +33,6 @@ type message struct {
 	Error   *RPCError       `json:"error,omitempty"`
 }
 
-// RPCError is the JSON-RPC 2.0 error object. Data carries a structured `kind`
-// field callers use to branch (e.g. "plan_infeasible" vs "arm_halted").
 type RPCError struct {
 	Code    int             `json:"code"`
 	Message string          `json:"message"`
@@ -61,14 +56,10 @@ func (e *RPCError) Kind() string {
 	return payload.Kind
 }
 
-// Handler serves an incoming JSON-RPC request. Return a non-nil *RPCError to
-// signal a structured failure; returning a Go error is a bug (use RPCError).
+// Handler serves an incoming request. Return a non-nil *RPCError for a
+// structured failure; returning a Go error is not supported.
 type Handler func(ctx context.Context, params json.RawMessage) (json.RawMessage, *RPCError)
 
-// Endpoint is a bidirectional JSON-RPC 2.0 peer over a framed reader/writer
-// pair. Outgoing calls go through Call; incoming calls dispatch to Handlers
-// registered via Register. Callers own the underlying transport — close it
-// to shut the endpoint down.
 type Endpoint struct {
 	logger logging.Logger
 	writer io.Writer
@@ -90,9 +81,6 @@ type Endpoint struct {
 	err    error
 }
 
-// NewEndpoint wraps a reader/writer pair as a bidirectional JSON-RPC endpoint.
-// maxOutstanding bounds in-flight outgoing calls; pass 0 for
-// DefaultMaxOutstanding.
 func NewEndpoint(logger logging.Logger, reader io.Reader, writer io.Writer, maxOutstanding int) *Endpoint {
 	if maxOutstanding <= 0 {
 		maxOutstanding = DefaultMaxOutstanding
@@ -109,17 +97,12 @@ func NewEndpoint(logger logging.Logger, reader io.Reader, writer io.Writer, maxO
 	return e
 }
 
-// Register attaches a handler for an incoming method. Overwrites any prior
-// handler for that method.
 func (e *Endpoint) Register(method string, h Handler) {
 	e.handlerM.Lock()
 	e.handlers[method] = h
 	e.handlerM.Unlock()
 }
 
-// Call sends a JSON-RPC request and blocks for the response, ctx cancellation,
-// or endpoint termination. Blocks if maxOutstanding calls are already in
-// flight; ctx cancellation aborts the wait.
 func (e *Endpoint) Call(ctx context.Context, method string, params any) (json.RawMessage, error) {
 	select {
 	case e.outstanding <- struct{}{}:
@@ -159,10 +142,8 @@ func (e *Endpoint) Call(ctx context.Context, method string, params any) (json.Ra
 	}
 }
 
-// Done returns a channel that closes when the read loop exits.
 func (e *Endpoint) Done() <-chan struct{} { return e.done }
 
-// Err returns the terminal error that ended the read loop, or nil if running.
 func (e *Endpoint) Err() error { return e.terminalErr() }
 
 func (e *Endpoint) reserveID() uint64 {
