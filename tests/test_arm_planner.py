@@ -13,6 +13,7 @@ from src.utils.arm_planner import (
     _binary_path,
     _raise_from_output,
     plan_and_execute,
+    resolve_parent_address,
 )
 
 
@@ -39,6 +40,21 @@ def test_arm_address_missing_channel_raises():
     arm = types.SimpleNamespace(name="arm1")
     with pytest.raises(ExecutionError):
         _arm_address(arm)
+
+
+def test_resolve_parent_address_override_wins():
+    arm = types.SimpleNamespace(name="arm1")  # no channel — sniff would fail
+    assert resolve_parent_address(arm, "unix:///override.sock") == "unix:///override.sock"
+
+
+def test_resolve_parent_address_falls_back_to_sniff():
+    assert resolve_parent_address(_fake_arm(), None) == "unix:///tmp/viam.sock"
+
+
+def test_resolve_parent_address_no_override_and_broken_sniff_raises():
+    arm = types.SimpleNamespace(name="arm1")
+    with pytest.raises(ExecutionError):
+        resolve_parent_address(arm, None)
 
 
 def test_binary_path_dev_mode_uses_repo_bin():

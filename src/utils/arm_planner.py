@@ -21,6 +21,10 @@ class ExecutionError(Exception):
 DEFAULT_TIMEOUT_SECONDS = 300.0
 
 
+# Sniffs viam-server's address from grpclib.Channel private attrs. Fragile
+# across viam-python-sdk / grpclib bumps — override via the parent_address
+# config attribute if these stop working.
+# Verified against viam-sdk 0.56.0 / grpclib 0.4.8.
 def _arm_address(arm: Arm) -> str:
     channel = getattr(arm, "channel", None)
     if channel is None:
@@ -33,6 +37,12 @@ def _arm_address(arm: Arm) -> str:
     if host and port:
         return f"{host}:{port}"
     raise ExecutionError(f"cannot derive viam-server address from arm {arm.name!r} channel")
+
+
+def resolve_parent_address(arm: Arm, override: Optional[str] = None) -> str:
+    if override:
+        return override
+    return _arm_address(arm)
 
 
 def _binary_path() -> str:
@@ -48,6 +58,7 @@ async def plan_and_execute(
     goal_pose: Optional[Pose] = None,
     goal_joints_deg: Optional[Sequence[float]] = None,
     reference_frame: str = "world",
+    parent_address: Optional[str] = None,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> None:
     if (goal_pose is None) == (goal_joints_deg is None):
@@ -62,7 +73,7 @@ async def plan_and_execute(
     proc = await asyncio.create_subprocess_exec(
         _binary_path(),
         "--arm", arm.name,
-        "--parent-addr", _arm_address(arm),
+        "--parent-addr", resolve_parent_address(arm, parent_address),
         "--goal", goal_json,
         "--timeout", f"{int(timeout_seconds)}s",
         stdout=asyncio.subprocess.PIPE,

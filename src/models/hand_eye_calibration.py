@@ -23,14 +23,14 @@ try:
     from solvers.reprojection_solver import refine_handeye
     from solvers.robust_init import robust_bootstrap_handeye
     from active_calibration.pose_sampler import generate_pose_set, sample_transform
-    from utils.arm_planner import plan_and_execute, PlanningError, ExecutionError
+    from utils.arm_planner import plan_and_execute, resolve_parent_address, PlanningError, ExecutionError
 except ModuleNotFoundError:
     # when running as local module with run.sh
     from ..diagnostics.pose_diversity import compute_pose_diversity
     from ..solvers.reprojection_solver import refine_handeye
     from ..solvers.robust_init import robust_bootstrap_handeye
     from ..active_calibration.pose_sampler import generate_pose_set, sample_transform
-    from ..utils.arm_planner import plan_and_execute, PlanningError, ExecutionError
+    from ..utils.arm_planner import plan_and_execute, resolve_parent_address, PlanningError, ExecutionError
 
 CALIBS = ["eye-in-hand", "eye-to-hand"]
 METHODS = [
@@ -57,6 +57,7 @@ SOLVER_ATTR = "solver"
 USE_MOTION_SERVICE_FOR_POSES_ATTR = "use_motion_service_for_poses"
 POSE_SELECTION_ATTR = "pose_selection"
 POSE_SAMPLING_ATTR = "pose_sampling"
+PARENT_ADDRESS_ATTR = "parent_address"
 
 # do_command keys a viam:opencv pose tracker exposes a raw observation under.
 # A chessboard reports the full grid every frame; a ChArUco board may report a
@@ -296,8 +297,15 @@ class HandEyeCalibration(Generic, EasyResource):
                 f"kept only for get_pose queries when '{USE_MOTION_SERVICE_FOR_POSES_ATTR}' is true"
             )
 
+        self.parent_address: Optional[str] = attrs.get(PARENT_ADDRESS_ATTR) or None
+        try:
+            resolve_parent_address(self.arm, self.parent_address)
+        except ExecutionError as e:
+            self.logger.warn(
+                f"cannot derive viam-server address from arm ({e}); "
+                f"set '{PARENT_ADDRESS_ATTR}' in config to override before running calibration"
+            )
 
-        # Parse joint positions or poses from config
         self.joint_positions = attrs.get(JOINT_POSITIONS_ATTR, [])
 
         poses_config = attrs.get(POSES_ATTR, [])
@@ -602,10 +610,15 @@ class HandEyeCalibration(Generic, EasyResource):
                 arm=self.arm,
                 goal_pose=position_data,
                 reference_frame=self.arm.name + "_origin",
+                parent_address=self.parent_address,
             )
         else:
             joints_deg = [float(np.degrees(joint)) for joint in position_data]
-            await plan_and_execute(arm=self.arm, goal_joints_deg=joints_deg)
+            await plan_and_execute(
+                arm=self.arm,
+                goal_joints_deg=joints_deg,
+                parent_address=self.parent_address,
+            )
 
     def _compute_per_pose_residuals(
         self,
