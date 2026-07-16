@@ -268,8 +268,6 @@ class HandEyeCalibration(Generic, EasyResource):
         if use_motion_service_for_poses and motion is None:
             raise Exception(f"'{USE_MOTION_SERVICE_FOR_POSES_ATTR}' is set to true but '{MOTION_ATTR}' is not configured. Either set '{USE_MOTION_SERVICE_FOR_POSES_ATTR}' to false or provide a '{MOTION_ATTR}' service name.")
 
-        # Auto pose selection no longer needs 'motion' — arm-planner handles
-        # reachability. Motion service is still used for get_pose queries.
         return [str(arm), str(pose_tracker)], optional_deps
 
     def reconfigure(
@@ -599,7 +597,6 @@ class HandEyeCalibration(Generic, EasyResource):
         self.logger.debug(f"Moving to position {position_index+1}/{total_positions}")
 
         if isinstance(position_data, Pose):
-            # Pose goals are in the arm's base frame to match prior motion.move semantics.
             await plan_and_execute(
                 arm=self.arm,
                 goal_pose=position_data,
@@ -725,7 +722,6 @@ class HandEyeCalibration(Generic, EasyResource):
                 measurements.append(await self._capture_measurement())
                 self.logger.info(f"successfully collected calibration data for position {i+1}/{total_positions}")
             except ExecutionError:
-                # Never skip past an arm halt, even for the OpenCV solver.
                 raise
             except Exception as e:
                 if self.solver == SOLVER_OPENCV:

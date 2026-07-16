@@ -1,5 +1,6 @@
-import asyncio
 import json
+import os
+import sys
 import types
 from unittest.mock import AsyncMock, patch
 
@@ -8,7 +9,8 @@ import pytest
 from src.utils.arm_planner import (
     ExecutionError,
     PlanningError,
-    _Address,
+    _arm_address,
+    _binary_path,
     _raise_from_output,
     plan_and_execute,
 )
@@ -21,23 +23,35 @@ def _fake_arm(path="/tmp/viam.sock"):
     return arm
 
 
-def test_address_from_arm_unix():
-    arm = _fake_arm(path="/tmp/viam.sock")
-    assert _Address.from_arm(arm).value == "unix:///tmp/viam.sock"
+def test_arm_address_unix():
+    assert _arm_address(_fake_arm(path="/tmp/viam.sock")) == "unix:///tmp/viam.sock"
 
 
-def test_address_from_arm_tcp():
+def test_arm_address_tcp():
     arm = types.SimpleNamespace(
         name="arm1",
         channel=types.SimpleNamespace(_path=None, _host="10.0.0.1", _port=8080),
     )
-    assert _Address.from_arm(arm).value == "10.0.0.1:8080"
+    assert _arm_address(arm) == "10.0.0.1:8080"
 
 
-def test_address_from_arm_missing_channel_raises():
+def test_arm_address_missing_channel_raises():
     arm = types.SimpleNamespace(name="arm1")
     with pytest.raises(ExecutionError):
-        _Address.from_arm(arm)
+        _arm_address(arm)
+
+
+def test_binary_path_dev_mode_uses_repo_bin():
+    with patch.object(sys, "frozen", False, create=True):
+        path = _binary_path()
+    assert path.endswith(os.path.join("bin", "arm-planner"))
+    assert os.path.isabs(path)
+
+
+def test_binary_path_frozen_mode_uses_meipass():
+    with patch.object(sys, "frozen", True, create=True), \
+         patch.object(sys, "_MEIPASS", "/tmp/fake-meipass", create=True):
+        assert _binary_path() == "/tmp/fake-meipass/arm-planner"
 
 
 def test_raise_from_output_ok_is_silent():

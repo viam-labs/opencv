@@ -2,7 +2,6 @@ import asyncio
 import json
 import os
 import sys
-from dataclasses import dataclass
 from typing import Optional, Sequence
 
 from viam.components.arm import Arm
@@ -20,23 +19,18 @@ class ExecutionError(Exception):
 DEFAULT_TIMEOUT_SECONDS = 300.0
 
 
-@dataclass
-class _Address:
-    value: str
-
-    @classmethod
-    def from_arm(cls, arm: Arm) -> "_Address":
-        channel = getattr(arm, "channel", None)
-        if channel is None:
-            raise ExecutionError(f"arm {arm.name!r} has no gRPC channel")
-        path = getattr(channel, "_path", None)
-        if path:
-            return cls(f"unix://{path}")
-        host = getattr(channel, "_host", None)
-        port = getattr(channel, "_port", None)
-        if host and port:
-            return cls(f"{host}:{port}")
-        raise ExecutionError(f"cannot derive viam-server address from arm {arm.name!r} channel")
+def _arm_address(arm: Arm) -> str:
+    channel = getattr(arm, "channel", None)
+    if channel is None:
+        raise ExecutionError(f"arm {arm.name!r} has no gRPC channel")
+    path = getattr(channel, "_path", None)
+    if path:
+        return f"unix://{path}"
+    host = getattr(channel, "_host", None)
+    port = getattr(channel, "_port", None)
+    if host and port:
+        return f"{host}:{port}"
+    raise ExecutionError(f"cannot derive viam-server address from arm {arm.name!r} channel")
 
 
 def _binary_path() -> str:
@@ -67,12 +61,10 @@ async def plan_and_execute(
     else:
         goal = {"joints_degrees": list(goal_joints_deg)}
 
-    address = _Address.from_arm(arm)
-
     proc = await asyncio.create_subprocess_exec(
         _binary_path(),
         "--arm", arm.name,
-        "--parent-addr", address.value,
+        "--parent-addr", _arm_address(arm),
         "--goal", json.dumps(goal),
         "--timeout", f"{int(timeout_seconds)}s",
         stdout=asyncio.subprocess.PIPE,
