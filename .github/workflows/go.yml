@@ -33,5 +33,11 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      - name: Lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.62.2
+          args: --config=./etc/golangci.yaml --timeout=10m
+
       - name: Test
         run: go test -race -count=1 -timeout=5m ./...

@@ -15,15 +15,33 @@ import (
 	"go.viam.com/test"
 )
 
-// newClientServer builds a Client wired to a fake JSON-RPC server driven by
-// the provided handle func. Returns the client and a shutdown func.
-func newClientServer(t *testing.T, handle func(req request) response) (*Client, func()) {
+// newTestEndpoint pairs two Endpoints with io.Pipe so tests can exercise
+// bidirectional traffic without a subprocess. Returns (local, remote, shutdown).
+func newTestEndpoint(t *testing.T) (*Endpoint, *Endpoint, func()) {
 	t.Helper()
+	// l2r: local writes → remote reads
+	l2rReader, l2rWriter := io.Pipe()
+	// r2l: remote writes → local reads
+	r2lReader, r2lWriter := io.Pipe()
 
+	local := NewEndpoint(logging.NewTestLogger(t), r2lReader, l2rWriter, 0)
+	remote := NewEndpoint(logging.NewTestLogger(t), l2rReader, r2lWriter, 0)
+
+	shutdown := func() {
+		_ = l2rWriter.Close()
+		_ = r2lWriter.Close()
+	}
+	return local, remote, shutdown
+}
+
+// serveFrom pairs an Endpoint with a bare-frame fake peer for tests where we
+// want direct control over what the "server" writes back.
+func serveFrom(t *testing.T, handle func(msg message) message) (*Endpoint, func()) {
+	t.Helper()
 	serverReadFromClient, clientWriteToServer := io.Pipe()
 	clientReadFromServer, serverWriteToClient := io.Pipe()
 
-	client := NewClient(logging.NewTestLogger(t), clientReadFromServer, clientWriteToServer)
+	e := NewEndpoint(logging.NewTestLogger(t), clientReadFromServer, clientWriteToServer, 0)
 
 	stop := make(chan struct{})
 	go func() {
@@ -33,16 +51,12 @@ func newClientServer(t *testing.T, handle func(req request) response) (*Client, 
 			if err != nil {
 				return
 			}
-			var req request
+			var req message
 			if err := json.Unmarshal(body, &req); err != nil {
-				t.Errorf("server: bad frame: %v", err)
 				return
 			}
-			// Dispatch each request in its own goroutine so a blocking handler
-			// (e.g. one that simulates "server never responds") doesn't stall
-			// the read loop and shutdown.
-			go func(req request) {
-				respCh := make(chan response, 1)
+			go func(req message) {
+				respCh := make(chan message, 1)
 				go func() { respCh <- handle(req) }()
 				select {
 				case resp := <-respCh:
@@ -60,7 +74,7 @@ func newClientServer(t *testing.T, handle func(req request) response) (*Client, 
 		_ = clientWriteToServer.Close()
 		_ = serverWriteToClient.Close()
 	}
-	return client, shutdown
+	return e, shutdown
 }
 
 func writeFrameTo(w io.Writer, v any) error {
@@ -90,9 +104,9 @@ func itoa(i int) string {
 }
 
 func TestCallRoundTrip(t *testing.T) {
-	client, shutdown := newClientServer(t, func(req request) response {
+	client, shutdown := serveFrom(t, func(req message) message {
 		test.That(t, req.Method, test.ShouldEqual, "echo")
-		return response{Result: req.Params}
+		return message{Result: req.Params}
 	})
 	defer shutdown()
 
@@ -108,14 +122,13 @@ func TestCallRoundTrip(t *testing.T) {
 }
 
 func TestCallConcurrentCorrelation(t *testing.T) {
-	// Server sleeps proportionally to the id to guarantee out-of-order responses.
-	client, shutdown := newClientServer(t, func(req request) response {
-		var payload struct {
+	client, shutdown := serveFrom(t, func(req message) message {
+		var p struct {
 			DelayMs int `json:"delay_ms"`
 		}
-		_ = json.Unmarshal(req.Params, &payload)
-		time.Sleep(time.Duration(payload.DelayMs) * time.Millisecond)
-		return response{Result: json.RawMessage(`"` + req.Method + `"`)}
+		_ = json.Unmarshal(req.Params, &p)
+		time.Sleep(time.Duration(p.DelayMs) * time.Millisecond)
+		return message{Result: json.RawMessage(`"` + req.Method + `"`)}
 	})
 	defer shutdown()
 
@@ -138,8 +151,8 @@ func TestCallConcurrentCorrelation(t *testing.T) {
 }
 
 func TestCallReturnsRPCError(t *testing.T) {
-	client, shutdown := newClientServer(t, func(req request) response {
-		return response{Error: &RPCError{
+	client, shutdown := serveFrom(t, func(req message) message {
+		return message{Error: &RPCError{
 			Code:    -32000,
 			Message: "arm halted",
 			Data:    json.RawMessage(`{"kind":"arm_halted"}`),
@@ -159,10 +172,7 @@ func TestCallReturnsRPCError(t *testing.T) {
 }
 
 func TestCallContextCancel(t *testing.T) {
-	// Server never responds.
-	client, shutdown := newClientServer(t, func(req request) response {
-		select {}
-	})
+	client, shutdown := serveFrom(t, func(req message) message { select {} })
 	defer shutdown()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
@@ -175,16 +185,14 @@ func TestCallContextCancel(t *testing.T) {
 func TestCallFailsWhenReaderClosed(t *testing.T) {
 	sr, cw := io.Pipe()
 	cr, sw := io.Pipe()
-	client := NewClient(logging.NewTestLogger(t), cr, cw)
+	client := NewEndpoint(logging.NewTestLogger(t), cr, cw, 0)
 
-	// Start a Call that would block waiting for a response.
 	errCh := make(chan error, 1)
 	go func() {
 		_, err := client.Call(context.Background(), "wait", nil)
 		errCh <- err
 	}()
 
-	// Drain what the client wrote so the pipe doesn't block, then close.
 	go func() {
 		buf := make([]byte, 1024)
 		for {
@@ -194,7 +202,6 @@ func TestCallFailsWhenReaderClosed(t *testing.T) {
 		}
 	}()
 
-	// Simulate subprocess exit by closing what the client reads from.
 	_ = sw.Close()
 
 	select {
@@ -203,7 +210,6 @@ func TestCallFailsWhenReaderClosed(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("call did not fail after reader closed")
 	}
-
 	<-client.Done()
 	_ = cw.Close()
 }
@@ -211,4 +217,103 @@ func TestCallFailsWhenReaderClosed(t *testing.T) {
 func TestReadFrameRejectsMissingContentLength(t *testing.T) {
 	_, err := readFrame(bufio.NewReader(strings.NewReader("\r\n\r\nbody")))
 	test.That(t, err, test.ShouldNotBeNil)
+}
+
+func TestReadFrameRejectsOversizedContentLength(t *testing.T) {
+	header := "Content-Length: 99999999999\r\n\r\n"
+	_, err := readFrame(bufio.NewReader(strings.NewReader(header)))
+	test.That(t, err, test.ShouldNotBeNil)
+	test.That(t, err.Error(), test.ShouldContainSubstring, "exceeds max")
+}
+
+func TestServerDispatchesHandler(t *testing.T) {
+	local, remote, shutdown := newTestEndpoint(t)
+	defer shutdown()
+
+	remote.Register("add", func(ctx context.Context, params json.RawMessage) (json.RawMessage, *RPCError) {
+		var p struct{ A, B int }
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, &RPCError{Code: -32602, Message: err.Error()}
+		}
+		return json.RawMessage(itoa(p.A + p.B)), nil
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	raw, err := local.Call(ctx, "add", map[string]int{"A": 2, "B": 3})
+	test.That(t, err, test.ShouldBeNil)
+	test.That(t, string(raw), test.ShouldEqual, "5")
+}
+
+func TestServerUnknownMethodReturnsError(t *testing.T) {
+	local, _, shutdown := newTestEndpoint(t)
+	defer shutdown()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	_, err := local.Call(ctx, "nope", nil)
+	test.That(t, err, test.ShouldNotBeNil)
+
+	var rpcErr *RPCError
+	test.That(t, errors.As(err, &rpcErr), test.ShouldBeTrue)
+	test.That(t, rpcErr.Code, test.ShouldEqual, -32601)
+}
+
+func TestBidirectionalTraffic(t *testing.T) {
+	local, remote, shutdown := newTestEndpoint(t)
+	defer shutdown()
+
+	local.Register("ping", func(ctx context.Context, _ json.RawMessage) (json.RawMessage, *RPCError) {
+		return json.RawMessage(`"pong-from-local"`), nil
+	})
+	remote.Register("ping", func(ctx context.Context, _ json.RawMessage) (json.RawMessage, *RPCError) {
+		return json.RawMessage(`"pong-from-remote"`), nil
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	toRemote, err := local.Call(ctx, "ping", nil)
+	test.That(t, err, test.ShouldBeNil)
+	test.That(t, string(toRemote), test.ShouldEqual, `"pong-from-remote"`)
+
+	toLocal, err := remote.Call(ctx, "ping", nil)
+	test.That(t, err, test.ShouldBeNil)
+	test.That(t, string(toLocal), test.ShouldEqual, `"pong-from-local"`)
+}
+
+func TestBackpressureBoundsInflight(t *testing.T) {
+	const maxOut = 3
+
+	sr, cw := io.Pipe()
+	cr, sw := io.Pipe()
+	client := NewEndpoint(logging.NewTestLogger(t), cr, cw, maxOut)
+
+	// Drain client writes but never respond, so calls stay pending.
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			if _, err := sr.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+
+	// Fire maxOut calls that acquire the semaphore and block.
+	for i := 0; i < maxOut; i++ {
+		go func() { _, _ = client.Call(context.Background(), "block", nil) }()
+	}
+	// Let the acquires settle so the semaphore is full.
+	time.Sleep(50 * time.Millisecond)
+
+	// One more Call should fail its own context deadline while waiting for a slot.
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_, err := client.Call(ctx, "extra", nil)
+	test.That(t, errors.Is(err, context.DeadlineExceeded), test.ShouldBeTrue)
+
+	_ = sw.Close()
+	_ = cw.Close()
 }
