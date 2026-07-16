@@ -39,8 +39,7 @@ func run() int {
 
 	var goal armplanner.Goal
 	if err := json.Unmarshal([]byte(*goalJSON), &goal); err != nil {
-		emit(armplanner.Result{Error: &armplanner.Err{Kind: armplanner.KindPlanning, Message: fmt.Sprintf("parse goal: %v", err)}})
-		return 1
+		return fail(armplanner.KindPlanning, "parse goal", err)
 	}
 
 	logger := logging.NewLogger("arm-planner")
@@ -51,8 +50,7 @@ func run() int {
 		client.WithDialOptions(rpc.WithInsecure()),
 	)
 	if err != nil {
-		emit(armplanner.Result{Error: &armplanner.Err{Kind: armplanner.KindExecution, Message: fmt.Sprintf("connect to viam-server: %v", err)}})
-		return 1
+		return fail(armplanner.KindExecution, "connect to viam-server", err)
 	}
 	defer func() {
 		if err := robot.Close(ctx); err != nil {
@@ -62,25 +60,21 @@ func run() int {
 
 	a, err := arm.FromProvider(robot, *armName)
 	if err != nil {
-		emit(armplanner.Result{Error: &armplanner.Err{Kind: armplanner.KindExecution, Message: fmt.Sprintf("resolve arm %q: %v", *armName, err)}})
-		return 1
+		return fail(armplanner.KindExecution, fmt.Sprintf("resolve arm %q", *armName), err)
 	}
 
 	fsCfg, err := robot.FrameSystemConfig(ctx)
 	if err != nil {
-		emit(armplanner.Result{Error: &armplanner.Err{Kind: armplanner.KindExecution, Message: fmt.Sprintf("get frame system config: %v", err)}})
-		return 1
+		return fail(armplanner.KindExecution, "get frame system config", err)
 	}
 	fs, err := referenceframe.NewFrameSystem("", fsCfg.Parts, nil)
 	if err != nil {
-		emit(armplanner.Result{Error: &armplanner.Err{Kind: armplanner.KindExecution, Message: fmt.Sprintf("build frame system: %v", err)}})
-		return 1
+		return fail(armplanner.KindExecution, "build frame system", err)
 	}
 
 	currentInputs, err := robot.CurrentInputs(ctx)
 	if err != nil {
-		emit(armplanner.Result{Error: &armplanner.Err{Kind: armplanner.KindExecution, Message: fmt.Sprintf("get current inputs: %v", err)}})
-		return 1
+		return fail(armplanner.KindExecution, "get current inputs", err)
 	}
 
 	result := armplanner.NewPlanner(logger).Run(ctx, a, fs, currentInputs, goal)
@@ -88,6 +82,14 @@ func run() int {
 	if result.OK {
 		return 0
 	}
+	return 1
+}
+
+func fail(kind, context string, err error) int {
+	emit(armplanner.Result{Error: &armplanner.Err{
+		Kind:    kind,
+		Message: fmt.Sprintf("%s: %v", context, err),
+	}})
 	return 1
 }
 

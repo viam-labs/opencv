@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 
 	"github.com/golang/geo/r3"
 	"go.viam.com/rdk/components/arm"
@@ -145,7 +146,7 @@ func degreesToInputs(fs *referenceframe.FrameSystem, armName string, degrees []f
 	}
 	inputs := make([]referenceframe.Input, len(degrees))
 	for i, d := range degrees {
-		inputs[i] = d * 3.141592653589793 / 180.0
+		inputs[i] = d * math.Pi / 180.0
 	}
 	return inputs, nil
 }
