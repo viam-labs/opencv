@@ -20,13 +20,13 @@ linters:
     - gocognit
     - godox
     - err113
+    - exportloopref
     - gochecknoglobals
     - gochecknoinits
     - gocyclo
     - godot
     - gofmt
     - goimports
-    - gomnd
     - importas
     - inamedparam
     - interfacebloat
