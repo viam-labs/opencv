@@ -13,6 +13,8 @@ import (
 	"go.viam.com/rdk/referenceframe"
 	"go.viam.com/rdk/robot/client"
 	"go.viam.com/utils/rpc"
+
+	"github.com/viam-labs/opencv/armplanner"
 )
 
 const defaultTimeout = 5 * time.Minute
@@ -35,9 +37,9 @@ func run() int {
 		return 2
 	}
 
-	var goal Goal
+	var goal armplanner.Goal
 	if err := json.Unmarshal([]byte(*goalJSON), &goal); err != nil {
-		emit(Result{Error: &Err{Kind: KindPlanning, Message: fmt.Sprintf("parse goal: %v", err)}})
+		emit(armplanner.Result{Error: &armplanner.Err{Kind: armplanner.KindPlanning, Message: fmt.Sprintf("parse goal: %v", err)}})
 		return 1
 	}
 
@@ -49,35 +51,35 @@ func run() int {
 		client.WithDialOptions(rpc.WithInsecure()),
 	)
 	if err != nil {
-		emit(Result{Error: &Err{Kind: KindExecution, Message: fmt.Sprintf("connect to viam-server: %v", err)}})
+		emit(armplanner.Result{Error: &armplanner.Err{Kind: armplanner.KindExecution, Message: fmt.Sprintf("connect to viam-server: %v", err)}})
 		return 1
 	}
 	defer robot.Close(ctx)
 
 	a, err := arm.FromRobot(robot, *armName)
 	if err != nil {
-		emit(Result{Error: &Err{Kind: KindExecution, Message: fmt.Sprintf("resolve arm %q: %v", *armName, err)}})
+		emit(armplanner.Result{Error: &armplanner.Err{Kind: armplanner.KindExecution, Message: fmt.Sprintf("resolve arm %q: %v", *armName, err)}})
 		return 1
 	}
 
 	fsCfg, err := robot.FrameSystemConfig(ctx)
 	if err != nil {
-		emit(Result{Error: &Err{Kind: KindExecution, Message: fmt.Sprintf("get frame system config: %v", err)}})
+		emit(armplanner.Result{Error: &armplanner.Err{Kind: armplanner.KindExecution, Message: fmt.Sprintf("get frame system config: %v", err)}})
 		return 1
 	}
 	fs, err := referenceframe.NewFrameSystem("", fsCfg.Parts, nil)
 	if err != nil {
-		emit(Result{Error: &Err{Kind: KindExecution, Message: fmt.Sprintf("build frame system: %v", err)}})
+		emit(armplanner.Result{Error: &armplanner.Err{Kind: armplanner.KindExecution, Message: fmt.Sprintf("build frame system: %v", err)}})
 		return 1
 	}
 
 	currentInputs, err := robot.CurrentInputs(ctx)
 	if err != nil {
-		emit(Result{Error: &Err{Kind: KindExecution, Message: fmt.Sprintf("get current inputs: %v", err)}})
+		emit(armplanner.Result{Error: &armplanner.Err{Kind: armplanner.KindExecution, Message: fmt.Sprintf("get current inputs: %v", err)}})
 		return 1
 	}
 
-	result := NewPlanner(logger).Run(ctx, a, fs, currentInputs, goal)
+	result := armplanner.NewPlanner(logger).Run(ctx, a, fs, currentInputs, goal)
 	emit(result)
 	if result.OK {
 		return 0
@@ -85,7 +87,7 @@ func run() int {
 	return 1
 }
 
-func emit(r Result) {
+func emit(r armplanner.Result) {
 	data, err := json.Marshal(r)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "marshal result: %v\n", err)
