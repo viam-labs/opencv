@@ -1,27 +1,26 @@
 #!/bin/sh
+set -e
 cd `dirname $0`
 
-# Create a virtual environment to run our code
 VENV_NAME="venv"
 PYTHON="$VENV_NAME/bin/python"
 
-if ! $PYTHON -m pip install pyinstaller -Uqq; then
-    exit 1
-fi
+$PYTHON -m pip install pyinstaller -Uqq
 
-# Build the Go binary
-echo "Building Go utils..."
-cd go_utils
-go build -o go_utils main.go
-if [ $? -ne 0 ]; then
-    echo "Failed to build Go binary"
-    exit 1
-fi
-cd ..
+echo "Building Go utils (orientation math helper)..."
+(cd go_utils && go build -o go_utils main.go)
 
-# Copy the Go binary to a location where PyInstaller can find it
+echo "Building arm-planner Go binary..."
+mkdir -p bin
+go build -o bin/arm-planner ./cmd/arm-planner
+
 mkdir -p dist
-cp go_utils/go_utils .
 
-$PYTHON -m PyInstaller --onefile --hidden-import="googleapiclient" --add-binary="./go_utils:." src/main.py
+echo "Packaging Python module with bundled Go binaries..."
+$PYTHON -m PyInstaller --onefile \
+    --hidden-import="googleapiclient" \
+    --add-binary="./go_utils/go_utils:." \
+    --add-binary="./bin/arm-planner:." \
+    src/main.py
+
 tar -czvf dist/archive.tar.gz meta.json ./dist/main
