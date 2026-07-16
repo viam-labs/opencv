@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
 
 	"go.viam.com/rdk/components/arm"
 	"go.viam.com/rdk/logging"
@@ -13,6 +14,8 @@ import (
 	"go.viam.com/rdk/robot/client"
 	"go.viam.com/utils/rpc"
 )
+
+const defaultTimeout = 5 * time.Minute
 
 func main() {
 	os.Exit(run())
@@ -23,6 +26,7 @@ func run() int {
 		armName    = flag.String("arm", "", "arm resource name")
 		parentAddr = flag.String("parent-addr", "", "viam-server address")
 		goalJSON   = flag.String("goal", "", "goal as JSON: {\"pose\":{...}} or {\"joints_degrees\":[...]}")
+		timeout    = flag.Duration("timeout", defaultTimeout, "hard ceiling on the entire plan+execute cycle")
 	)
 	flag.Parse()
 
@@ -38,7 +42,8 @@ func run() int {
 	}
 
 	logger := logging.NewLogger("arm-planner")
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
 
 	robot, err := client.New(ctx, *parentAddr, logger,
 		client.WithDialOptions(rpc.WithInsecure()),
