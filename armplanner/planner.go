@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 
 	"github.com/golang/geo/r3"
 	"go.viam.com/rdk/components/arm"
@@ -13,6 +12,7 @@ import (
 	"go.viam.com/rdk/motionplan/armplanning"
 	"go.viam.com/rdk/referenceframe"
 	"go.viam.com/rdk/spatialmath"
+	"go.viam.com/rdk/utils"
 )
 
 const (
@@ -146,7 +146,7 @@ func degreesToInputs(fs *referenceframe.FrameSystem, armName string, degrees []f
 	}
 	inputs := make([]referenceframe.Input, len(degrees))
 	for i, d := range degrees {
-		inputs[i] = d * math.Pi / 180.0
+		inputs[i] = utils.DegToRad(d)
 	}
 	return inputs, nil
 }
