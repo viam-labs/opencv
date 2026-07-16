@@ -124,3 +124,28 @@ async def test_plan_and_execute_planning_error_via_mocked_subprocess():
     with patch("src.utils.arm_planner.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
         with pytest.raises(PlanningError, match="no ik"):
             await plan_and_execute(arm=_fake_arm(), goal_joints_deg=[10.0])
+
+
+@pytest.mark.asyncio
+async def test_plan_and_execute_pose_goal_serializes_as_protojson_pose_in_frame():
+    from viam.proto.common import Pose
+    proc = AsyncMock()
+    proc.communicate = AsyncMock(return_value=(b'{"ok":true}', b""))
+    proc.returncode = 0
+
+    create = AsyncMock(return_value=proc)
+    with patch("src.utils.arm_planner.asyncio.create_subprocess_exec", create):
+        await plan_and_execute(
+            arm=_fake_arm(),
+            goal_pose=Pose(x=1.0, y=2.0, z=3.0, o_x=0, o_y=0, o_z=1, theta=45),
+            reference_frame="arm1_origin",
+        )
+
+    args = create.call_args.args
+    goal_index = args.index("--goal")
+    goal = json.loads(args[goal_index + 1])
+    assert goal["pose"]["reference_frame"] == "arm1_origin"
+    assert goal["pose"]["pose"]["x"] == 1.0
+    assert goal["pose"]["pose"]["y"] == 2.0
+    assert goal["pose"]["pose"]["z"] == 3.0
+    assert goal["pose"]["pose"]["theta"] == 45

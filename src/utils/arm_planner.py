@@ -4,8 +4,10 @@ import os
 import sys
 from typing import Optional, Sequence
 
+from google.protobuf.json_format import MessageToJson
+
 from viam.components.arm import Arm
-from viam.proto.common import Pose
+from viam.proto.common import Pose, PoseInFrame
 
 
 class PlanningError(Exception):
@@ -52,20 +54,16 @@ async def plan_and_execute(
         raise ValueError("exactly one of goal_pose or goal_joints_deg must be set")
 
     if goal_pose is not None:
-        goal = {"pose": {
-            "x": goal_pose.x, "y": goal_pose.y, "z": goal_pose.z,
-            "o_x": goal_pose.o_x, "o_y": goal_pose.o_y, "o_z": goal_pose.o_z,
-            "theta": goal_pose.theta,
-            "reference_frame": reference_frame,
-        }}
+        pif = PoseInFrame(reference_frame=reference_frame, pose=goal_pose)
+        goal_json = json.dumps({"pose": json.loads(MessageToJson(pif, preserving_proto_field_name=True))})
     else:
-        goal = {"joints_degrees": list(goal_joints_deg)}
+        goal_json = json.dumps({"joints_degrees": list(goal_joints_deg)})
 
     proc = await asyncio.create_subprocess_exec(
         _binary_path(),
         "--arm", arm.name,
         "--parent-addr", _arm_address(arm),
-        "--goal", json.dumps(goal),
+        "--goal", goal_json,
         "--timeout", f"{int(timeout_seconds)}s",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
