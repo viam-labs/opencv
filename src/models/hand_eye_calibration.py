@@ -23,12 +23,14 @@ try:
     from solvers.reprojection_solver import refine_handeye
     from solvers.robust_init import robust_bootstrap_handeye
     from active_calibration.pose_sampler import generate_pose_set, sample_transform
+    from utils.arm_planner import plan_and_execute, PlanningError, ExecutionError
 except ModuleNotFoundError:
     # when running as local module with run.sh
     from ..diagnostics.pose_diversity import compute_pose_diversity
     from ..solvers.reprojection_solver import refine_handeye
     from ..solvers.robust_init import robust_bootstrap_handeye
     from ..active_calibration.pose_sampler import generate_pose_set, sample_transform
+    from ..utils.arm_planner import plan_and_execute, PlanningError, ExecutionError
 
 CALIBS = ["eye-in-hand", "eye-to-hand"]
 METHODS = [
@@ -266,12 +268,8 @@ class HandEyeCalibration(Generic, EasyResource):
         if use_motion_service_for_poses and motion is None:
             raise Exception(f"'{USE_MOTION_SERVICE_FOR_POSES_ATTR}' is set to true but '{MOTION_ATTR}' is not configured. Either set '{USE_MOTION_SERVICE_FOR_POSES_ATTR}' to false or provide a '{MOTION_ATTR}' service name.")
 
-        if pose_selection == POSE_SELECTION_AUTO and motion is None:
-            raise Exception(
-                f"'{POSE_SELECTION_ATTR}=\"{POSE_SELECTION_AUTO}\"' requires a "
-                f"'{MOTION_ATTR}' service for reachability validation."
-            )
-
+        # Auto pose selection no longer needs 'motion' — arm-planner handles
+        # reachability. Motion service is still used for get_pose queries.
         return [str(arm), str(pose_tracker)], optional_deps
 
     def reconfigure(
@@ -555,11 +553,13 @@ class HandEyeCalibration(Generic, EasyResource):
                     candidate, len(achieved), n_target
                 )
                 await asyncio.sleep(self.sleep_seconds)
-            except Exception as e:
+            except PlanningError as e:
                 self.logger.info(
-                    f"attempt {attempts}: candidate unreachable ({e}); resampling"
+                    f"attempt {attempts}: candidate infeasible ({e}); resampling"
                 )
                 continue
+            except ExecutionError:
+                raise
 
             # Capture the calibration measurement from this pose. The capture
             # doubles as the visibility check: a pose that's reachable but
@@ -596,47 +596,18 @@ class HandEyeCalibration(Generic, EasyResource):
         return achieved, measurements
 
     async def _move_arm_to_position(self, position_data, position_index, total_positions):
-        """Move arm to specified position using joint control, direct pose control, or motion planning.
-
-        Args:
-            position_data: Either a list of joint positions (radians) or a Pose object
-            position_index: Index of the current position
-            total_positions: Total number of positions
-        """
         self.logger.debug(f"Moving to position {position_index+1}/{total_positions}")
 
-        is_pose = isinstance(position_data, Pose)
-
-        if self.motion is not None and is_pose:
-            # hack to get the arm to move relative to the base of the arm, not the end TCP
-            pif = PoseInFrame(reference_frame=self.arm.name + "_origin", pose=position_data)
-
-            success = await self.motion.move(
-                component_name=self.arm.name,
-                destination=pif,
+        if isinstance(position_data, Pose):
+            # Pose goals are in the arm's base frame to match prior motion.move semantics.
+            await plan_and_execute(
+                arm=self.arm,
+                goal_pose=position_data,
+                reference_frame=self.arm.name + "_origin",
             )
-            if not success:
-                raise Exception(f"Could not move to pose {position_index+1}/{total_positions}")
-            self.logger.debug(f"Moved arm to pose: {pif} using motion planning")
-        elif is_pose:
-            # Direct pose control using arm.move_to_position
-            try:
-                await self.arm.move_to_position(pose=position_data)
-            except Exception as e:
-                self.logger.error(f"Could not move arm to pose. If the arm does not implement move_to_position, use motion service instead. Error: {e}")
-                raise e
-
-            while await self.arm.is_moving():
-                await asyncio.sleep(0.05)
-            self.logger.debug(f"Moved arm to pose: {position_data}")
         else:
-            # Direct joint position control
-            joints_deg = [np.degrees(joint) for joint in position_data]
-            jp = JointPositions(values=joints_deg)
-            await self.arm.move_to_joint_positions(jp)
-            while await self.arm.is_moving():
-                await asyncio.sleep(0.05)
-            self.logger.debug(f"Moved arm to joint position: {jp}")
+            joints_deg = [float(np.degrees(joint)) for joint in position_data]
+            await plan_and_execute(arm=self.arm, goal_joints_deg=joints_deg)
 
     def _compute_per_pose_residuals(
         self,
@@ -753,6 +724,9 @@ class HandEyeCalibration(Generic, EasyResource):
                 await asyncio.sleep(self.sleep_seconds)
                 measurements.append(await self._capture_measurement())
                 self.logger.info(f"successfully collected calibration data for position {i+1}/{total_positions}")
+            except ExecutionError:
+                # Never skip past an arm halt, even for the OpenCV solver.
+                raise
             except Exception as e:
                 if self.solver == SOLVER_OPENCV:
                     self.logger.warning(
