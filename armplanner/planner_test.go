@@ -18,6 +18,8 @@ import (
 
 const testArmName = "arm1"
 
+var samplePoseGoal = json.RawMessage(`{"reference_frame":"world","pose":{"o_z":1}}`)
+
 func newTestPlanner(t *testing.T, planFn PlanMotionFunc) *Planner {
 	return &Planner{logger: logging.NewTestLogger(t), planMotion: planFn}
 }
@@ -33,8 +35,6 @@ func newTestArm(t *testing.T, moveErr error) (*inject.Arm, *int) {
 	return a, &calls
 }
 
-// stubPlan returns a motionplan.Plan with a single trivial trajectory step
-// that includes the test arm frame so GetFrameInputs succeeds.
 type stubPlan struct{}
 
 func (stubPlan) Path() motionplan.Path { return nil }
@@ -50,7 +50,7 @@ func TestRunReturnsPlanningErrorWhenPlannerFails(t *testing.T) {
 	}
 	a, calls := newTestArm(t, nil)
 
-	res := newTestPlanner(t, planFn).Run(context.Background(), a, nil, nil, Goal{Pose: &PoseGoal{}})
+	res := newTestPlanner(t, planFn).Run(context.Background(), a, nil, nil, Goal{Pose: samplePoseGoal})
 
 	test.That(t, res.OK, test.ShouldBeFalse)
 	test.That(t, res.Error, test.ShouldNotBeNil)
@@ -65,7 +65,7 @@ func TestRunReturnsExecutionErrorWhenArmFails(t *testing.T) {
 	}
 	a, calls := newTestArm(t, errors.New("pstop: arm is stopped"))
 
-	res := newTestPlanner(t, planFn).Run(context.Background(), a, singleFrameSystem(t), nil, Goal{Pose: &PoseGoal{}})
+	res := newTestPlanner(t, planFn).Run(context.Background(), a, singleFrameSystem(t), nil, Goal{Pose: samplePoseGoal})
 
 	test.That(t, res.OK, test.ShouldBeFalse)
 	test.That(t, res.Error.Kind, test.ShouldEqual, KindExecution)
@@ -79,7 +79,7 @@ func TestRunReturnsOKOnSuccess(t *testing.T) {
 	}
 	a, calls := newTestArm(t, nil)
 
-	res := newTestPlanner(t, planFn).Run(context.Background(), a, singleFrameSystem(t), nil, Goal{Pose: &PoseGoal{}})
+	res := newTestPlanner(t, planFn).Run(context.Background(), a, singleFrameSystem(t), nil, Goal{Pose: samplePoseGoal})
 
 	test.That(t, res.OK, test.ShouldBeTrue)
 	test.That(t, res.Error, test.ShouldBeNil)
@@ -94,11 +94,17 @@ func TestBuildPlanRequestRejectsMissingGoal(t *testing.T) {
 
 func TestBuildPlanRequestRejectsBothGoals(t *testing.T) {
 	_, err := buildPlanRequest(nil, nil, testArmName, Goal{
-		Pose:          &PoseGoal{},
+		Pose:          samplePoseGoal,
 		JointsDegrees: []float64{0, 0},
 	})
 	test.That(t, err, test.ShouldNotBeNil)
 	test.That(t, err.Error(), test.ShouldContainSubstring, "exactly one")
+}
+
+func TestBuildPlanRequestRejectsInvalidPoseJSON(t *testing.T) {
+	_, err := buildPlanRequest(nil, nil, testArmName, Goal{Pose: json.RawMessage("not json")})
+	test.That(t, err, test.ShouldNotBeNil)
+	test.That(t, err.Error(), test.ShouldContainSubstring, "parse pose")
 }
 
 func TestResultJSONShape(t *testing.T) {
@@ -111,8 +117,6 @@ func TestResultJSONShape(t *testing.T) {
 	test.That(t, string(bad), test.ShouldEqual, `{"error":{"kind":"planning","message":"unreachable"}}`)
 }
 
-// singleFrameSystem returns a framesystem with just the arm frame — enough to
-// let extractTrajectory succeed against stubPlan.
 func singleFrameSystem(t *testing.T) *referenceframe.FrameSystem {
 	t.Helper()
 	fs := referenceframe.NewEmptyFrameSystem("")

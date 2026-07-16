@@ -2,17 +2,18 @@ package armplanner
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 
-	"github.com/golang/geo/r3"
+	commonpb "go.viam.com/api/common/v1"
 	"go.viam.com/rdk/components/arm"
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/motionplan"
 	"go.viam.com/rdk/motionplan/armplanning"
 	"go.viam.com/rdk/referenceframe"
-	"go.viam.com/rdk/spatialmath"
 	"go.viam.com/rdk/utils"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 const (
@@ -31,19 +32,8 @@ type Err struct {
 }
 
 type Goal struct {
-	JointsDegrees []float64 `json:"joints_degrees,omitempty"`
-	Pose          *PoseGoal `json:"pose,omitempty"`
-}
-
-type PoseGoal struct {
-	X              float64 `json:"x"`
-	Y              float64 `json:"y"`
-	Z              float64 `json:"z"`
-	OX             float64 `json:"o_x"`
-	OY             float64 `json:"o_y"`
-	OZ             float64 `json:"o_z"`
-	Theta          float64 `json:"theta"`
-	ReferenceFrame string  `json:"reference_frame"`
+	JointsDegrees []float64       `json:"joints_degrees,omitempty"`
+	Pose          json.RawMessage `json:"pose,omitempty"`
 }
 
 type PlanMotionFunc func(context.Context, logging.Logger, *armplanning.PlanRequest) (motionplan.Plan, *armplanning.PlanMeta, error)
@@ -97,30 +87,25 @@ func buildPlanRequest(
 	armName string,
 	goal Goal,
 ) (*armplanning.PlanRequest, error) {
-	if goal.Pose != nil && goal.JointsDegrees != nil {
+	hasPose := len(goal.Pose) > 0
+	hasJoints := goal.JointsDegrees != nil
+	if hasPose && hasJoints {
 		return nil, errors.New("goal must specify exactly one of pose or joints_degrees")
 	}
-	if goal.Pose == nil && goal.JointsDegrees == nil {
+	if !hasPose && !hasJoints {
 		return nil, errors.New("goal must specify one of pose or joints_degrees")
 	}
 
 	var goalState *armplanning.PlanState
-	switch {
-	case goal.Pose != nil:
-		pose := spatialmath.NewPose(
-			r3.Vector{X: goal.Pose.X, Y: goal.Pose.Y, Z: goal.Pose.Z},
-			&spatialmath.OrientationVectorDegrees{
-				OX: goal.Pose.OX, OY: goal.Pose.OY, OZ: goal.Pose.OZ, Theta: goal.Pose.Theta,
-			},
-		)
-		ref := goal.Pose.ReferenceFrame
-		if ref == "" {
-			ref = referenceframe.World
+	if hasPose {
+		var pifProto commonpb.PoseInFrame
+		if err := protojson.Unmarshal(goal.Pose, &pifProto); err != nil {
+			return nil, fmt.Errorf("parse pose: %w", err)
 		}
 		goalState = armplanning.NewPlanState(referenceframe.FrameSystemPoses{
-			armName: referenceframe.NewPoseInFrame(ref, pose),
+			armName: referenceframe.ProtobufToPoseInFrame(&pifProto),
 		}, nil)
-	default:
+	} else {
 		inputs, err := degreesToInputs(fs, armName, goal.JointsDegrees)
 		if err != nil {
 			return nil, err
