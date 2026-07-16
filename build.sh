@@ -15,12 +15,11 @@ mkdir -p bin
 go build -o bin/arm-planner ./cmd/arm-planner
 
 mkdir -p dist
-cp go_utils/go_utils .
 
 echo "Packaging Python module with bundled Go binaries..."
 $PYTHON -m PyInstaller --onefile \
     --hidden-import="googleapiclient" \
-    --add-binary="./go_utils:." \
+    --add-binary="./go_utils/go_utils:." \
     --add-binary="./bin/arm-planner:." \
     src/main.py
 
