@@ -291,9 +291,10 @@ class HandEyeCalibration(Generic, EasyResource):
         motion = attrs.get(MOTION_ATTR)
         self.motion: Optional[Motion] = dependencies.get(Motion.get_resource_name(motion)) if motion else None
         if self.motion is not None:
-            self.logger.debug(f"Motion service configured: {self.motion.name}")
-        else:
-            self.logger.debug("No motion service configured, using direct joint position control")
+            self.logger.info(
+                f"'{MOTION_ATTR}' is configured ({self.motion.name}) but no longer used for arm movement; "
+                f"kept only for get_pose queries when '{USE_MOTION_SERVICE_FOR_POSES_ATTR}' is true"
+            )
 
 
         # Parse joint positions or poses from config
