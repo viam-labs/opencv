@@ -54,9 +54,9 @@ func run() int {
 		emit(armplanner.Result{Error: &armplanner.Err{Kind: armplanner.KindExecution, Message: fmt.Sprintf("connect to viam-server: %v", err)}})
 		return 1
 	}
-	defer robot.Close(ctx)
+	defer func() { _ = robot.Close(ctx) }()
 
-	a, err := arm.FromRobot(robot, *armName)
+	a, err := arm.FromProvider(robot, *armName)
 	if err != nil {
 		emit(armplanner.Result{Error: &armplanner.Err{Kind: armplanner.KindExecution, Message: fmt.Sprintf("resolve arm %q: %v", *armName, err)}})
 		return 1
@@ -93,5 +93,5 @@ func emit(r armplanner.Result) {
 		fmt.Fprintf(os.Stderr, "marshal result: %v\n", err)
 		return
 	}
-	fmt.Println(string(data))
+	_, _ = os.Stdout.Write(append(data, '\n'))
 }
