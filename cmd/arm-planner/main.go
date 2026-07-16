@@ -27,7 +27,7 @@ func run() int {
 	var (
 		armName    = flag.String("arm", "", "arm resource name")
 		parentAddr = flag.String("parent-addr", "", "viam-server address")
-		goalJSON   = flag.String("goal", "", "goal as JSON: {\"pose\":{...}} or {\"joints_degrees\":[...]}")
+		goalJSON   = flag.String("goal", "", "goal as JSON: {\"pose\": <protojson common.PoseInFrame>} or {\"joints_degrees\": [...]}")
 		timeout    = flag.Duration("timeout", defaultTimeout, "hard ceiling on the entire plan+execute cycle")
 	)
 	flag.Parse()
