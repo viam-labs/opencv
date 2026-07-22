@@ -1,18 +1,18 @@
 dnspython==2.8.0
-googleapis-common-protos==1.70.0
-grpclib==0.4.8
+googleapis-common-protos==1.75.0
+grpclib==0.4.9
 h2==4.3.0
-hpack==4.1.0
+hpack==4.2.0
 hyperframe==6.1.0
-multidict==6.6.4
+multidict==6.7.1
 numpy==2.2.6
 opencv-python==4.12.0.88
 scipy>=1.10
 pillow==11.3.0
-protobuf==5.29.5
-pymongo==4.15.1
-typing_extensions==4.15.0
-viam-sdk==0.56.0
+protobuf==6.33.5
+pymongo==4.17.0
+typing_extensions==4.16.0
+viam-sdk==0.79.2
 python-dotenv==1.1.1
 
 typing-extensions
