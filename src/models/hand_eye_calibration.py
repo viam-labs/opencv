@@ -58,6 +58,7 @@ USE_MOTION_SERVICE_FOR_POSES_ATTR = "use_motion_service_for_poses"
 POSE_SELECTION_ATTR = "pose_selection"
 POSE_SAMPLING_ATTR = "pose_sampling"
 CAMERA_FRAME_PARENT_ATTR = "camera_frame_parent"
+TARGET_ATTR = "target"
 
 # do_command keys a viam:opencv pose tracker exposes a raw observation under.
 # A chessboard reports the full grid every frame; a ChArUco board may report a
@@ -119,8 +120,9 @@ def _validate_sampling_attrs(sampling: dict) -> None:
             "'pose_sampling.look_at_point' must be a length-3 list [x, y, z] "
             "in the robot base frame, in mm: the target board's position for "
             "eye-in-hand, or the static camera's position for eye-to-hand "
-            "(the tool +Z — and a board mounted facing along it — then aims "
-            "at the camera)."
+            "(the +Z of whatever frame is being aimed — the 'target' frame if "
+            "configured, otherwise the arm's own tool +Z with a board assumed "
+            "mounted facing along it — then aims at the camera)."
         )
 
     roll = sampling.get("roll_range_deg")
@@ -286,6 +288,25 @@ class HandEyeCalibration(Generic, EasyResource):
                     f"camera frame is always parented to the arm."
                 )
 
+        target = attrs.get(TARGET_ATTR)
+        if target is not None:
+            if not isinstance(target, str) or not target:
+                raise Exception(
+                    f"'{TARGET_ATTR}' must be a non-empty string, got {target!r}"
+                )
+            if calib != CALIB_EYE_TO_HAND:
+                raise Exception(
+                    f"'{TARGET_ATTR}' only applies to {CALIB_ATTR}='{CALIB_EYE_TO_HAND}'; "
+                    f"it names the frame that auto-mode sampling moves in place of the arm."
+                )
+        elif calib == CALIB_EYE_TO_HAND and pose_selection == POSE_SELECTION_AUTO:
+            raise Exception(
+                f"'{TARGET_ATTR}' is required when {CALIB_ATTR}='{CALIB_EYE_TO_HAND}' and "
+                f"{POSE_SELECTION_ATTR}='{POSE_SELECTION_AUTO}': auto-mode sampling needs a "
+                f"frame, already configured in the machine's frame system as a child of the "
+                f"arm, to move and to model collision geometry for the held target."
+            )
+
         motion = attrs.get(MOTION_ATTR)
         optional_deps = []
         if motion is not None:
@@ -351,6 +372,7 @@ class HandEyeCalibration(Generic, EasyResource):
         self.camera_frame_parent = attrs.get(
             CAMERA_FRAME_PARENT_ATTR, DEFAULT_CAMERA_FRAME_PARENT
         )
+        self.target = attrs.get(TARGET_ATTR)
         self.method = attrs.get(METHOD_ATTR, DEFAULT_METHOD)
         self.solver = attrs.get(SOLVER_ATTR, DEFAULT_SOLVER)
         self.sleep_seconds = attrs.get(SLEEP_ATTR, DEFAULT_SLEEP_SECONDS)
@@ -583,6 +605,11 @@ class HandEyeCalibration(Generic, EasyResource):
             raise Exception(
                 f"{POSE_SELECTION_ATTR}='{POSE_SELECTION_AUTO}' requires a motion service"
             )
+        if self.calibration_type == CALIB_EYE_TO_HAND and not self.target:
+            raise Exception(
+                f"{CALIB_ATTR}='{CALIB_EYE_TO_HAND}' with "
+                f"{POSE_SELECTION_ATTR}='{POSE_SELECTION_AUTO}' requires '{TARGET_ATTR}'"
+            )
 
         rng = np.random.default_rng(sampling["seed"])
         n_target = sampling["n_poses"]
@@ -606,9 +633,13 @@ class HandEyeCalibration(Generic, EasyResource):
                 self.logger.warning(f"attempt {attempts}: sampler error: {e}")
                 continue
 
+            # target is required (and validated non-empty) above whenever
+            # calibration_type is eye-to-hand, so this is always the target
+            # frame for eye-to-hand and always the arm for eye-in-hand.
+            move_component = self.target if self.calibration_type == CALIB_EYE_TO_HAND else None
             try:
                 await self._move_arm_to_position(
-                    candidate, len(achieved), n_target
+                    candidate, len(achieved), n_target, component_name=move_component
                 )
                 await asyncio.sleep(self.sleep_seconds)
             except Exception as e:
@@ -651,29 +682,39 @@ class HandEyeCalibration(Generic, EasyResource):
 
         return achieved, measurements
 
-    async def _move_arm_to_position(self, position_data, position_index, total_positions):
+    async def _move_arm_to_position(
+        self, position_data, position_index, total_positions, component_name: Optional[str] = None
+    ):
         """Move arm to specified position using joint control, direct pose control, or motion planning.
 
         Args:
             position_data: Either a list of joint positions (radians) or a Pose object
             position_index: Index of the current position
             total_positions: Total number of positions
+            component_name: Which frame to command the motion service to move to
+                ``position_data`` (defaults to the arm itself). Passing a
+                different, already-configured frame name here — e.g. one
+                representing a target rigidly held by the gripper — lets the
+                motion service resolve the required arm motion itself and
+                avoid collisions using that frame's own geometry, without
+                this module needing to know the mount offset or geometry.
         """
         self.logger.debug(f"Moving to position {position_index+1}/{total_positions}")
 
         is_pose = isinstance(position_data, Pose)
 
         if self.motion is not None and is_pose:
+            move_component = component_name or self.arm.name
             # hack to get the arm to move relative to the base of the arm, not the end TCP
             pif = PoseInFrame(reference_frame=self.arm.name + "_origin", pose=position_data)
 
             success = await self.motion.move(
-                component_name=self.arm.name,
+                component_name=move_component,
                 destination=pif,
             )
             if not success:
                 raise Exception(f"Could not move to pose {position_index+1}/{total_positions}")
-            self.logger.debug(f"Moved arm to pose: {pif} using motion planning")
+            self.logger.debug(f"Moved {move_component} to pose: {pif} using motion planning")
         elif is_pose:
             # Direct pose control using arm.move_to_position
             try:
