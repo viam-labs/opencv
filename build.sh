@@ -24,4 +24,4 @@ mkdir -p dist
 cp go_utils/go_utils .
 
 $PYTHON -m PyInstaller --onefile --hidden-import="googleapiclient" --add-binary="./go_utils:." src/main.py
-tar -czvf dist/archive.tar.gz meta.json ./dist/main
+tar -czvf dist/archive.tar.gz meta.json first_run.sh ./dist/main

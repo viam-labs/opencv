@@ -2,6 +2,35 @@
 
 A Viam module that provides OpenCV-based computer vision components for robotics applications. This module includes pose tracking capabilities using chessboard patterns and hand-eye calibration services for robotic arm calibration.
 
+## System dependencies
+
+This module needs a few shared libraries that are not bundled inside it:
+
+| Library | Debian / Ubuntu | Fedora / RHEL |
+| --- | --- | --- |
+| `libGL.so.1` | `libgl1` | `mesa-libGL` |
+| `libICE.so.6` | `libice6` | `libICE` |
+| `libSM.so.6` | `libsm6` | `libSM` |
+| `libX11.so.6` | `libx11-6` | `libX11` |
+| `libXext.so.6` | `libxext6` | `libXext` |
+| `libglib-2.0.so.0`, `libgthread-2.0.so.0` | `libglib2.0-0t64` (`libglib2.0-0` before Ubuntu 24.04) | `glib2` |
+| `libxcb.so.1` | `libxcb1` | `libxcb` |
+| `libz.so.1` | `zlib1g` | `zlib-ng-compat` |
+
+These come from the Qt GUI stack that the non-headless `opencv-python` wheel links against, which is why the module needs `libGL` even though it never opens a window. A desktop image usually has them already; a server or minimal container image does not.
+
+`first_run.sh` installs them automatically the first time the module is
+installed on a machine, so in most cases there is nothing to do. It supports
+`apt`, `dnf`/`yum`, `zypper`, `pacman` and `apk`, picks the right package name
+for the distro, and does nothing on macOS.
+
+If it cannot install them — for example the module is not running as root and
+passwordless `sudo` is unavailable — it logs the exact command to run by hand
+and exits without failing, so it never blocks the rest of the machine from
+reconfiguring. Look for `[first_run]` lines in the machine logs. Until the
+libraries are present the module fails to start with
+`cannot open shared object file`.
+
 ## Model viam:opencv:chessboard
 
 A pose tracker component that detects and tracks the pose of chessboard calibration patterns in camera images. This model uses OpenCV's chessboard detection algorithms to provide accurate 6-DOF pose estimation of chessboard targets, making it ideal for camera calibration and pose tracking applications.
