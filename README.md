@@ -203,7 +203,6 @@ The following attribute template can be used to configure this model:
   "motion": <string>,
   "sleep_seconds": <float>,
   "use_motion_service_for_poses": <bool>,
-  "camera_frame_parent": <string>,
   "target": <string>
 }
 ```
@@ -227,15 +226,14 @@ The following attributes are available for this model:
 | `sleep_seconds`   | `float`  | `Optional`  | Sleep time between movements to allow the arm to settle (defaults to 2.0 seconds). |
 | `use_motion_service_for_poses` | `bool` | `Optional` | Use `motion.get_pose()` (with the arm's origin frame) instead of `arm.get_end_position()` to read the achieved end-effector pose. Defaults to false. Requires `motion` when true. |
 | `body_name`       | `string` | `Optional`  | Name of the specific tracked body to use (e.g., AprilTag ID like `"tag36h11:0"` or chessboard corner like `"corner_0"`). Calibration expects exactly one tracked pose; set this when the pose tracker returns multiple. **Important**: when using chessboard corners, ensure the board's orientation is stable across all poses so the same corner is tracked. |
-| `camera_frame_parent` | `string` | `Optional` | Eye-to-hand only: the frame the returned camera frame is parented to (defaults to `"world"`). The solved transform is the camera pose in the **arm base** frame, so this should be the frame the arm base is mounted in — see *Calibration types* below. |
-| `target`          | `string` | `Required***` | Eye-to-hand only (rejected for eye-in-hand configs, preserving today's eye-in-hand behavior unchanged). **Required** when `calibration_type="eye-to-hand"` and `pose_selection="auto"`; not required (but harmless if set) in manual mode for either calibration type. Name of an existing frame or component, already configured in the machine's frame system as a child of the arm and carrying its own collision geometry, representing whatever's rigidly attached to the gripper and holding the calibration target (the ChArUco board itself, or a near-zero-volume frame if the target is just taped on, e.g. an AprilTag). Auto-mode sampling commands the motion service to move this frame instead of the arm directly; the motion service resolves the required arm motion from the already-configured frame-system relationship, and avoids collisions using the frame's geometry automatically. In manual mode it's simply unused for move commands — collision avoidance against the frame's geometry still happens automatically there too, independent of this attribute, as soon as the frame/geometry exists in the machine config. |
+| `target`          | `string` | `Required***` | Eye-to-hand only; required when `pose_selection="auto"` (not needed in manual mode). Name of an existing frame in the machine's frame system, parented under the arm with its own collision geometry, representing whatever holds the calibration target. See *Auto pose sampling* below. |
 
 **Note**: in `pose_selection="manual"` mode, either `joint_positions` or `poses` must be provided. In `pose_selection="auto"` mode, both are ignored and `pose_sampling` is required.
 
 Available calibrations are:
 
 - **"eye-in-hand"** — the camera rides the gripper and looks at a target fixed in the world. The result is the camera pose relative to the gripper; the returned `frame` is parented to the arm (`parent: <arm_name>`) so it can be pasted into the camera component's frame config as a child of the arm.
-- **"eye-to-hand"** — the camera is statically mounted and watches a target rigidly held by the gripper (or bolted to it). The result is the camera pose in the **arm base** frame; the returned `frame` is parented to `camera_frame_parent` (default `"world"`) so it can be pasted into the fixed camera component's frame config. **Caveat**: the solved transform is camera-in-arm-base. If your arm's own frame places its base anywhere other than the identity pose of `camera_frame_parent`, compose the returned transform with the arm's frame (or parent the camera to the same frame the arm is parented to and apply the arm's offset) before pasting.
+- **"eye-to-hand"** — the camera is statically mounted and watches a target rigidly held by the gripper (or bolted to it). The result is the camera pose in the **arm base** frame; the returned `frame` is parented to `"world"` so it can be pasted into the fixed camera component's frame config. **Caveat**: the solved transform is camera-in-arm-base. If your arm's own frame places its base anywhere other than the identity pose of `"world"`, compose the returned transform with the arm's frame (or parent the camera to the same frame the arm is parented to and apply the arm's offset) before pasting.
 
 Both types run the same data-collection procedure and support all solvers, both pose-selection modes, and partially visible ChArUco boards. For eye-to-hand specifically:
 
@@ -263,7 +261,7 @@ The roll randomization is what gives the resulting pose set good rotation-axis d
 
 After moving to each candidate the service captures the calibration measurement (arm pose + board observation) right there — sampling and data collection are a single pass, so the arm never re-visits poses. Unreachable poses, planning failures, and poses where the board is out of view are silently skipped and resampled, up to `max_attempts` total attempts.
 
-**Which frame gets moved**: normally the sampled pose is commanded directly to the arm's own end-effector, and the **assumption** is that whatever's attached (camera or board) faces roughly along the arm's own +Z with no offset. For eye-to-hand with `target` configured, the sampled pose is instead commanded to the `target` frame — the motion service resolves the arm motion needed to place that frame there, using the mount offset already described in the frame system, so the board can be held any way. Either way, if your mount (or `target`'s configured pose) is at a wild angle relative to the sampling geometry, you may need to widen `workspace_bounds` so enough candidates land with the target in the camera's view.
+**Which frame gets moved**: eye-in-hand (and eye-to-hand without `target`) commands the sampled pose directly to the arm's end-effector, assuming whatever's attached faces roughly along the arm's own +Z with no offset. Eye-to-hand with `target` configured instead commands the `target` frame — see the *Calibration types* section above. If the target ends up out of the camera's view more often than expected, widen `workspace_bounds`.
 
 | Field                          | Type    | Required | Description |
 |--------------------------------|---------|----------|-------------|
@@ -390,7 +388,6 @@ No `joint_positions` or `poses` are needed in auto mode. The response includes a
 {
   "arm_name": "my_arm",
   "calibration_type": "eye-to-hand",
-  "camera_frame_parent": "world",
   "target": "charuco_target",
   "method": "CALIB_HAND_EYE_TSAI",
   "solver": "hybrid",
@@ -433,7 +430,7 @@ result = await hand_eye_service.do_command({"run_calibration": True})
 
 | Key             | Present when      | Contents |
 |-----------------|-------------------|----------|
-| `frame`         | always            | Frame-system-compatible transform (`translation`, `orientation`, `parent`) — the camera's pose, ready to paste into the camera component's frame config. Eye-in-hand: parented to the arm. Eye-to-hand: parented to `camera_frame_parent` (default `"world"`). |
+| `frame`         | always            | Frame-system-compatible transform (`translation`, `orientation`, `parent`) — the camera's pose, ready to paste into the camera component's frame config. Eye-in-hand: parented to the arm. Eye-to-hand: parented to `"world"`. |
 | `residuals`     | always            | Per-pose translation/rotation residuals against the mean board pose (in base frame for eye-in-hand, in gripper frame for eye-to-hand — the constant of each arrangement), plus summary stats. Lets you spot outlier poses without re-running calibration. |
 | `solver`        | always            | The solver that ran (`"opencv"`, `"hybrid"`, or `"reprojection"`). |
 | `calibration_type` | always         | `"eye-in-hand"` or `"eye-to-hand"`. |
