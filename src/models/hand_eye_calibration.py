@@ -959,7 +959,6 @@ class HandEyeCalibration(Generic, EasyResource):
                         # blindly from station 0.
                         T_cw_list = [boot["selected_T_cw"][i] for i in kept]
                         T_arm_list = [T_arm_list[i] for i in kept]
-                        T_be_list = [T_be_list[i] for i in kept]
                         corners_2d_list = [corners_2d_list[i] for i in kept]
                         corners_3d_list = [corners_3d_list[i] for i in kept]
                         station_numbers = [i + 1 for i in kept]
@@ -1037,11 +1036,11 @@ class HandEyeCalibration(Generic, EasyResource):
                         )
 
                     # Solved transform is the camera pose in its parent frame:
-                    # eye-in-hand's parent is the arm; eye-to-hand's is "world".
+                    # eye-in-hand's parent is the arm; eye-to-hand's is arm's base frame
                     R_cam_in_parent = R_cam2gripper
                     t_cam_in_parent = t_cam2gripper.reshape(3, 1)
                     if self.calibration_type == CALIB_EYE_TO_HAND:
-                        parent_frame = "world"
+                        parent_frame = self.arm.name + "_origin"
                     else:
                         parent_frame = self.arm.name
 
