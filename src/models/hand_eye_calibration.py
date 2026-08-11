@@ -20,17 +20,19 @@ from utils.utils import call_go_ov2mat, call_go_mat2ov
 
 try:
     from diagnostics.pose_diversity import compute_pose_diversity
-    from solvers.reprojection_solver import refine_handeye
+    from solvers.reprojection_solver import _se3_inverse, refine_handeye
     from solvers.robust_init import robust_bootstrap_handeye
     from active_calibration.pose_sampler import generate_pose_set, sample_transform
 except ModuleNotFoundError:
     # when running as local module with run.sh
     from ..diagnostics.pose_diversity import compute_pose_diversity
-    from ..solvers.reprojection_solver import refine_handeye
+    from ..solvers.reprojection_solver import _se3_inverse, refine_handeye
     from ..solvers.robust_init import robust_bootstrap_handeye
     from ..active_calibration.pose_sampler import generate_pose_set, sample_transform
 
-CALIBS = ["eye-in-hand", "eye-to-hand"]
+CALIB_EYE_IN_HAND = "eye-in-hand"
+CALIB_EYE_TO_HAND = "eye-to-hand"
+CALIBS = [CALIB_EYE_IN_HAND, CALIB_EYE_TO_HAND]
 METHODS = [
     "CALIB_HAND_EYE_TSAI",
     "CALIB_HAND_EYE_PARK",
@@ -55,6 +57,7 @@ SOLVER_ATTR = "solver"
 USE_MOTION_SERVICE_FOR_POSES_ATTR = "use_motion_service_for_poses"
 POSE_SELECTION_ATTR = "pose_selection"
 POSE_SAMPLING_ATTR = "pose_sampling"
+TARGET_ATTR = "target"
 
 # do_command keys a viam:opencv pose tracker exposes a raw observation under.
 # A chessboard reports the full grid every frame; a ChArUco board may report a
@@ -113,7 +116,8 @@ def _validate_sampling_attrs(sampling: dict) -> None:
     if not isinstance(look_at, (list, tuple)) or len(look_at) != 3:
         raise Exception(
             "'pose_sampling.look_at_point' must be a length-3 list [x, y, z] "
-            "(the chessboard's position in the robot base frame, in mm)."
+            "in the robot base frame, in mm — the point the sampled frame's "
+            "+Z aims at. See README for eye-in-hand vs. eye-to-hand semantics."
         )
 
     roll = sampling.get("roll_range_deg")
@@ -256,6 +260,23 @@ class HandEyeCalibration(Generic, EasyResource):
             if not isinstance(body_name, str):
                 raise Exception(f"'{BODY_NAME_ATTR}' must be a string, got {type(body_name)}")
 
+        target = attrs.get(TARGET_ATTR)
+        if target is not None:
+            if not isinstance(target, str) or not target:
+                raise Exception(
+                    f"'{TARGET_ATTR}' must be a non-empty string, got {target!r}"
+                )
+            if calib != CALIB_EYE_TO_HAND:
+                raise Exception(
+                    f"'{TARGET_ATTR}' only applies to {CALIB_ATTR}='{CALIB_EYE_TO_HAND}'; "
+                    f"it names the frame that auto-mode sampling moves in place of the arm."
+                )
+        elif calib == CALIB_EYE_TO_HAND and pose_selection == POSE_SELECTION_AUTO:
+            raise Exception(
+                f"'{TARGET_ATTR}' is required when {CALIB_ATTR}='{CALIB_EYE_TO_HAND}' and "
+                f"{POSE_SELECTION_ATTR}='{POSE_SELECTION_AUTO}'."
+            )
+
         motion = attrs.get(MOTION_ATTR)
         optional_deps = []
         if motion is not None:
@@ -317,6 +338,8 @@ class HandEyeCalibration(Generic, EasyResource):
             )
             self.poses.append(pose)
 
+        self.calibration_type = attrs.get(CALIB_ATTR, CALIB_EYE_IN_HAND)
+        self.target = attrs.get(TARGET_ATTR)
         self.method = attrs.get(METHOD_ATTR, DEFAULT_METHOD)
         self.solver = attrs.get(SOLVER_ATTR, DEFAULT_SOLVER)
         self.sleep_seconds = attrs.get(SLEEP_ATTR, DEFAULT_SLEEP_SECONDS)
@@ -372,8 +395,15 @@ class HandEyeCalibration(Generic, EasyResource):
 
     async def _capture_opencv_measurement(self) -> dict:
         """Capture one hand-eye measurement at the current arm position for the
-        OpenCV solver path: gripper-in-base from the arm, target-in-camera from
+        OpenCV solver path: an arm pose from the arm, target-in-camera from
         the pose tracker. Raises if the tracker does not resolve exactly one body.
+
+        Eye-in-hand needs gripper-in-base; eye-to-hand needs the inverse
+        (base-in-gripper) — OpenCV's documented trick for a static camera,
+        which makes the solver return camera-in-base instead of
+        camera-in-gripper. The dict keys stay ``R_gripper2base``/
+        ``t_gripper2base`` either way since they name the
+        ``cv2.calibrateHandEye`` argument slots, not the physical transform.
         """
         arm_pose = await self._read_arm_pose()
 
@@ -414,12 +444,19 @@ class HandEyeCalibration(Generic, EasyResource):
         )
         t_cam2target = np.array([[tracked_pose.x], [tracked_pose.y], [tracked_pose.z]], dtype=np.float64)
 
-        # TODO: Implement eye-to-hand. This should just be changing the
-        # order/in-frame values
+        # call_go_ov2mat returns gripper-in-base directly (no transpose needed
+        # since the RDK rotation fix); eye-to-hand needs the inverse.
+        if self.calibration_type == CALIB_EYE_TO_HAND:
+            R_arm = R_base2gripper.T
+            t_arm = -R_base2gripper.T @ t_base2gripper
+        else:
+            R_arm = R_base2gripper
+            t_arm = t_base2gripper
+
         return {
             "arm_pose": arm_pose,
-            "R_gripper2base": R_base2gripper,
-            "t_gripper2base": t_base2gripper,
+            "R_gripper2base": R_arm,
+            "t_gripper2base": t_arm,
             "R_target2cam": R_cam2target,
             "t_target2cam": t_cam2target,
         }
@@ -527,6 +564,11 @@ class HandEyeCalibration(Generic, EasyResource):
             raise Exception(
                 f"{POSE_SELECTION_ATTR}='{POSE_SELECTION_AUTO}' requires a motion service"
             )
+        if self.calibration_type == CALIB_EYE_TO_HAND and not self.target:
+            raise Exception(
+                f"{CALIB_ATTR}='{CALIB_EYE_TO_HAND}' with "
+                f"{POSE_SELECTION_ATTR}='{POSE_SELECTION_AUTO}' requires '{TARGET_ATTR}'"
+            )
 
         rng = np.random.default_rng(sampling["seed"])
         n_target = sampling["n_poses"]
@@ -550,9 +592,13 @@ class HandEyeCalibration(Generic, EasyResource):
                 self.logger.warning(f"attempt {attempts}: sampler error: {e}")
                 continue
 
+            # target is required (and validated non-empty) above whenever
+            # calibration_type is eye-to-hand, so this is always the target
+            # frame for eye-to-hand and always the arm for eye-in-hand.
+            move_component = self.target if self.calibration_type == CALIB_EYE_TO_HAND else None
             try:
                 await self._move_arm_to_position(
-                    candidate, len(achieved), n_target
+                    candidate, len(achieved), n_target, component_name=move_component
                 )
                 await asyncio.sleep(self.sleep_seconds)
             except Exception as e:
@@ -595,29 +641,34 @@ class HandEyeCalibration(Generic, EasyResource):
 
         return achieved, measurements
 
-    async def _move_arm_to_position(self, position_data, position_index, total_positions):
+    async def _move_arm_to_position(
+        self, position_data, position_index, total_positions, component_name: Optional[str] = None
+    ):
         """Move arm to specified position using joint control, direct pose control, or motion planning.
 
         Args:
             position_data: Either a list of joint positions (radians) or a Pose object
             position_index: Index of the current position
             total_positions: Total number of positions
+            component_name: Which frame to command the motion service to move
+                to ``position_data`` (defaults to the arm itself).
         """
         self.logger.debug(f"Moving to position {position_index+1}/{total_positions}")
 
         is_pose = isinstance(position_data, Pose)
 
         if self.motion is not None and is_pose:
+            move_component = component_name or self.arm.name
             # hack to get the arm to move relative to the base of the arm, not the end TCP
             pif = PoseInFrame(reference_frame=self.arm.name + "_origin", pose=position_data)
 
             success = await self.motion.move(
-                component_name=self.arm.name,
+                component_name=move_component,
                 destination=pif,
             )
             if not success:
                 raise Exception(f"Could not move to pose {position_index+1}/{total_positions}")
-            self.logger.debug(f"Moved arm to pose: {pif} using motion planning")
+            self.logger.debug(f"Moved {move_component} to pose: {pif} using motion planning")
         elif is_pose:
             # Direct pose control using arm.move_to_position
             try:
@@ -649,10 +700,17 @@ class HandEyeCalibration(Generic, EasyResource):
     ):
         """Evaluate per-pose calibration residuals to identify outlier measurements.
 
-        For a correct calibration, the target's pose expressed in the base frame
-        (T_target2base = T_gripper2base · T_cam2gripper · T_target2cam) should be
-        identical across every pose, since the target is physically fixed.
-        Deviations from the mean reveal which poses contributed bad measurements.
+        For a correct eye-in-hand calibration, the target's pose expressed in
+        the base frame (T_target2base = T_gripper2base · T_cam2gripper ·
+        T_target2cam) should be identical across every pose, since the target
+        is physically fixed. Deviations from the mean reveal which poses
+        contributed bad measurements.
+
+        The same arithmetic covers eye-to-hand when fed the values the solver
+        was fed: the arm-pose slots then hold base-in-gripper and the solved
+        transform is camera-in-base, so the product is target-in-GRIPPER —
+        which is the constant of that arrangement (the target is rigidly
+        held by the gripper). Either way: constant product, same outlier test.
 
         Returns a list of per-pose residual dicts plus summary stats.
         """
@@ -842,12 +900,20 @@ class HandEyeCalibration(Generic, EasyResource):
                             "+ robust branch selection"
                         )
 
+                        # Same eye-to-hand inversion as _capture_opencv_measurement:
+                        # robust_bootstrap_handeye has no eye-to-hand awareness of
+                        # its own, so it's applied here to the arm poses instead.
+                        if self.calibration_type == CALIB_EYE_TO_HAND:
+                            T_arm_list = [_se3_inverse(T) for T in T_be_list]
+                        else:
+                            T_arm_list = T_be_list
+
                         # Bootstrap with PnP-branch disambiguation (planar
                         # two-fold ambiguity) and station outlier rejection, so
                         # a few flipped or bad stations can't poison X_init and
                         # strand the refinement in the wrong basin.
                         boot = robust_bootstrap_handeye(
-                            T_be_list,
+                            T_arm_list,
                             [m["T_cw_candidates"] for m in measurements],
                             [m["pnp_reproj_errs"] for m in measurements],
                             method=getattr(cv2, self.method),
@@ -892,7 +958,7 @@ class HandEyeCalibration(Generic, EasyResource):
                         # board pose from the bootstrap consensus rather than
                         # blindly from station 0.
                         T_cw_list = [boot["selected_T_cw"][i] for i in kept]
-                        T_be_list = [T_be_list[i] for i in kept]
+                        T_arm_list = [T_arm_list[i] for i in kept]
                         corners_2d_list = [corners_2d_list[i] for i in kept]
                         corners_3d_list = [corners_3d_list[i] for i in kept]
                         station_numbers = [i + 1 for i in kept]
@@ -901,7 +967,7 @@ class HandEyeCalibration(Generic, EasyResource):
                             f"refining with reprojection-error solver on {len(kept)} station(s)..."
                         )
                         refinement = refine_handeye(
-                            T_be_list,
+                            T_arm_list,
                             corners_2d_list,
                             corners_3d_list,
                             K,
@@ -934,9 +1000,10 @@ class HandEyeCalibration(Generic, EasyResource):
 
                         # For the legacy per-pose residual summary, reconstruct the
                         # rotation/translation lists (kept stations, chain-consistent
-                        # PnP branches) in the convention that helper expects.
-                        R_gripper2base_list = [T[:3, :3] for T in T_be_list]
-                        t_gripper2base_list = [T[:3, 3].reshape(3, 1) for T in T_be_list]
+                        # PnP branches, arm poses in the same orientation actually fed
+                        # to the solver above) in the convention that helper expects.
+                        R_gripper2base_list = [T[:3, :3] for T in T_arm_list]
+                        t_gripper2base_list = [T[:3, 3].reshape(3, 1) for T in T_arm_list]
                         R_target2cam_list = [T[:3, :3] for T in T_cw_list]
                         t_target2cam_list = [T[:3, 3].reshape(3, 1) for T in T_cw_list]
 
@@ -968,26 +1035,33 @@ class HandEyeCalibration(Generic, EasyResource):
                             f"r_resid={r['rotation_residual_deg']:.3f}deg"
                         )
 
-                    # Convert OpenCV output to frame system format.
-                    # cv2.calibrateHandEye returns (R_cam2gripper, t_cam2gripper), i.e. the
-                    # camera's mounting orientation and position in the gripper frame — which
-                    # is exactly what the Viam frame system wants.
-                    t_gripper2cam = t_cam2gripper.reshape(3, 1)
+                    # Solved transform is the camera pose in its parent frame:
+                    # eye-in-hand's parent is the arm; eye-to-hand's is arm's base frame
+                    R_cam_in_parent = R_cam2gripper
+                    t_cam_in_parent = t_cam2gripper.reshape(3, 1)
+                    if self.calibration_type == CALIB_EYE_TO_HAND:
+                        parent_frame = self.arm.name + "_origin"
+                    else:
+                        parent_frame = self.arm.name
 
-                    orientation_result = call_go_mat2ov(R_cam2gripper)
+                    orientation_result = call_go_mat2ov(R_cam_in_parent)
                     if orientation_result is None:
                         raise Exception("failed to convert rotation matrix to orientation vector")
                     ox, oy, oz, theta = orientation_result
 
-                    x = float(t_gripper2cam[0][0])
-                    y = float(t_gripper2cam[1][0])
-                    z = float(t_gripper2cam[2][0])
+                    x = float(t_cam_in_parent[0][0])
+                    y = float(t_cam_in_parent[1][0])
+                    z = float(t_cam_in_parent[2][0])
 
                     viam_pose = Pose(x=x, y=y, z=z, o_x=ox, o_y=oy, o_z=oz, theta=theta)
 
-                    self.logger.info(f"calibration success: {viam_pose}")
+                    self.logger.info(
+                        f"calibration success ({self.calibration_type}, camera in "
+                        f"'{parent_frame}' frame): {viam_pose}"
+                    )
 
-                    # Format output to be frame system compatible
+                    # Format output to be frame system compatible: paste the
+                    # 'frame' dict into the camera component's frame config.
                     response = {
                         "frame": {
                             "translation": {
@@ -1004,13 +1078,14 @@ class HandEyeCalibration(Generic, EasyResource):
                                     "th": theta
                                 }
                             },
-                            "parent": self.arm.name
+                            "parent": parent_frame
                         },
                         "residuals": {
                             "summary": residual_summary,
                             "per_pose": per_pose_residuals,
                         },
                         "solver": self.solver,
+                        "calibration_type": self.calibration_type,
                     }
                     if refinement_info is not None:
                         response["refinement"] = refinement_info

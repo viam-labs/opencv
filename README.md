@@ -202,7 +202,8 @@ The following attribute template can be used to configure this model:
   "pose_tracker": <string>,
   "motion": <string>,
   "sleep_seconds": <float>,
-  "use_motion_service_for_poses": <bool>
+  "use_motion_service_for_poses": <bool>,
+  "target": <string>
 }
 ```
 
@@ -225,13 +226,20 @@ The following attributes are available for this model:
 | `sleep_seconds`   | `float`  | `Optional`  | Sleep time between movements to allow the arm to settle (defaults to 2.0 seconds). |
 | `use_motion_service_for_poses` | `bool` | `Optional` | Use `motion.get_pose()` (with the arm's origin frame) instead of `arm.get_end_position()` to read the achieved end-effector pose. Defaults to false. Requires `motion` when true. |
 | `body_name`       | `string` | `Optional`  | Name of the specific tracked body to use (e.g., AprilTag ID like `"tag36h11:0"` or chessboard corner like `"corner_0"`). Calibration expects exactly one tracked pose; set this when the pose tracker returns multiple. **Important**: when using chessboard corners, ensure the board's orientation is stable across all poses so the same corner is tracked. |
+| `target`          | `string` | `Required***` | Eye-to-hand only; required when `pose_selection="auto"` (not needed in manual mode). Name of an existing frame in the machine's frame system, parented under the arm with its own collision geometry, representing whatever holds the calibration target. See *Auto pose sampling* below. |
 
 **Note**: in `pose_selection="manual"` mode, either `joint_positions` or `poses` must be provided. In `pose_selection="auto"` mode, both are ignored and `pose_sampling` is required.
 
 Available calibrations are:
 
-- "eye-in-hand"
-- "eye-to-hand" *(not yet implemented end-to-end; the new corner-based solvers and auto sampler currently assume eye-in-hand)*
+- **"eye-in-hand"** — the camera rides the gripper and looks at a target fixed in the world. The result is the camera pose relative to the gripper; the returned `frame` is parented to the arm (`parent: <arm_name>`) so it can be pasted into the camera component's frame config as a child of the arm.
+- **"eye-to-hand"** — the camera is statically mounted and watches a target rigidly held by the gripper (or bolted to it). The result is the camera pose in the **arm's base frame** — the only static reference the calibration actually has, since the arm's TCP moves throughout the process. The returned `frame` is parented to `<arm_name>_origin` so it can be pasted into the fixed camera component's frame config as a child of that frame.
+
+Both types run the same data-collection procedure and support all solvers, both pose-selection modes, and partially visible ChArUco boards. For eye-to-hand specifically:
+
+- Hold the board in one rigid grasp for the entire run — any slip or regrasp invalidates subsequent measurements. The board-in-gripper transform is solved internally as a nuisance parameter; you never need to measure it.
+- The gripper occluding part of the ChArUco board is fine (use the `viam:opencv:charuco` tracker); keep the visible corners well spread rather than clustered.
+- In auto pose-selection mode, `target` is required and `look_at_point` should be set to the static **camera's** location: sampled poses aim `target`'s +Z at the camera and the motion service moves the arm to achieve it — the board can be held any way, since `target`'s pose in the frame system already describes how it's mounted.
 
 Available methods are:
 
@@ -246,19 +254,19 @@ Available methods are:
 When `pose_selection` is `"auto"`, the service randomly generates and visits poses inside a rectangular workspace volume. Each candidate has:
 
 - a position drawn uniformly from `workspace_bounds`,
-- an orientation that aims the end-effector's +Z axis at `look_at_point`,
+- an orientation that aims the sampled frame's +Z axis at `look_at_point`,
 - a random *roll* about that axis drawn from `roll_range_deg`.
 
 The roll randomization is what gives the resulting pose set good rotation-axis diversity. Pure look-at without roll would cluster rotation axes in a plane and produce ill-conditioned calibrations (see `compute_pose_diversity` below).
 
 After moving to each candidate the service captures the calibration measurement (arm pose + board observation) right there — sampling and data collection are a single pass, so the arm never re-visits poses. Unreachable poses, planning failures, and poses where the board is out of view are silently skipped and resampled, up to `max_attempts` total attempts.
 
-**Assumption**: the camera's optical axis is roughly aligned with the end-effector +Z. The chessboard tracker is forgiving as long as corners are in frame, but if your mount is at a wild angle you may need to widen `workspace_bounds` so enough candidates land with the target in view.
+**Which frame gets moved**: eye-in-hand (and eye-to-hand without `target`) commands the sampled pose directly to the arm's end-effector, assuming whatever's attached faces roughly along the arm's own +Z with no offset. Eye-to-hand with `target` configured instead commands the `target` frame — see the *Calibration types* section above. If the target ends up out of the camera's view more often than expected, widen `workspace_bounds`.
 
 | Field                          | Type    | Required | Description |
 |--------------------------------|---------|----------|-------------|
-| `workspace_bounds.x.min/max`   | float   | yes      | Sampling range for end-effector position along base-frame X, in mm. (Likewise `y`, `z`.) |
-| `look_at_point`                | `[x,y,z]` | yes    | Chessboard center in robot base frame, in mm. Easiest way to find: touch the board with the TCP and read `arm.get_end_position()`. |
+| `workspace_bounds.x.min/max`   | float   | yes      | Sampling range for the moved frame's position along base-frame X, in mm. (Likewise `y`, `z`.) |
+| `look_at_point`                | `[x,y,z]` | yes    | The point the moved frame's +Z aims at, in robot base frame, in mm. Eye-in-hand: the chessboard center (easiest way to find: touch the board with the TCP and read `arm.get_end_position()`). Eye-to-hand: the static camera's approximate location. |
 | `n_poses`                      | int     | no       | Number of successful poses to collect. Defaults to 20. |
 | `max_attempts`                 | int     | no       | Cap on total sample attempts (including skips). Defaults to 60. |
 | `roll_range_deg`               | `[lo, hi]` | no    | Range for the random roll about the optical axis, in degrees. Defaults to `[-180, 180]`. |
@@ -374,13 +382,43 @@ The response gains a `refinement` block with `rmse_pixels`, `per_pose_rmse_pixel
 
 No `joint_positions` or `poses` are needed in auto mode. The response includes an `auto_sampling` block reporting `requested_n_poses` vs `captured_n_poses`.
 
+**Eye-to-hand (static camera, board held by the gripper):**
+
+```json
+{
+  "arm_name": "my_arm",
+  "calibration_type": "eye-to-hand",
+  "target": "charuco_target",
+  "method": "CALIB_HAND_EYE_TSAI",
+  "solver": "hybrid",
+  "pose_tracker": "charuco_tracker",
+  "motion": "motion",
+  "pose_selection": "auto",
+  "pose_sampling": {
+    "workspace_bounds": {
+      "x": {"min": 200, "max": 450},
+      "y": {"min": -150, "max": 150},
+      "z": {"min": 200, "max": 450}
+    },
+    "look_at_point": [700, 0, 300],
+    "n_poses": 15,
+    "max_attempts": 80,
+    "roll_range_deg": [-60, 60]
+  }
+}
+```
+
+Here `look_at_point` is the fixed camera's approximate position in the arm base frame, and `charuco_target` is a frame already configured in the machine's frame system as a child of `my_arm` — with a pose describing however the board is actually mounted, and a box geometry sized to the board — so sampled poses aim the board (not necessarily the arm's own tool +Z) at the camera, and the motion service avoids colliding the board with anything else in the frame system while planning. The returned `frame` is the camera's pose parented to `my_arm_origin` (the arm's base frame) — paste it directly into the fixed camera component's frame config.
+
+`target` is required for `calibration_type="eye-to-hand"` with `pose_selection="auto"` — `validate_config` rejects the config without it, since auto-mode sampling needs a frame to move and to model collision geometry for the held target. (Manual mode doesn't need it — see the attribute table above.)
+
 ### Available Commands
 
 The hand-eye calibration service provides the following commands via `do_command`:
 
 #### `run_calibration`
 
-Runs the hand-eye calibration procedure. In manual mode, moves the arm through all configured positions; in auto mode, samples and visits poses until `n_poses` reachable observations are collected. Then runs the chosen `solver` and computes the camera-to-gripper transformation.
+Runs the hand-eye calibration procedure. In manual mode, moves the arm through all configured positions; in auto mode, samples and visits poses until `n_poses` reachable observations are collected. Then runs the chosen `solver` and computes the camera transform: camera-in-gripper for eye-in-hand, camera-in-arm-base for eye-to-hand.
 
 **Example:**
 
@@ -392,9 +430,10 @@ result = await hand_eye_service.do_command({"run_calibration": True})
 
 | Key             | Present when      | Contents |
 |-----------------|-------------------|----------|
-| `frame`         | always            | Frame-system-compatible transform (`translation`, `orientation`, `parent`). |
-| `residuals`     | always            | Per-pose translation/rotation residuals against the mean board pose in base frame, plus summary stats. Lets you spot outlier poses without re-running calibration. |
+| `frame`         | always            | Frame-system-compatible transform (`translation`, `orientation`, `parent`) — the camera's pose, ready to paste into the camera component's frame config. Eye-in-hand: parented to the arm's TCP. Eye-to-hand: parented to the arm's base frame (`<arm_name>_origin`), not its TCP. |
+| `residuals`     | always            | Per-pose translation/rotation residuals against the mean board pose (in base frame for eye-in-hand, in gripper frame for eye-to-hand — the constant of each arrangement), plus summary stats. Lets you spot outlier poses without re-running calibration. |
 | `solver`        | always            | The solver that ran (`"opencv"`, `"hybrid"`, or `"reprojection"`). |
+| `calibration_type` | always         | `"eye-in-hand"` or `"eye-to-hand"`. |
 | `refinement`    | `hybrid`/`reprojection` only | Reprojection solver diagnostics: `rmse_pixels`, `per_pose_rmse_pixels`, `iterations`, `success`, `message`. |
 | `auto_sampling` | `pose_selection="auto"` only | `requested_n_poses` and `captured_n_poses`. |
 
@@ -424,6 +463,8 @@ Returns a dict with `n_poses`, `n_pairs`, `mean_rotation_angle_deg`, `translatio
 #### `generate_poses`
 
 Standalone pose sampler — returns a list of poses without moving the arm. Same sampling logic as `pose_selection="auto"` but useful as a preview: paste the result into your `poses` config and run a manual calibration, or just sanity-check the diversity numbers before kicking off an auto run.
+
+**Caveat when `target` is configured**: this command samples poses in isolation and has no way to know about `target`. If you're previewing sampling parameters for a run that will use `target`, the returned poses represent poses for the `target` frame, not the arm — they are not directly paste-ready into manual-mode `poses` in that case, since manual mode always specifies arm poses.
 
 **Example:**
 
