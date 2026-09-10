@@ -41,6 +41,7 @@ METHODS = [
 
 # required attributes
 ARM_ATTR = "arm_name"
+ZIVID_CALIB_ATTR = "zivid_calib_name"
 BODY_NAME_ATTR = "body_name"
 CALIB_ATTR = "calibration_type"
 JOINT_POSITIONS_ATTR = "joint_positions"
@@ -208,6 +209,10 @@ class HandEyeCalibration(Generic, EasyResource):
         if arm is None:
             raise Exception(f"Missing required {ARM_ATTR} attribute.")
 
+        zivid_calib = attrs.get(ZIVID_CALIB_ATTR)
+        if zivid_calib is None:
+            raise Exception(f"Missing required {ZIVID_CALIB_ATTR} attribute.")
+
         pose_selection = attrs.get(POSE_SELECTION_ATTR, DEFAULT_POSE_SELECTION)
         if pose_selection not in POSE_SELECTIONS:
             raise Exception(
@@ -272,7 +277,7 @@ class HandEyeCalibration(Generic, EasyResource):
                 f"'{MOTION_ATTR}' service for reachability validation."
             )
 
-        return [str(arm), str(pose_tracker)], optional_deps
+        return [str(arm), str(zivid_calib), str(pose_tracker)], optional_deps
 
     def reconfigure(
         self, config: ComponentConfig, dependencies: Mapping[ResourceName, ResourceBase]
@@ -288,6 +293,10 @@ class HandEyeCalibration(Generic, EasyResource):
         arm = attrs.get(ARM_ATTR)
         self.arm_name = arm
         self.arm: Arm = dependencies.get(Arm.get_resource_name(arm))
+
+        zivid_calib = attrs.get(ZIVID_CALIB_ATTR)
+        self.zivid_calib_name = zivid_calib
+        self.zivid_calib: Generic = dependencies.get(Generic.get_resource_name(zivid_calib))
 
         pose_tracker = attrs.get(POSE_TRACKER_ATTR)
         self.pose_tracker: PoseTracker = dependencies.get(PoseTracker.get_resource_name(pose_tracker))
@@ -535,7 +544,7 @@ class HandEyeCalibration(Generic, EasyResource):
         achieved: list = []
         measurements: list = []
         attempts = 0
-        while len(achieved) < n_target and attempts < max_attempts:
+        while len(achieved) < 10 and attempts < 1000:
             attempts += 1
             try:
                 T = sample_transform(
@@ -567,15 +576,17 @@ class HandEyeCalibration(Generic, EasyResource):
             # success means this pose's data is already collected — no second
             # visit needed.
             try:
-                measurement = await self._capture_measurement()
+                output = await self.zivid_calib.do_command({"command": "capture_and_detect"})
+                self.logger.info(f"attempt {attempts}: capture_and_detect output: {output}")
+                if output["detected"] != True:
+                    raise Exception("target not detected in camera frame")
             except Exception as e:
                 self.logger.info(
                     f"attempt {attempts}: could not capture measurement ({e}); resampling"
                 )
                 continue
+            achieved.append(1)
 
-            achieved.append(measurement["arm_pose"])
-            measurements.append(measurement)
             self.logger.info(
                 f"auto pose {len(achieved)}/{n_target} captured after {attempts} attempts "
                 "(measurement collected)"
@@ -592,6 +603,8 @@ class HandEyeCalibration(Generic, EasyResource):
                 f"auto sampling collected only {len(achieved)} valid measurements "
                 f"(need >= 3). Widen workspace_bounds or check look_at_point."
             )
+
+        measurements = [0] * int(output["accumulated_count"])
 
         return achieved, measurements
 
@@ -781,6 +794,26 @@ class HandEyeCalibration(Generic, EasyResource):
         resp = {}
         for key, value in command.items():
             match key:
+                case "run_zivid_calibration":
+                    if self.pose_sampling is None:
+                        raise Exception(
+                            f"{POSE_SELECTION_ATTR}='{POSE_SELECTION_AUTO}' but "
+                            f"'{POSE_SAMPLING_ATTR}' is not configured."
+                        )
+                    self.logger.info(
+                        f"pose_selection=auto: sampling up to {self.pose_sampling['n_poses']} "
+                        f"poses (max {self.pose_sampling['max_attempts']} attempts) "
+                        "and capturing measurements in the same pass"
+                    )
+                    _, measurements = await self._sample_and_move_loop(self.pose_sampling)
+
+                    # Check if we have enough measurements
+                    if len(measurements) < 3:
+                        raise Exception(f"not enough valid measurements collected. Got {len(measurements)}, need at least 3. Make sure the pose tracker can see exactly one target in each calibration position.")
+
+                    response = await self.zivid_calib.do_command({"command": "calibrate_eye_in_hand"})
+
+                    resp["run_zivid_calibration"] = response
                 case "run_calibration":
                     refinement_info = None
                     bootstrap_info = None
