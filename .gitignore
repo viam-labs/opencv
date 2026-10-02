@@ -175,3 +175,5 @@ go_utils/go_utils
 
 # Images in script directory
 *.jpg
+
+/docs/
